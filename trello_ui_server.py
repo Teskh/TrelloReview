@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import mimetypes
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,21 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from trello_smoke_test import TrelloClient, load_dotenv
+from workbench_store import (
+    detect_mime_from_name,
+    ensure_card_workspace,
+    get_card_workspace_info,
+    get_index_for_card,
+    get_local_file_path,
+    get_run_result,
+    init_workbench_paths,
+    list_index_summaries,
+    load_checklist,
+    load_checklist_text,
+    run_checklist_for_card,
+    save_checklist_text,
+    save_indexes_for_card,
+)
 
 ROOT_DIR = Path(__file__).resolve().parent
 UI_DIR = ROOT_DIR / "ui"
@@ -141,7 +157,12 @@ def build_timeline(
             attachment = dict(att_full) if att_full else dict(att_stub)
             if attachment_id:
                 attachment.setdefault("id", attachment_id)
-                attachment.setdefault("proxyUrl", attachment_proxy_path(card_id, attachment_id))
+                # Only emit a proxy URL for attachments that still exist on the card.
+                # Old attachment actions can remain in history after the file is removed,
+                # which causes broken inline image previews in the rendered transcript.
+                if att_full:
+                    attachment.setdefault("proxyUrl", attachment_proxy_path(card_id, attachment_id))
+            attachment["isCurrentAttachment"] = bool(att_full)
             attachment["isImage"] = is_image_attachment(attachment)
             events.append(
                 {
@@ -310,6 +331,10 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
     def app_config(self) -> AppConfig:
         return self.server.app_config  # type: ignore[attr-defined]
 
+    @property
+    def workbench_paths(self) -> Any:
+        return self.server.workbench_paths  # type: ignore[attr-defined]
+
     def _client(self) -> TrelloClient:
         return make_client(self.app_config)
 
@@ -324,6 +349,24 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
 
     def _send_error_json(self, status: int, message: str) -> None:
         self._send_json({"error": message}, status=status)
+
+    def _read_json_body(self) -> Dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError as e:
+            raise ValueError("Invalid Content-Length") from e
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            raise ValueError("Invalid JSON body") from e
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
 
     def _send_binary(self, body: bytes, content_type: str, filename: str | None = None) -> None:
         self.send_response(HTTPStatus.OK)
@@ -375,6 +418,12 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
         filename = attachment.get("fileName") or attachment.get("name")
         self._send_binary(body=body, content_type=content_type, filename=filename)
 
+    def _send_local_file(self, card_id: str, rel_path: str) -> None:
+        file_path = get_local_file_path(self.workbench_paths, card_id, rel_path)
+        body = file_path.read_bytes()
+        content_type = mimetypes.guess_type(file_path.name)[0] or detect_mime_from_name(file_path.name)
+        self._send_binary(body, content_type=content_type, filename=file_path.name)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/"):
@@ -384,6 +433,13 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
         if parsed.path in ("/", ""):
             self.path = "/index.html"
         super().do_GET()
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/"):
+            self._send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
+            return
+        self._handle_api_post(parsed)
 
     def _handle_api_get(self, parsed: Any) -> None:
         path = parsed.path
@@ -396,6 +452,15 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
 
             if path == "/api/boards":
                 self._send_json(get_me_and_boards(client))
+                return
+
+            if path == "/api/checklist":
+                self._send_json(
+                    {
+                        "text": load_checklist_text(self.workbench_paths),
+                        "parsed": load_checklist(self.workbench_paths),
+                    }
+                )
                 return
 
             if path.startswith("/api/boards/") and path.endswith("/cards"):
@@ -419,6 +484,60 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 self._send_json({"packet": packet, "markdown": markdown})
                 return
 
+            if path.startswith("/api/cards/") and path.endswith("/workspace"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace route")
+                    return
+                card_id = parts[2]
+                self._send_json(get_card_workspace_info(self.workbench_paths, card_id))
+                return
+
+            if path.startswith("/api/cards/") and path.endswith("/workspace/indexes"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 5:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace indexes route")
+                    return
+                card_id = parts[2]
+                self._send_json(list_index_summaries(self.workbench_paths, card_id))
+                return
+
+            if path.startswith("/api/cards/") and path.endswith("/workspace/index"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 5:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace index route")
+                    return
+                card_id = parts[2]
+                source_key = (qs.get("sourceKey", [""])[0] or "").strip()
+                if not source_key:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Missing sourceKey")
+                    return
+                self._send_json(get_index_for_card(self.workbench_paths, card_id, source_key))
+                return
+
+            if path.startswith("/api/cards/") and path.endswith("/workspace/files/content"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 6:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid local file content route")
+                    return
+                card_id = parts[2]
+                rel_path = (qs.get("path", [""])[0] or "").strip()
+                if not rel_path:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Missing path query parameter")
+                    return
+                self._send_local_file(card_id, rel_path)
+                return
+
+            if "/workspace/runs/" in path:
+                parts = path.strip("/").split("/")
+                if len(parts) != 6 or parts[3] != "workspace" or parts[4] != "runs":
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace run route")
+                    return
+                card_id = parts[2]
+                run_id = parts[5]
+                self._send_json(get_run_result(self.workbench_paths, card_id, run_id))
+                return
+
             if path.startswith("/api/cards/") and "/attachments/" in path and path.endswith("/content"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 6 or parts[3] != "attachments":
@@ -432,6 +551,85 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             self._send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
         except ValueError as e:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(e))
+        except FileNotFoundError as e:
+            self._send_error_json(HTTPStatus.NOT_FOUND, str(e))
+        except Exception as e:  # pragma: no cover - debug-friendly for local tool
+            self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+    def _handle_api_post(self, parsed: Any) -> None:
+        path = parsed.path
+        try:
+            payload = self._read_json_body()
+            client = self._client()
+
+            if path == "/api/checklist":
+                text = str(payload.get("text") or "")
+                parsed_checklist = save_checklist_text(self.workbench_paths, text)
+                self._send_json({"ok": True, "parsed": parsed_checklist, "text": load_checklist_text(self.workbench_paths)})
+                return
+
+            if path.startswith("/api/cards/") and path.endswith("/workspace/create"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 5:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace create route")
+                    return
+                card_id = parts[2]
+                card = client.get("/cards/" + card_id, fields="id,name,url")
+                info = ensure_card_workspace(
+                    self.workbench_paths,
+                    card_id=card_id,
+                    card_name=card.get("name") or card_id,
+                    card_url=card.get("url") or "",
+                )
+                self._send_json(info)
+                return
+
+            if path.startswith("/api/cards/") and path.endswith("/workspace/indexes"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 5:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace indexes save route")
+                    return
+                card_id = parts[2]
+                indexes = payload.get("indexes")
+                if not isinstance(indexes, list):
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Body must contain indexes array")
+                    return
+                card = client.get("/cards/" + card_id, fields="id,name,url")
+                result = save_indexes_for_card(
+                    self.workbench_paths,
+                    card_id=card_id,
+                    card_name=card.get("name") or card_id,
+                    card_url=card.get("url") or "",
+                    indexes=indexes,
+                )
+                self._send_json({"ok": True, **result})
+                return
+
+            if path.startswith("/api/cards/") and path.endswith("/workspace/run"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 5:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace run route")
+                    return
+                card_id = parts[2]
+                card_packet = get_card_packet(client, card_id=card_id)
+                card = card_packet.get("card") or {}
+                model = (payload.get("model") or "").strip() if isinstance(payload.get("model"), str) else None
+                result = run_checklist_for_card(
+                    self.workbench_paths,
+                    card_id=card_id,
+                    card_name=card.get("name") or card_id,
+                    card_url=card.get("url") or "",
+                    card_packet=card_packet,
+                    model=model,
+                )
+                self._send_json({"ok": True, **result})
+                return
+
+            self._send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
+        except ValueError as e:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, str(e))
+        except FileNotFoundError as e:
+            self._send_error_json(HTTPStatus.NOT_FOUND, str(e))
         except Exception as e:  # pragma: no cover - debug-friendly for local tool
             self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
 
@@ -448,6 +646,7 @@ def main() -> int:
     cfg = load_config()
     server = ThreadingHTTPServer((args.host, args.port), TrelloWorkbenchHandler)
     server.app_config = cfg  # type: ignore[attr-defined]
+    server.workbench_paths = init_workbench_paths(ROOT_DIR)  # type: ignore[attr-defined]
 
     print(f"Trello workbench: http://{args.host}:{args.port}")
     print("Endpoints:")
@@ -455,6 +654,12 @@ def main() -> int:
     print("  GET /api/boards/<boardId>/cards?limit=200")
     print("  GET /api/cards/<cardId>/packet")
     print("  GET /api/cards/<cardId>/attachments/<attachmentId>/content")
+    print("  GET /api/checklist")
+    print("  POST /api/checklist")
+    print("  GET /api/cards/<cardId>/workspace")
+    print("  POST /api/cards/<cardId>/workspace/create")
+    print("  POST /api/cards/<cardId>/workspace/indexes")
+    print("  POST /api/cards/<cardId>/workspace/run")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

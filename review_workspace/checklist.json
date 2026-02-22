@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "Review Checklist",
+  "instructions": "Edit this checklist in the UI. Keep item ids stable once citations/runs exist.",
+  "items": [
+    {
+      "id": "item_001",
+      "title": "Required document is present",
+      "description": "Confirm the required supporting document exists and appears complete.",
+      "pass_criteria": "Document exists and contains the expected content/sections.",
+      "fail_criteria": "Document missing, incomplete, or clearly inconsistent.",
+      "required_evidence_types": []
+    }
+  ]
+}

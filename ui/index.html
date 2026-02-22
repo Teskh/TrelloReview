@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Trello Review Workbench</title>
+    <title>Trello Review Workbench MVP</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -11,17 +11,21 @@
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" defer></script>
+    <script src="/app.js" defer></script>
   </head>
   <body>
     <div class="grain" aria-hidden="true"></div>
     <header class="topbar">
       <div>
         <p class="eyebrow">Local Tooling</p>
-        <h1>Trello Review Workbench</h1>
+        <h1>Trello Review Workbench MVP</h1>
       </div>
       <div class="actions">
         <button id="refreshBoardsBtn" class="btn">Refresh Boards</button>
-        <button id="copyMdBtn" class="btn btn-accent" disabled>Copy Markdown</button>
+        <button id="copyMdBtn" class="btn" disabled>Copy Packet Markdown</button>
       </div>
     </header>
 
@@ -48,20 +52,81 @@
         <ul id="cardsList" class="list card-list"></ul>
       </section>
 
-      <section class="panel viewer-panel">
+      <section class="panel workspace-panel">
         <div class="panel-head">
-          <h2>LLM Packet Preview</h2>
+          <h2>Card Workspace</h2>
           <span id="cardBadge" class="pill">No card selected</span>
         </div>
-        <div class="tabs">
-          <button class="tab active" data-tab="markdown">Markdown Transcript</button>
-          <button class="tab" data-tab="rendered">Rendered Transcript</button>
-          <button class="tab" data-tab="json">Raw Packet JSON</button>
+        <div id="viewerState" class="meta-block muted">Select a card to fetch a packet and workspace state.</div>
+
+        <div class="toolbar-row">
+          <button id="createWorkspaceBtn" class="btn" disabled>Create Folder</button>
+          <button id="refreshWorkspaceBtn" class="btn" disabled>Refresh Workspace</button>
+          <button id="indexLocalBtn" class="btn" disabled>Index Local Attachments</button>
+          <button id="indexTrelloBtn" class="btn" disabled>Index Trello Attachments</button>
         </div>
-        <div id="viewerState" class="meta-block muted">Select a card to fetch comments/checklists/attachments.</div>
-        <pre id="markdownView" class="viewer tab-pane active"></pre>
-        <div id="renderedView" class="viewer md-render tab-pane"></div>
-        <pre id="jsonView" class="viewer tab-pane"></pre>
+
+        <div class="toolbar-row">
+          <label for="modelInput">Model</label>
+          <input id="modelInput" type="text" value="gpt-5.2" />
+          <button id="runChecklistBtn" class="btn btn-accent" disabled>Run Checklist (OpenAI)</button>
+        </div>
+
+        <div id="workspaceMeta" class="meta-block muted">No workspace created.</div>
+        <div id="workspaceLists" class="split-grid">
+          <div>
+            <h3>Local Files (`attachments/`)</h3>
+            <ul id="localFilesList" class="list compact-list"></ul>
+          </div>
+          <div>
+            <h3>Indexed Sources</h3>
+            <ul id="indexesList" class="list compact-list"></ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel checklist-panel">
+        <div class="panel-head">
+          <h2>Checklist Editor (JSON)</h2>
+          <div class="panel-controls">
+            <button id="loadChecklistBtn" class="btn">Reload</button>
+            <button id="saveChecklistBtn" class="btn btn-accent">Save Checklist</button>
+          </div>
+        </div>
+        <div id="checklistStatus" class="meta-block muted">Checklist not loaded yet.</div>
+        <textarea id="checklistEditor" class="editor" spellcheck="false"></textarea>
+      </section>
+
+      <section class="panel results-panel">
+        <div class="panel-head">
+          <h2>Checklist Results</h2>
+          <div class="panel-controls">
+            <label for="runHistorySelect">Run</label>
+            <select id="runHistorySelect"></select>
+            <button id="loadRunBtn" class="btn" disabled>Load Run</button>
+          </div>
+        </div>
+        <div id="runSummary" class="meta-block muted">No run yet.</div>
+        <div id="resultsList" class="results-list"></div>
+      </section>
+
+      <section class="panel viewer-panel">
+        <div class="panel-head">
+          <h2>Citation Viewer</h2>
+          <span id="citationBadge" class="pill muted">No citation selected</span>
+        </div>
+        <div class="tabs">
+          <button class="tab active" data-tab="packet-rendered">Packet Rendered</button>
+          <button class="tab" data-tab="packet-markdown">Packet Markdown</button>
+          <button class="tab" data-tab="packet-json">Packet JSON</button>
+          <button class="tab" data-tab="citation-doc">Cited Document</button>
+          <button class="tab" data-tab="citation-json">Index JSON</button>
+        </div>
+        <div id="packetRenderedView" class="viewer md-render tab-pane active"></div>
+        <pre id="packetMarkdownView" class="viewer tab-pane"></pre>
+        <pre id="packetJsonView" class="viewer tab-pane"></pre>
+        <div id="citationDocView" class="viewer doc-view tab-pane"></div>
+        <pre id="citationJsonView" class="viewer tab-pane"></pre>
       </section>
     </main>
 
@@ -77,7 +142,5 @@
         </button>
       </li>
     </template>
-
-    <script src="/app.js" defer></script>
   </body>
 </html>

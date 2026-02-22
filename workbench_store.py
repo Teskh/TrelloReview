@@ -1,0 +1,880 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _safe_slug(text: str, max_len: int = 80) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", (text or "").strip()).strip("-").lower()
+    return (slug[:max_len].rstrip("-") or "card")
+
+
+def _json_dump(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _json_load(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def normalize_text(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def normalize_text_loose(s: str) -> str:
+    s = normalize_text(s)
+    return re.sub(r"[^a-z0-9 ]+", "", s)
+
+
+def similarity_score(a: str, b: str) -> float:
+    # stdlib-only fuzzy score for v1
+    import difflib
+
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, normalize_text_loose(a), normalize_text_loose(b)).ratio()
+
+
+@dataclass
+class WorkbenchPaths:
+    root: Path
+    cards_dir: Path
+    checklist_file: Path
+
+
+def init_workbench_paths(project_root: Path) -> WorkbenchPaths:
+    root = project_root / "review_workspace"
+    cards_dir = root / "cards"
+    root.mkdir(parents=True, exist_ok=True)
+    cards_dir.mkdir(parents=True, exist_ok=True)
+    checklist_file = root / "checklist.json"
+    if not checklist_file.exists():
+        _json_dump(checklist_file, default_checklist())
+    return WorkbenchPaths(root=root, cards_dir=cards_dir, checklist_file=checklist_file)
+
+
+def default_checklist() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "name": "Review Checklist",
+        "instructions": "Edit this checklist in the UI. Keep item ids stable once citations/runs exist.",
+        "items": [
+            {
+                "id": "item_001",
+                "title": "Required document is present",
+                "description": "Confirm the required supporting document exists and appears complete.",
+                "pass_criteria": "Document exists and contains the expected content/sections.",
+                "fail_criteria": "Document missing, incomplete, or clearly inconsistent.",
+            }
+        ],
+    }
+
+
+def load_checklist(paths: WorkbenchPaths) -> Dict[str, Any]:
+    raw = _json_load(paths.checklist_file, default_checklist())
+    return validate_and_normalize_checklist(raw)
+
+
+def load_checklist_text(paths: WorkbenchPaths) -> str:
+    if not paths.checklist_file.exists():
+        _json_dump(paths.checklist_file, default_checklist())
+    return paths.checklist_file.read_text(encoding="utf-8")
+
+
+def save_checklist_text(paths: WorkbenchPaths, text: str) -> Dict[str, Any]:
+    parsed = json.loads(text)
+    normalized = validate_and_normalize_checklist(parsed)
+    paths.checklist_file.write_text(json.dumps(normalized, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return normalized
+
+
+def validate_and_normalize_checklist(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Checklist must be a JSON object")
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("Checklist must contain a non-empty items array")
+    seen: set[str] = set()
+    out_items: List[Dict[str, Any]] = []
+    for idx, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Checklist item #{idx} must be an object")
+        item_id = str(item.get("id") or "").strip()
+        if not item_id:
+            raise ValueError(f"Checklist item #{idx} missing id")
+        if item_id in seen:
+            raise ValueError(f"Duplicate checklist item id: {item_id}")
+        seen.add(item_id)
+        title = str(item.get("title") or "").strip()
+        if not title:
+            raise ValueError(f"Checklist item {item_id} missing title")
+        out_items.append(
+            {
+                "id": item_id,
+                "title": title,
+                "description": str(item.get("description") or "").strip(),
+                "pass_criteria": str(item.get("pass_criteria") or "").strip(),
+                "fail_criteria": str(item.get("fail_criteria") or "").strip(),
+                "required_evidence_types": item.get("required_evidence_types") or [],
+            }
+        )
+    return {
+        "version": int(payload.get("version") or 1),
+        "name": str(payload.get("name") or "Review Checklist").strip() or "Review Checklist",
+        "instructions": str(payload.get("instructions") or "").strip(),
+        "items": out_items,
+    }
+
+
+def _find_card_workspace_dir(paths: WorkbenchPaths, card_id: str) -> Optional[Path]:
+    suffix = "__" + card_id
+    for p in paths.cards_dir.iterdir():
+        if p.is_dir() and p.name.endswith(suffix):
+            return p
+    return None
+
+
+def _card_workspace_dir(paths: WorkbenchPaths, card_id: str, card_name: str) -> Path:
+    return paths.cards_dir / f"{_safe_slug(card_name)}__{card_id}"
+
+
+def _manifest_path(ws_dir: Path) -> Path:
+    return ws_dir / "manifest.json"
+
+
+def _card_meta_path(ws_dir: Path) -> Path:
+    return ws_dir / "card_meta.json"
+
+
+def _indexes_dir(ws_dir: Path) -> Path:
+    return ws_dir / "indexes"
+
+
+def _runs_dir(ws_dir: Path) -> Path:
+    return ws_dir / "runs"
+
+
+def _attachments_dir(ws_dir: Path) -> Path:
+    return ws_dir / "attachments"
+
+
+def _default_manifest(card_id: str) -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "card_id": card_id,
+        "updated_at": utc_now_iso(),
+        "local_files": {},
+        "trello_sources": {},
+        "indexes": {},
+        "runs": [],
+    }
+
+
+def _load_manifest(ws_dir: Path, card_id: str) -> Dict[str, Any]:
+    manifest = _json_load(_manifest_path(ws_dir), _default_manifest(card_id))
+    if not isinstance(manifest, dict):
+        manifest = _default_manifest(card_id)
+    manifest.setdefault("version", 1)
+    manifest.setdefault("card_id", card_id)
+    manifest.setdefault("local_files", {})
+    manifest.setdefault("trello_sources", {})
+    manifest.setdefault("indexes", {})
+    manifest.setdefault("runs", [])
+    return manifest
+
+
+def _save_manifest(ws_dir: Path, manifest: Dict[str, Any]) -> None:
+    manifest["updated_at"] = utc_now_iso()
+    _json_dump(_manifest_path(ws_dir), manifest)
+
+
+def _sha1_text(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()  # noqa: S324 - non-security id only
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def ensure_card_workspace(
+    paths: WorkbenchPaths,
+    *,
+    card_id: str,
+    card_name: str,
+    card_url: str = "",
+) -> Dict[str, Any]:
+    existing = _find_card_workspace_dir(paths, card_id)
+    ws_dir = existing or _card_workspace_dir(paths, card_id, card_name)
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    _attachments_dir(ws_dir).mkdir(parents=True, exist_ok=True)
+    _indexes_dir(ws_dir).mkdir(parents=True, exist_ok=True)
+    _runs_dir(ws_dir).mkdir(parents=True, exist_ok=True)
+    meta = {
+        "id": card_id,
+        "name": card_name,
+        "url": card_url,
+        "workspace_folder": ws_dir.name,
+        "updated_at": utc_now_iso(),
+    }
+    _json_dump(_card_meta_path(ws_dir), meta)
+    manifest = _load_manifest(ws_dir, card_id)
+    _save_manifest(ws_dir, manifest)
+    return get_card_workspace_info(paths, card_id)
+
+
+def _iter_local_files(root: Path) -> Iterable[Path]:
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            if any(part.startswith(".") for part in p.relative_to(root).parts):
+                continue
+            yield p
+
+
+def _rel_posix(root: Path, p: Path) -> str:
+    return p.relative_to(root).as_posix()
+
+
+def file_stat_fingerprint(path: Path) -> Dict[str, Any]:
+    st = path.stat()
+    return {
+        "size": st.st_size,
+        "mtime_ns": getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),
+    }
+
+
+def list_runs_summary(ws_dir: Path) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    runs_dir = _runs_dir(ws_dir)
+    if not runs_dir.exists():
+        return out
+    for run_dir in sorted([p for p in runs_dir.iterdir() if p.is_dir()], key=lambda p: p.name, reverse=True):
+        result_path = run_dir / "run_result.json"
+        if not result_path.exists():
+            continue
+        data = _json_load(result_path, {})
+        summary = data.get("summary") or {}
+        out.append(
+            {
+                "run_id": run_dir.name,
+                "created_at": data.get("created_at"),
+                "model": data.get("model"),
+                "counts": summary.get("counts"),
+                "status": summary.get("status"),
+            }
+        )
+    return out[:20]
+
+
+def get_card_workspace_info(paths: WorkbenchPaths, card_id: str) -> Dict[str, Any]:
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        return {"exists": False, "card_id": card_id}
+    manifest = _load_manifest(ws_dir, card_id)
+    attachments_dir = _attachments_dir(ws_dir)
+    local_files: List[Dict[str, Any]] = []
+    manifest_local = manifest.get("local_files", {})
+    for p in _iter_local_files(attachments_dir):
+        rel = _rel_posix(attachments_dir, p)
+        fp = file_stat_fingerprint(p)
+        entry = manifest_local.get(rel, {}) if isinstance(manifest_local, dict) else {}
+        stored_size = entry.get("size")
+        stored_mtime_ns = entry.get("mtime_ns")
+        indexed = bool(entry.get("index_file"))
+        changed = indexed and (
+            (stored_size is not None and stored_size != fp["size"])
+            or (stored_mtime_ns is not None and stored_mtime_ns != fp["mtime_ns"])
+        )
+        status = entry.get("index_status") or ("indexed" if indexed else "not_indexed")
+        if changed:
+            status = "changed"
+        local_files.append(
+            {
+                "relativePath": rel,
+                "size": fp["size"],
+                "mtimeNs": fp["mtime_ns"],
+                "indexedHash": entry.get("content_hash"),
+                "lastIndexedAt": entry.get("last_indexed_at"),
+                "indexSourceKey": entry.get("source_key"),
+                "indexStatus": status,
+                "indexFileKind": entry.get("file_kind"),
+                "indexWarnings": entry.get("warnings") or [],
+            }
+        )
+    meta = _json_load(_card_meta_path(ws_dir), {})
+    return {
+        "exists": True,
+        "card_id": card_id,
+        "workspaceFolder": ws_dir.name,
+        "workspacePath": str(ws_dir),
+        "attachmentsPath": str(attachments_dir),
+        "cardMeta": meta,
+        "manifest": manifest,
+        "localFiles": local_files,
+        "runs": list_runs_summary(ws_dir),
+    }
+
+
+def get_local_file_path(paths: WorkbenchPaths, card_id: str, rel_path: str) -> Path:
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        raise FileNotFoundError("Workspace does not exist")
+    attachments_dir = _attachments_dir(ws_dir).resolve()
+    candidate = (attachments_dir / rel_path).resolve()
+    if attachments_dir not in [candidate, *candidate.parents]:
+        raise ValueError("Invalid relative path")
+    if not candidate.is_file():
+        raise FileNotFoundError("File not found")
+    return candidate
+
+
+def _index_filename(source_key: str, file_kind: str) -> str:
+    ext = ".json"
+    return f"{file_kind}__{_sha1_text(source_key)[:16]}{ext}"
+
+
+def save_indexes_for_card(
+    paths: WorkbenchPaths,
+    *,
+    card_id: str,
+    card_name: str,
+    card_url: str,
+    indexes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    info = ensure_card_workspace(paths, card_id=card_id, card_name=card_name, card_url=card_url)
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        raise RuntimeError("Workspace create/load failed")
+    manifest = _load_manifest(ws_dir, card_id)
+    indexes_dir = _indexes_dir(ws_dir)
+    saved: List[Dict[str, Any]] = []
+
+    for payload in indexes:
+        if not isinstance(payload, dict):
+            continue
+        source = str(payload.get("source") or "").strip()
+        source_key = str(payload.get("sourceKey") or "").strip()
+        card_ref = str(payload.get("cardId") or card_id)
+        if card_ref != card_id:
+            raise ValueError(f"Index source {source_key} references mismatched card id")
+        if source not in ("local", "trello"):
+            raise ValueError(f"Invalid source for index {source_key}")
+        if not source_key:
+            raise ValueError("Index payload missing sourceKey")
+        index_data = payload.get("index")
+        if not isinstance(index_data, dict):
+            raise ValueError(f"Index payload {source_key} missing index object")
+
+        file_kind = str(index_data.get("file_kind") or payload.get("fileKind") or "unknown").lower()
+        idx_name = _index_filename(source_key, file_kind)
+        idx_rel = f"indexes/{idx_name}"
+        idx_path = indexes_dir / idx_name
+        _json_dump(idx_path, index_data)
+
+        index_summary = {
+            "source": source,
+            "source_key": source_key,
+            "file_kind": file_kind,
+            "display_name": payload.get("displayName") or index_data.get("display_name") or source_key,
+            "mime_type": payload.get("mimeType") or index_data.get("mime_type") or "",
+            "content_hash": payload.get("contentHash") or index_data.get("content_hash") or "",
+            "index_file": idx_rel,
+            "segment_count": len(index_data.get("segments") or []),
+            "updated_at": utc_now_iso(),
+            "warnings": index_data.get("warnings") or [],
+            "source_locator": payload.get("sourceLocator") or {},
+        }
+        manifest["indexes"][source_key] = index_summary
+
+        if source == "local":
+            rel = str((payload.get("localFile") or {}).get("relativePath") or "").strip()
+            if rel:
+                stat = None
+                try:
+                    stat = file_stat_fingerprint(get_local_file_path(paths, card_id, rel))
+                except Exception:
+                    stat = None
+                manifest["local_files"][rel] = {
+                    "source_key": source_key,
+                    "content_hash": index_summary["content_hash"],
+                    "file_kind": file_kind,
+                    "index_file": idx_rel,
+                    "index_status": "indexed",
+                    "last_indexed_at": utc_now_iso(),
+                    "warnings": index_summary["warnings"],
+                    "size": stat["size"] if stat else None,
+                    "mtime_ns": stat["mtime_ns"] if stat else None,
+                }
+        else:
+            trello_meta = payload.get("trelloAttachment") or {}
+            attachment_id = str(trello_meta.get("attachmentId") or trello_meta.get("id") or "").strip()
+            if attachment_id:
+                manifest["trello_sources"][attachment_id] = {
+                    "attachment_id": attachment_id,
+                    "source_key": source_key,
+                    "name": trello_meta.get("name") or payload.get("displayName"),
+                    "mime_type": payload.get("mimeType") or trello_meta.get("mimeType"),
+                    "content_hash": index_summary["content_hash"],
+                    "index_file": idx_rel,
+                    "last_indexed_at": utc_now_iso(),
+                    "proxy_url": trello_meta.get("proxyUrl"),
+                    "source_url": trello_meta.get("sourceUrl"),
+                    "warnings": index_summary["warnings"],
+                }
+
+        saved.append({"sourceKey": source_key, "fileKind": file_kind, "indexFile": idx_rel})
+
+    _save_manifest(ws_dir, manifest)
+    return {"saved": saved, "workspace": get_card_workspace_info(paths, card_id)}
+
+
+def _load_index_by_source_key(ws_dir: Path, manifest: Dict[str, Any], source_key: str) -> Dict[str, Any]:
+    entry = (manifest.get("indexes") or {}).get(source_key)
+    if not entry:
+        raise FileNotFoundError(f"Index not found for sourceKey={source_key}")
+    idx_rel = entry.get("index_file")
+    if not idx_rel:
+        raise FileNotFoundError(f"Index file missing for sourceKey={source_key}")
+    idx_path = (ws_dir / idx_rel).resolve()
+    if ws_dir.resolve() not in [idx_path, *idx_path.parents]:
+        raise ValueError("Invalid index path")
+    data = _json_load(idx_path, {})
+    if not isinstance(data, dict):
+        raise ValueError("Index file invalid")
+    return data
+
+
+def get_index_for_card(paths: WorkbenchPaths, card_id: str, source_key: str) -> Dict[str, Any]:
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        raise FileNotFoundError("Workspace not found")
+    manifest = _load_manifest(ws_dir, card_id)
+    index_data = _load_index_by_source_key(ws_dir, manifest, source_key)
+    entry = manifest.get("indexes", {}).get(source_key, {})
+    return {
+        "sourceKey": source_key,
+        "summary": entry,
+        "index": index_data,
+    }
+
+
+def list_index_summaries(paths: WorkbenchPaths, card_id: str) -> Dict[str, Any]:
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        return {"indexes": []}
+    manifest = _load_manifest(ws_dir, card_id)
+    indexes = []
+    for source_key, entry in sorted((manifest.get("indexes") or {}).items()):
+        if isinstance(entry, dict):
+            row = dict(entry)
+            row["source_key"] = source_key
+            indexes.append(row)
+    return {"indexes": indexes}
+
+
+def _collect_evidence_segments(paths: WorkbenchPaths, card_id: str) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        raise FileNotFoundError("Workspace not found")
+    manifest = _load_manifest(ws_dir, card_id)
+    idx_entries = manifest.get("indexes") or {}
+    evidence: List[Dict[str, Any]] = []
+    index_lookup: Dict[str, Dict[str, Any]] = {}
+    for source_key, entry in idx_entries.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            data = _load_index_by_source_key(ws_dir, manifest, source_key)
+        except Exception:
+            continue
+        index_lookup[source_key] = data
+        segments = data.get("segments") or []
+        # Keep payload compact while preserving anchors
+        ev_segments = []
+        for seg in segments[:500]:
+            if not isinstance(seg, dict):
+                continue
+            ev_segments.append(
+                {
+                    "anchor_id": seg.get("anchor_id"),
+                    "kind": seg.get("kind"),
+                    "text": str(seg.get("text") or "")[:1200],
+                    "page": seg.get("page"),
+                    "sheet": seg.get("sheet"),
+                    "meta": seg.get("meta") or {},
+                }
+            )
+        evidence.append(
+            {
+                "source_key": source_key,
+                "source": entry.get("source"),
+                "display_name": entry.get("display_name"),
+                "file_kind": data.get("file_kind") or entry.get("file_kind"),
+                "mime_type": data.get("mime_type") or entry.get("mime_type"),
+                "content_hash": data.get("content_hash") or entry.get("content_hash"),
+                "warnings": data.get("warnings") or entry.get("warnings") or [],
+                "segments": ev_segments,
+            }
+        )
+    return evidence, index_lookup
+
+
+def _response_text_from_responses_api(payload: Dict[str, Any]) -> str:
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+    texts: List[str] = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content") or []:
+            if not isinstance(content, dict):
+                continue
+            txt = content.get("text")
+            if isinstance(txt, str):
+                texts.append(txt)
+    return "\n".join(texts).strip()
+
+
+def checklist_run_schema() -> Dict[str, Any]:
+    citation = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "source_key": {"type": "string"},
+            "anchor_id": {"type": "string"},
+            "quote": {"type": "string"},
+            "reason": {"type": "string"},
+            "page": {"type": ["integer", "null"]},
+            "sheet": {"type": ["string", "null"]},
+            "bbox": {
+                "type": ["array", "null"],
+                "items": {"type": "number"},
+                "minItems": 4,
+                "maxItems": 4,
+            },
+        },
+        "required": ["source_key", "anchor_id", "quote", "reason", "page", "sheet", "bbox"],
+    }
+    item = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "item_id": {"type": "string"},
+            "status": {"type": "string", "enum": ["pass", "fail", "needs_review"]},
+            "confidence": {"type": "number"},
+            "rationale": {"type": "string"},
+            "citations": {"type": "array", "items": citation},
+            "missing_evidence": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["item_id", "status", "confidence", "rationale", "citations", "missing_evidence"],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "summary": {"type": "string"},
+            "items": {"type": "array", "items": item},
+            "global_notes": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["summary", "items", "global_notes"],
+    }
+
+
+def build_system_prompt() -> str:
+    return (
+        "You are a meticulous document review assistant. "
+        "Evaluate checklist items using only the provided evidence segments. "
+        "Every conclusion must cite one or more evidence anchors. "
+        "Citations must reference source_key and anchor_id exactly as provided. "
+        "If evidence is insufficient, ambiguous, or the document is image/scanned-only without usable text, "
+        "return status='needs_review' and explain what is missing. "
+        "Do not invent citations. Use verbatim quotes copied from the cited segment text when available. "
+        "For image-only/scanned pages without text, set quote to an empty string and cite the page anchor."
+    )
+
+
+def _openai_request(
+    *,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    base_body = {
+        "model": model,
+        "reasoning": {"effort": "high"},
+        "input": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+    }
+    attempts = [
+        {
+            **base_body,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "checklist_review",
+                    "schema": checklist_run_schema(),
+                    "strict": True,
+                }
+            },
+        },
+        {
+            **base_body,
+            "input": [
+                {"role": "system", "content": system_prompt + " Return strict JSON matching the requested schema."},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ],
+        },
+    ]
+    last_err: Optional[Exception] = None
+    for attempt_idx, body in enumerate(attempts, start=1):
+        req = Request(
+            "https://api.openai.com/v1/responses",
+            method="POST",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(req, timeout=180) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            last_err = RuntimeError(f"OpenAI Responses API error {e.code} (attempt {attempt_idx}): {detail}")
+            # If structured format is rejected, try plain JSON-prompt fallback once.
+            if attempt_idx == 1:
+                continue
+            raise last_err from e
+        except URLError as e:
+            raise RuntimeError(f"OpenAI Responses API network error: {e}") from e
+    if last_err:
+        raise last_err
+    raise RuntimeError("OpenAI Responses API request failed")
+
+
+def _validate_citations(result: Dict[str, Any], index_lookup: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    segment_maps: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for source_key, idx in index_lookup.items():
+        seg_map: Dict[str, Dict[str, Any]] = {}
+        for seg in idx.get("segments") or []:
+            if isinstance(seg, dict) and seg.get("anchor_id"):
+                seg_map[str(seg["anchor_id"])] = seg
+        segment_maps[source_key] = seg_map
+
+    for item in result.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        validated = []
+        for cit in item.get("citations") or []:
+            if not isinstance(cit, dict):
+                continue
+            source_key = str(cit.get("source_key") or "")
+            anchor_id = str(cit.get("anchor_id") or "")
+            seg = segment_maps.get(source_key, {}).get(anchor_id)
+            quote = str(cit.get("quote") or "")
+            val = dict(cit)
+            if not seg:
+                val["validation"] = {"status": "missing_anchor", "score": 0}
+            else:
+                seg_text = str(seg.get("text") or "")
+                if not quote:
+                    score = 1.0 if not seg_text else 0.0
+                elif normalize_text(quote) in normalize_text(seg_text):
+                    score = 1.0
+                else:
+                    score = round(similarity_score(quote, seg_text), 4)
+                val["validation"] = {
+                    "status": "ok" if score >= 0.55 else "weak_match",
+                    "score": score,
+                    "segment_text_preview": seg_text[:240],
+                }
+                if val.get("page") is None and seg.get("page") is not None:
+                    val["page"] = seg.get("page")
+                if val.get("sheet") is None and seg.get("sheet") is not None:
+                    val["sheet"] = seg.get("sheet")
+            validated.append(val)
+        item["citations"] = validated
+    return result
+
+
+def _summarize_run(result: Dict[str, Any]) -> Dict[str, Any]:
+    counts = {"pass": 0, "fail": 0, "needs_review": 0}
+    for item in result.get("items") or []:
+        status = str((item or {}).get("status") or "")
+        if status in counts:
+            counts[status] += 1
+    overall = "ok"
+    if counts["fail"] > 0:
+        overall = "has_failures"
+    elif counts["needs_review"] > 0:
+        overall = "needs_review"
+    return {"status": overall, "counts": counts}
+
+
+def run_checklist_for_card(
+    paths: WorkbenchPaths,
+    *,
+    card_id: str,
+    card_name: str,
+    card_url: str,
+    card_packet: Dict[str, Any],
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        raise FileNotFoundError("Workspace not found for card. Create it first.")
+    checklist = load_checklist(paths)
+    evidence, index_lookup = _collect_evidence_segments(paths, card_id)
+    if not evidence:
+        raise ValueError("No indexed evidence found. Index local and/or Trello attachments first.")
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY in environment")
+    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.2").strip()
+
+    user_payload = {
+        "task": "Evaluate checklist against indexed evidence and return structured results with citations.",
+        "card": {
+            "id": card_id,
+            "name": card_name,
+            "url": card_url,
+            "metadata": {
+                "labels": [l.get("name") or l.get("color") for l in (card_packet.get("card") or {}).get("labels", [])],
+                "members": [
+                    m.get("fullName") or m.get("username")
+                    for m in (card_packet.get("members") or [])
+                    if (m.get("fullName") or m.get("username"))
+                ],
+            },
+        },
+        "checklist": checklist,
+        "citation_rules": {
+            "must_cite_every_item": True,
+            "cite_only_provided_source_key_and_anchor_id": True,
+            "prefer_exact_quote": True,
+            "for_image_or_scanned_pdf_without_text": "Use page anchor citation and empty quote, then mark needs_review unless other evidence resolves the item.",
+        },
+        "evidence_documents": evidence,
+    }
+
+    raw_api = _openai_request(
+        api_key=api_key,
+        model=model_name,
+        system_prompt=build_system_prompt(),
+        user_payload=user_payload,
+    )
+    text = _response_text_from_responses_api(raw_api)
+    if not text:
+        raise RuntimeError("OpenAI response did not contain output text")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Model output was not valid JSON: {e}\n{text[:1000]}") from e
+
+    parsed = _validate_citations(parsed, index_lookup)
+    summary = _summarize_run(parsed)
+
+    run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
+    run_dir = _runs_dir(ws_dir) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    _json_dump(run_dir / "llm_request.json", user_payload)
+    _json_dump(run_dir / "llm_response_raw.json", raw_api)
+    run_result = {
+        "run_id": run_id,
+        "created_at": utc_now_iso(),
+        "model": model_name,
+        "summary": summary,
+        "card": {"id": card_id, "name": card_name, "url": card_url},
+        "result": parsed,
+    }
+    _json_dump(run_dir / "run_result.json", run_result)
+
+    manifest = _load_manifest(ws_dir, card_id)
+    manifest_runs = manifest.get("runs")
+    if not isinstance(manifest_runs, list):
+        manifest_runs = []
+        manifest["runs"] = manifest_runs
+    manifest_runs.insert(
+        0,
+        {
+            "run_id": run_id,
+            "created_at": run_result["created_at"],
+            "model": model_name,
+            "summary": summary,
+        },
+    )
+    manifest["runs"] = manifest_runs[:50]
+    _save_manifest(ws_dir, manifest)
+
+    return {"run": run_result, "runs": list_runs_summary(ws_dir)}
+
+
+def get_run_result(paths: WorkbenchPaths, card_id: str, run_id: str) -> Dict[str, Any]:
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        raise FileNotFoundError("Workspace not found")
+    run_dir = _runs_dir(ws_dir) / run_id
+    if not run_dir.exists():
+        raise FileNotFoundError("Run not found")
+    result = _json_load(run_dir / "run_result.json", None)
+    if not isinstance(result, dict):
+        raise FileNotFoundError("Run result missing")
+    return result
+
+
+def detect_mime_from_name(name: str) -> str:
+    ext = Path(name).suffix.lower()
+    return {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".csv": "text/csv",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }.get(ext, "application/octet-stream")
+
+
+def sha256_of_path(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()

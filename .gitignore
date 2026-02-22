@@ -4,6 +4,7 @@
 node_modules/
 /.pnp
 .pnp.js
+ review_workspace/
 
 # backups
 /backup_metadata.json
