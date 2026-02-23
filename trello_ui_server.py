@@ -28,6 +28,7 @@ from urllib.request import Request, urlopen
 from trello_smoke_test import TrelloClient, load_dotenv
 from workbench_store import (
     detect_mime_from_name,
+    estimate_llm_input_tokens_for_card,
     ensure_card_workspace,
     get_card_workspace_info,
     get_index_for_card,
@@ -38,6 +39,7 @@ from workbench_store import (
     load_checklist,
     load_checklist_text,
     run_checklist_for_card,
+    save_checklist,
     save_checklist_text,
     save_indexes_for_card,
 )
@@ -54,6 +56,10 @@ class AppConfig:
 
 def load_config() -> AppConfig:
     env = load_dotenv(ROOT_DIR / ".env")
+    # Populate process env for other modules (e.g., checklist runs) that read OpenAI vars directly.
+    for key in ("OPENAI_API_KEY", "OPENAI_MODEL"):
+        if env.get(key) and not os.getenv(key):
+            os.environ[key] = env[key]
     api_key = env.get("API_KEY") or os.getenv("API_KEY") or ""
     token = env.get("TOKEN") or os.getenv("TOKEN") or ""
     if not api_key or not token:
@@ -78,17 +84,33 @@ def get_me_and_boards(client: TrelloClient) -> Dict[str, Any]:
     return {"me": me, "boards": boards_sorted}
 
 
-def get_board_cards(client: TrelloClient, board_id: str, limit: int = 200) -> Dict[str, Any]:
+def get_board_cards(client: TrelloClient, board_id: str, limit: int = 200, query: str = "") -> Dict[str, Any]:
     board = client.get("/boards/" + board_id, fields="id,name,desc,url,dateLastActivity")
     cards = client.get(
         "/boards/" + board_id + "/cards",
         fields="id,name,desc,idList,idMembers,labels,dateLastActivity,url,closed,due,start",
         filter="open",
     )
+    total_open_cards = len(cards)
+    q = (query or "").strip().lower()
+    if q:
+        cards = [
+            c
+            for c in cards
+            if q in (str(c.get("name") or "").lower()) or q in (str(c.get("desc") or "").lower())
+        ]
+    matched_cards = len(cards)
     cards_sorted = sorted(cards, key=lambda c: (c.get("dateLastActivity") or ""), reverse=True)
     if limit > 0:
         cards_sorted = cards_sorted[:limit]
-    return {"board": board, "cards": cards_sorted}
+    return {
+        "board": board,
+        "cards": cards_sorted,
+        "query": query or "",
+        "total_open_cards": total_open_cards,
+        "matched_cards": matched_cards,
+        "returned_cards": len(cards_sorted),
+    }
 
 
 def is_image_attachment(attachment: Dict[str, Any]) -> bool:
@@ -470,7 +492,8 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     return
                 board_id = parts[2]
                 limit = int(qs.get("limit", ["200"])[0])
-                self._send_json(get_board_cards(client, board_id=board_id, limit=limit))
+                query = (qs.get("q", [""])[0] or "").strip()
+                self._send_json(get_board_cards(client, board_id=board_id, limit=limit, query=query))
                 return
 
             if path.startswith("/api/cards/") and path.endswith("/packet"):
@@ -563,9 +586,36 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             client = self._client()
 
             if path == "/api/checklist":
-                text = str(payload.get("text") or "")
-                parsed_checklist = save_checklist_text(self.workbench_paths, text)
+                if isinstance(payload.get("checklist"), dict):
+                    parsed_checklist = save_checklist(self.workbench_paths, payload["checklist"])
+                else:
+                    text = str(payload.get("text") or "")
+                    parsed_checklist = save_checklist_text(self.workbench_paths, text)
                 self._send_json({"ok": True, "parsed": parsed_checklist, "text": load_checklist_text(self.workbench_paths)})
+                return
+
+            if path.startswith("/api/cards/") and path.endswith("/workspace/token-estimate"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 5:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace token estimate route")
+                    return
+                card_id = parts[2]
+                model = (payload.get("model") or "").strip() if isinstance(payload.get("model"), str) else None
+                card_packet = payload.get("cardPacket")
+                if not isinstance(card_packet, dict):
+                    card_packet = get_card_packet(client, card_id=card_id)
+                card_obj = card_packet.get("card") if isinstance(card_packet, dict) else {}
+                if not isinstance(card_obj, dict):
+                    card_obj = {}
+                estimate = estimate_llm_input_tokens_for_card(
+                    self.workbench_paths,
+                    card_id=card_id,
+                    card_name=card_obj.get("name") or card_id,
+                    card_url=card_obj.get("url") or "",
+                    card_packet=card_packet if isinstance(card_packet, dict) else {},
+                    model=model,
+                )
+                self._send_json({"ok": True, "estimate": estimate})
                 return
 
             if path.startswith("/api/cards/") and path.endswith("/workspace/create"):
@@ -657,6 +707,7 @@ def main() -> int:
     print("  GET /api/checklist")
     print("  POST /api/checklist")
     print("  GET /api/cards/<cardId>/workspace")
+    print("  POST /api/cards/<cardId>/workspace/token-estimate")
     print("  POST /api/cards/<cardId>/workspace/create")
     print("  POST /api/cards/<cardId>/workspace/indexes")
     print("  POST /api/cards/<cardId>/workspace/run")

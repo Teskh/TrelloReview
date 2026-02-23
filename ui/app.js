@@ -3,12 +3,15 @@ const state = {
   filteredBoards: [],
   selectedBoard: null,
   cards: [],
+  lastCardsQuery: "",
+  cardSearchServerApplied: false,
   selectedCard: null,
   currentMarkdown: "",
   currentPacket: null,
   workspace: null,
-  checklistText: "",
+  tokenEstimate: null,
   checklistParsed: null,
+  checklistDraft: null,
   runResult: null,
   runHistory: [],
   indexCache: new Map(),
@@ -22,6 +25,7 @@ const els = {
   boardsList: document.getElementById("boardsList"),
   identity: document.getElementById("identity"),
   cardLimit: document.getElementById("cardLimit"),
+  cardSearch: document.getElementById("cardSearch"),
   loadCardsBtn: document.getElementById("loadCardsBtn"),
   selectedBoardMeta: document.getElementById("selectedBoardMeta"),
   cardsList: document.getElementById("cardsList"),
@@ -34,14 +38,18 @@ const els = {
   indexTrelloBtn: document.getElementById("indexTrelloBtn"),
   runChecklistBtn: document.getElementById("runChecklistBtn"),
   modelInput: document.getElementById("modelInput"),
+  tokenEstimate: document.getElementById("tokenEstimate"),
   workspaceMeta: document.getElementById("workspaceMeta"),
   localFilesList: document.getElementById("localFilesList"),
   indexesList: document.getElementById("indexesList"),
 
   checklistStatus: document.getElementById("checklistStatus"),
-  checklistEditor: document.getElementById("checklistEditor"),
+  checklistNameInput: document.getElementById("checklistNameInput"),
+  checklistInstructionsInput: document.getElementById("checklistInstructionsInput"),
+  checklistItemsList: document.getElementById("checklistItemsList"),
   loadChecklistBtn: document.getElementById("loadChecklistBtn"),
   saveChecklistBtn: document.getElementById("saveChecklistBtn"),
+  addChecklistItemBtn: document.getElementById("addChecklistItemBtn"),
 
   runSummary: document.getElementById("runSummary"),
   resultsList: document.getElementById("resultsList"),
@@ -212,6 +220,7 @@ function renderBoards() {
       state.selectedBoard = board;
       state.cards = [];
       state.selectedCard = null;
+      state.tokenEstimate = null;
       state.currentPacket = null;
       state.currentMarkdown = "";
       state.workspace = null;
@@ -220,6 +229,7 @@ function renderBoards() {
       renderBoards();
       renderCards();
       renderPacketViews();
+      renderTokenEstimate();
       renderWorkspace();
       renderResults();
       els.loadCardsBtn.disabled = false;
@@ -236,8 +246,16 @@ function renderBoards() {
 }
 
 function renderCards() {
+  const q = (els.cardSearch?.value || "").trim().toLowerCase();
+  const visibleCards = q
+    ? state.cards.filter((card) => {
+        const name = String(card.name || "").toLowerCase();
+        const desc = String(card.desc || "").toLowerCase();
+        return name.includes(q) || desc.includes(q);
+      })
+    : state.cards;
   els.cardsList.innerHTML = "";
-  for (const card of state.cards) {
+  for (const card of visibleCards) {
     const node = els.cardItemTpl.content.firstElementChild.cloneNode(true);
     const btn = node.querySelector("button");
     btn.querySelector(".title").textContent = card.name || "(unnamed card)";
@@ -251,7 +269,9 @@ function renderCards() {
     els.cardsList.appendChild(node);
   }
   if (!state.cards.length) {
-    els.cardsList.innerHTML = `<li class="meta-block muted">No cards loaded yet.</li>`;
+    els.cardsList.innerHTML = `<li class="meta-block muted">No cards loaded yet. Click Load Cards.</li>`;
+  } else if (!visibleCards.length) {
+    els.cardsList.innerHTML = `<li class="meta-block muted">No loaded cards match this search. Click Load Cards to search the full board.</li>`;
   }
 }
 
@@ -260,6 +280,43 @@ function renderPacketViews() {
   els.packetJsonView.textContent = state.currentPacket ? JSON.stringify(state.currentPacket, null, 2) : "";
   renderMarkdownPreview(state.currentMarkdown || "");
   els.copyMdBtn.disabled = !state.currentMarkdown;
+}
+
+function renderTokenEstimate() {
+  if (!els.tokenEstimate) return;
+  if (!state.selectedCard) {
+    els.tokenEstimate.textContent = "Token estimate: no card selected.";
+    els.tokenEstimate.classList.add("muted");
+    return;
+  }
+  const est = state.tokenEstimate;
+  if (!est) {
+    els.tokenEstimate.textContent = "Token estimate: not calculated yet.";
+    els.tokenEstimate.classList.add("muted");
+    return;
+  }
+  if (est.loading) {
+    els.tokenEstimate.textContent = "Token estimate: calculating...";
+    els.tokenEstimate.classList.add("muted");
+    return;
+  }
+  const model = est.model || (els.modelInput?.value || "gpt-5.2");
+  const total = est.counts?.total_input_tokens;
+  const docs = est.payload_stats?.evidence_documents ?? 0;
+  const segs = est.payload_stats?.evidence_segments ?? 0;
+  const checklistItems = est.payload_stats?.checklist_items ?? 0;
+  const commentsCount = est.payload_stats?.comments_count ?? 0;
+  const commentsChars = est.payload_stats?.comments_text_chars ?? 0;
+  const descChars = est.payload_stats?.card_description_chars ?? 0;
+  const encoding = est.tiktoken?.encoding || "n/a";
+  const notes = Array.isArray(est.notes) ? est.notes.filter(Boolean) : [];
+  const headline = Number.isFinite(total)
+    ? `Token estimate (${model}): ${total.toLocaleString()} input tokens`
+    : `Token estimate (${model}): unavailable`;
+  const detail = `Checklist: ${checklistItems} item(s) • Comments: ${commentsCount} (${commentsChars.toLocaleString()} chars) • Desc: ${descChars.toLocaleString()} chars • Evidence: ${docs} doc(s), ${segs} segment(s) • Encoder: ${encoding}`;
+  const extra = est.error ? `\n${est.error}` : notes.length ? `\n${notes[0]}` : "";
+  els.tokenEstimate.textContent = `${headline}\n${detail}${extra}`;
+  els.tokenEstimate.classList.toggle("muted", !Number.isFinite(total));
 }
 
 function renderWorkspace() {
@@ -324,6 +381,181 @@ function renderChecklistEditorStatus(ok, msg) {
   els.checklistStatus.classList.toggle("muted", !!ok);
 }
 
+function newChecklistItemDraft(seed = {}) {
+  return {
+    id: String(seed.id || "").trim(),
+    title: String(seed.title || "").trim(),
+    description: String(seed.description || "").trim(),
+    pass_criteria: String(seed.pass_criteria || "").trim(),
+    fail_criteria: String(seed.fail_criteria || "").trim(),
+  };
+}
+
+function newChecklistDraft(seed = {}) {
+  const items = Array.isArray(seed.items) && seed.items.length ? seed.items.map(newChecklistItemDraft) : [newChecklistItemDraft()];
+  return {
+    version: Number(seed.version) || 1,
+    name: String(seed.name || "Review Checklist"),
+    instructions: String(seed.instructions || ""),
+    items,
+  };
+}
+
+function checklistDraftFromParsed(parsed) {
+  return newChecklistDraft(parsed || {});
+}
+
+function ensureChecklistDraft() {
+  if (!state.checklistDraft) state.checklistDraft = newChecklistDraft();
+  return state.checklistDraft;
+}
+
+function checklistFieldValue(input) {
+  return String(input?.value || "").trim();
+}
+
+function renderChecklistBuilder() {
+  const draft = ensureChecklistDraft();
+  els.checklistNameInput.value = draft.name || "";
+  els.checklistInstructionsInput.value = draft.instructions || "";
+  els.checklistItemsList.innerHTML = "";
+
+  if (!draft.items.length) {
+    draft.items.push(newChecklistItemDraft());
+  }
+
+  draft.items.forEach((item, idx) => {
+    const card = document.createElement("div");
+    card.className = "checklist-item-card";
+    card.innerHTML = `
+      <div class="checklist-item-head">
+        <div class="checklist-item-number">#${idx + 1}</div>
+        <div class="checklist-item-id">ID: <code>${escapeHtml(item.id || "(auto-generated on save)")}</code></div>
+        <div class="checklist-item-actions"></div>
+      </div>
+      <div class="field-block">
+        <label>Item Title</label>
+        <input type="text" data-field="title" value="${escapeHtml(item.title || "")}" placeholder="What should be checked?" />
+      </div>
+      <div class="field-block">
+        <label>Description</label>
+        <textarea class="input-multiline" rows="3" data-field="description" placeholder="Explain what this checklist item means.">${escapeHtml(item.description || "")}</textarea>
+      </div>
+      <div class="field-block">
+        <label>Pass Criteria</label>
+        <textarea class="input-multiline" rows="2" data-field="pass_criteria" placeholder="What counts as pass?">${escapeHtml(item.pass_criteria || "")}</textarea>
+      </div>
+      <div class="field-block">
+        <label>Fail Criteria</label>
+        <textarea class="input-multiline" rows="2" data-field="fail_criteria" placeholder="What counts as fail?">${escapeHtml(item.fail_criteria || "")}</textarea>
+      </div>
+    `;
+
+    const actions = card.querySelector(".checklist-item-actions");
+    const upBtn = document.createElement("button");
+    upBtn.className = "small-btn";
+    upBtn.type = "button";
+    upBtn.textContent = "Up";
+    upBtn.disabled = idx === 0;
+    upBtn.addEventListener("click", () => {
+      const a = draft.items[idx - 1];
+      draft.items[idx - 1] = draft.items[idx];
+      draft.items[idx] = a;
+      renderChecklistBuilder();
+    });
+    actions.appendChild(upBtn);
+
+    const downBtn = document.createElement("button");
+    downBtn.className = "small-btn";
+    downBtn.type = "button";
+    downBtn.textContent = "Down";
+    downBtn.disabled = idx === draft.items.length - 1;
+    downBtn.addEventListener("click", () => {
+      const a = draft.items[idx + 1];
+      draft.items[idx + 1] = draft.items[idx];
+      draft.items[idx] = a;
+      renderChecklistBuilder();
+    });
+    actions.appendChild(downBtn);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "small-btn danger-btn";
+    removeBtn.type = "button";
+    removeBtn.textContent = "Remove";
+    removeBtn.disabled = draft.items.length <= 1;
+    removeBtn.addEventListener("click", () => {
+      draft.items.splice(idx, 1);
+      renderChecklistBuilder();
+    });
+    actions.appendChild(removeBtn);
+
+    card.querySelectorAll("[data-field]").forEach((input) => {
+      input.addEventListener("input", () => {
+        const field = input.dataset.field;
+        if (!field) return;
+        draft.items[idx][field] = checklistFieldValue(input);
+        if (field === "title") {
+          const idNode = card.querySelector(".checklist-item-id code");
+          if (idNode && !draft.items[idx].id) {
+            idNode.textContent = "(auto-generated on save)";
+          }
+        }
+      });
+    });
+
+    els.checklistItemsList.appendChild(card);
+  });
+}
+
+function slugifyChecklistToken(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 48);
+}
+
+function buildChecklistPayloadFromForm() {
+  const draft = ensureChecklistDraft();
+  draft.name = checklistFieldValue(els.checklistNameInput) || "Review Checklist";
+  draft.instructions = checklistFieldValue(els.checklistInstructionsInput);
+
+  const seen = new Set();
+  const items = draft.items.map((item, idx) => {
+    const title = String(item.title || "").trim();
+    if (!title) {
+      throw new Error(`Checklist item #${idx + 1} is missing a title`);
+    }
+    let itemId = String(item.id || "").trim();
+    if (!itemId) {
+      const token = slugifyChecklistToken(title);
+      itemId = token ? `item_${token}` : `item_${String(idx + 1).padStart(3, "0")}`;
+    }
+    let candidate = itemId;
+    let n = 2;
+    while (seen.has(candidate)) {
+      candidate = `${itemId}_${n}`;
+      n += 1;
+    }
+    seen.add(candidate);
+    item.id = candidate;
+    return {
+      id: candidate,
+      title,
+      description: String(item.description || "").trim(),
+      pass_criteria: String(item.pass_criteria || "").trim(),
+      fail_criteria: String(item.fail_criteria || "").trim(),
+    };
+  });
+
+  return {
+    version: 1,
+    name: draft.name,
+    instructions: draft.instructions,
+    items,
+  };
+}
+
 function renderRunHistorySelect() {
   const runs = state.workspace?.runs || [];
   els.runHistorySelect.innerHTML = "";
@@ -375,8 +607,8 @@ function renderResults() {
     wrap.innerHTML = `
       <div class="head">
         <div>
-          <div><strong>${escapeHtml(item.item_id || "(missing id)")}</strong></div>
-          <div class="result-meta">${escapeHtml(findChecklistTitle(item.item_id) || "")}</div>
+          <div><strong>Item ${Number(item.item_number) || "?"}</strong> <span class="inline-meta">(${escapeHtml(item.item_id || "missing id")})</span></div>
+          <div class="result-meta">${escapeHtml(findChecklistMeta(item.item_id)?.title || "")}</div>
         </div>
         <span class="status-chip ${escapeHtml(status)}">${escapeHtml(status)}</span>
       </div>
@@ -423,9 +655,9 @@ function renderResults() {
   }
 }
 
-function findChecklistTitle(itemId) {
+function findChecklistMeta(itemId) {
   const items = state.checklistParsed?.items || [];
-  return items.find((i) => i.id === itemId)?.title || "";
+  return items.find((i) => i.id === itemId) || null;
 }
 
 async function loadBoards() {
@@ -451,15 +683,27 @@ async function loadBoards() {
 async function loadCards() {
   if (!state.selectedBoard) return;
   const limit = Math.min(Math.max(Number(els.cardLimit.value || 100), 1), 500);
+  const query = (els.cardSearch?.value || "").trim();
   els.loadCardsBtn.disabled = true;
   els.cardsList.innerHTML = `<li class="meta-block muted">Loading cards...</li>`;
   try {
-    setViewerState(`Loading cards for ${state.selectedBoard.name}...`);
-    const data = await apiGet(`/api/boards/${state.selectedBoard.id}/cards?limit=${limit}`);
+    setViewerState(query ? `Searching cards in ${state.selectedBoard.name}...` : `Loading cards for ${state.selectedBoard.name}...`);
+    const data = await apiGet(
+      `/api/boards/${state.selectedBoard.id}/cards?limit=${limit}${query ? `&q=${encodeURIComponent(query)}` : ""}`
+    );
     state.cards = data.cards || [];
+    state.lastCardsQuery = String(data.query || query || "");
+    state.cardSearchServerApplied = !!state.lastCardsQuery;
     renderCards();
     const board = data.board || state.selectedBoard;
-    els.selectedBoardMeta.textContent = `Board: ${board.name}\nID: ${board.id}\nCards loaded: ${state.cards.length}\nLast Activity: ${fmtDate(board.dateLastActivity)}`;
+    const totalOpen = Number(data.total_open_cards);
+    const matched = Number(data.matched_cards);
+    const returned = Number(data.returned_cards);
+    const countLine = Number.isFinite(totalOpen) && Number.isFinite(matched) && Number.isFinite(returned)
+      ? `Cards: returned ${returned} / matched ${matched} / open ${totalOpen}`
+      : `Cards loaded: ${state.cards.length}`;
+    const queryLine = state.lastCardsQuery ? `Search: ${state.lastCardsQuery}` : "Search: (none)";
+    els.selectedBoardMeta.textContent = `Board: ${board.name}\nID: ${board.id}\n${countLine}\n${queryLine}\nLast Activity: ${fmtDate(board.dateLastActivity)}`;
     setViewerState("Select a card to inspect packet/workspace and run checklist.");
   } catch (err) {
     els.cardsList.innerHTML = `<li class="meta-block">Failed to load cards: ${err.message}</li>`;
@@ -471,8 +715,10 @@ async function loadCards() {
 
 async function loadCard(card) {
   state.selectedCard = card;
+  state.tokenEstimate = { loading: true, model: (els.modelInput.value || "gpt-5.2").trim() };
   state.indexCache.clear();
   renderCards();
+  renderTokenEstimate();
   els.cardBadge.textContent = `Loading ${card.name || card.id}...`;
   setViewerState("Fetching card packet and workspace state...");
   try {
@@ -492,8 +738,11 @@ async function loadCard(card) {
     const imageAssets = (state.currentPacket?.llm_assets || []).filter((a) => a.isImage).length;
     els.cardBadge.textContent = `${card.name || card.id} • ${comments} comments • ${attachments} attachments • ${imageAssets} images`;
     setViewerState("Card loaded. Create folder, index sources, then run checklist.");
+    refreshTokenEstimate();
   } catch (err) {
     els.cardBadge.textContent = "Load failed";
+    state.tokenEstimate = { error: err.message || String(err) };
+    renderTokenEstimate();
     setViewerState(`Failed to load card/workspace: ${err.message}`, false);
   }
 }
@@ -502,10 +751,11 @@ async function loadChecklist() {
   els.loadChecklistBtn.disabled = true;
   try {
     const data = await apiGet("/api/checklist");
-    state.checklistText = data.text || "";
     state.checklistParsed = data.parsed || null;
-    els.checklistEditor.value = state.checklistText;
+    state.checklistDraft = checklistDraftFromParsed(state.checklistParsed);
+    renderChecklistBuilder();
     renderChecklistEditorStatus(true, `Checklist loaded (${(state.checklistParsed?.items || []).length} item(s)).`);
+    refreshTokenEstimate();
   } catch (err) {
     renderChecklistEditorStatus(false, `Failed to load checklist: ${err.message}`);
   } finally {
@@ -516,12 +766,14 @@ async function loadChecklist() {
 async function saveChecklist() {
   els.saveChecklistBtn.disabled = true;
   try {
-    const data = await apiPost("/api/checklist", { text: els.checklistEditor.value });
-    state.checklistText = data.text || els.checklistEditor.value;
+    const checklist = buildChecklistPayloadFromForm();
+    const data = await apiPost("/api/checklist", { checklist });
     state.checklistParsed = data.parsed || null;
-    els.checklistEditor.value = state.checklistText;
+    state.checklistDraft = checklistDraftFromParsed(state.checklistParsed);
+    renderChecklistBuilder();
     renderChecklistEditorStatus(true, `Checklist saved (${(state.checklistParsed?.items || []).length} item(s)).`);
     renderResults();
+    refreshTokenEstimate();
   } catch (err) {
     renderChecklistEditorStatus(false, `Checklist save failed: ${err.message}`);
   } finally {
@@ -536,6 +788,7 @@ async function createWorkspace() {
     setViewerState("Creating workspace folder...");
     state.workspace = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/create`, {});
     renderWorkspace();
+    refreshTokenEstimate();
     setViewerState("Workspace ready. Copy supplemental files into attachments/ then index.");
   } catch (err) {
     setViewerState(`Failed to create workspace: ${err.message}`, false);
@@ -549,6 +802,7 @@ async function refreshWorkspace() {
   try {
     state.workspace = await apiGet(`/api/cards/${state.selectedCard.id}/workspace`);
     renderWorkspace();
+    refreshTokenEstimate();
   } catch (err) {
     setViewerState(`Failed to refresh workspace: ${err.message}`, false);
   }
@@ -1036,6 +1290,31 @@ async function runChecklist() {
   }
 }
 
+async function refreshTokenEstimate() {
+  if (!state.selectedCard || !state.currentPacket) {
+    state.tokenEstimate = null;
+    renderTokenEstimate();
+    return;
+  }
+  const cardId = state.selectedCard.id;
+  const model = (els.modelInput.value || "gpt-5.2").trim();
+  state.tokenEstimate = { loading: true, model };
+  renderTokenEstimate();
+  try {
+    const data = await apiPost(`/api/cards/${cardId}/workspace/token-estimate`, {
+      model,
+      cardPacket: state.currentPacket,
+    });
+    if (state.selectedCard?.id !== cardId) return;
+    state.tokenEstimate = data.estimate || { error: "Missing estimate payload", model };
+    renderTokenEstimate();
+  } catch (err) {
+    if (state.selectedCard?.id !== cardId) return;
+    state.tokenEstimate = { error: err.message || String(err), model };
+    renderTokenEstimate();
+  }
+}
+
 async function loadSelectedRun() {
   if (!state.selectedCard) return;
   const runId = els.runHistorySelect.value;
@@ -1376,17 +1655,38 @@ function initTabs() {
 function bindEvents() {
   els.refreshBoardsBtn.addEventListener("click", loadBoards);
   els.loadCardsBtn.addEventListener("click", loadCards);
+  els.cardSearch.addEventListener("input", () => {
+    renderCards();
+  });
+  els.cardSearch.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      loadCards();
+    }
+  });
   els.boardSearch.addEventListener("input", renderBoards);
   els.copyMdBtn.addEventListener("click", copyMarkdown);
 
   els.loadChecklistBtn.addEventListener("click", loadChecklist);
   els.saveChecklistBtn.addEventListener("click", saveChecklist);
+  els.addChecklistItemBtn.addEventListener("click", () => {
+    const draft = ensureChecklistDraft();
+    draft.items.push(newChecklistItemDraft());
+    renderChecklistBuilder();
+  });
+  els.checklistNameInput.addEventListener("input", () => {
+    ensureChecklistDraft().name = String(els.checklistNameInput.value || "");
+  });
+  els.checklistInstructionsInput.addEventListener("input", () => {
+    ensureChecklistDraft().instructions = String(els.checklistInstructionsInput.value || "");
+  });
 
   els.createWorkspaceBtn.addEventListener("click", createWorkspace);
   els.refreshWorkspaceBtn.addEventListener("click", refreshWorkspace);
   els.indexLocalBtn.addEventListener("click", indexLocalAttachments);
   els.indexTrelloBtn.addEventListener("click", indexTrelloAttachments);
   els.runChecklistBtn.addEventListener("click", runChecklist);
+  els.modelInput.addEventListener("change", refreshTokenEstimate);
 
   els.loadRunBtn.addEventListener("click", loadSelectedRun);
 }
@@ -1412,9 +1712,11 @@ async function init() {
   bindEvents();
   configurePdfJs();
   verifyLibraries();
+  renderChecklistBuilder();
   renderWorkspace();
   renderResults();
   renderPacketViews();
+  renderTokenEstimate();
   await Promise.all([loadChecklist(), loadBoards()]);
 }
 

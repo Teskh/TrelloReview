@@ -48,6 +48,7 @@
             <button id="loadCardsBtn" class="btn" disabled>Load Cards</button>
           </div>
         </div>
+        <input id="cardSearch" type="search" placeholder="Search cards (name/description)..." />
         <div id="selectedBoardMeta" class="meta-block muted">Select a board.</div>
         <ul id="cardsList" class="list card-list"></ul>
       </section>
@@ -72,6 +73,7 @@
           <button id="runChecklistBtn" class="btn btn-accent" disabled>Run Checklist (OpenAI)</button>
         </div>
 
+        <div id="tokenEstimate" class="meta-block muted">Token estimate: no card selected.</div>
         <div id="workspaceMeta" class="meta-block muted">No workspace created.</div>
         <div id="workspaceLists" class="split-grid">
           <div>
@@ -87,14 +89,30 @@
 
       <section class="panel checklist-panel">
         <div class="panel-head">
-          <h2>Checklist Editor (JSON)</h2>
+          <h2>Checklist Editor</h2>
           <div class="panel-controls">
             <button id="loadChecklistBtn" class="btn">Reload</button>
             <button id="saveChecklistBtn" class="btn btn-accent">Save Checklist</button>
           </div>
         </div>
         <div id="checklistStatus" class="meta-block muted">Checklist not loaded yet.</div>
-        <textarea id="checklistEditor" class="editor" spellcheck="false"></textarea>
+        <div class="checklist-form">
+          <div class="checklist-meta-grid">
+            <div class="field-block">
+              <label for="checklistNameInput">Checklist Name</label>
+              <input id="checklistNameInput" type="text" placeholder="Review Checklist" />
+            </div>
+            <div class="field-block">
+              <label for="checklistInstructionsInput">Instructions (optional)</label>
+              <textarea id="checklistInstructionsInput" class="input-multiline" rows="3" placeholder="Extra instructions for the reviewer / LLM."></textarea>
+            </div>
+          </div>
+          <div class="checklist-items-head">
+            <h3>Items</h3>
+            <button id="addChecklistItemBtn" class="btn">Add Item</button>
+          </div>
+          <div id="checklistItemsList" class="checklist-items-list"></div>
+        </div>
       </section>
 
       <section class="panel results-panel">

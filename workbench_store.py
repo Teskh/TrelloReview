@@ -13,6 +13,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from llm_review_payloads import (
+    build_review_system_prompt,
+    build_review_user_payload,
+    estimate_review_input_tokens,
+)
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -103,11 +109,29 @@ def load_checklist_text(paths: WorkbenchPaths) -> str:
     return paths.checklist_file.read_text(encoding="utf-8")
 
 
-def save_checklist_text(paths: WorkbenchPaths, text: str) -> Dict[str, Any]:
-    parsed = json.loads(text)
-    normalized = validate_and_normalize_checklist(parsed)
+def save_checklist(paths: WorkbenchPaths, payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = validate_and_normalize_checklist(payload)
     paths.checklist_file.write_text(json.dumps(normalized, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return normalized
+
+
+def save_checklist_text(paths: WorkbenchPaths, text: str) -> Dict[str, Any]:
+    parsed = json.loads(text)
+    return save_checklist(paths, parsed)
+
+
+def _auto_item_id(idx: int, title: str, seen: set[str]) -> str:
+    base = re.sub(r"[^a-z0-9]+", "_", (title or "").lower()).strip("_")
+    if not base:
+        base = f"item_{idx:03d}"
+    else:
+        base = f"item_{base[:48].strip('_') or idx}"
+    candidate = base
+    n = 2
+    while candidate in seen:
+        candidate = f"{base}_{n}"
+        n += 1
+    return candidate
 
 
 def validate_and_normalize_checklist(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -121,15 +145,15 @@ def validate_and_normalize_checklist(payload: Dict[str, Any]) -> Dict[str, Any]:
     for idx, item in enumerate(items, start=1):
         if not isinstance(item, dict):
             raise ValueError(f"Checklist item #{idx} must be an object")
+        title = str(item.get("title") or "").strip()
+        if not title:
+            raise ValueError(f"Checklist item #{idx} missing title")
         item_id = str(item.get("id") or "").strip()
         if not item_id:
-            raise ValueError(f"Checklist item #{idx} missing id")
+            item_id = _auto_item_id(idx, title, seen)
         if item_id in seen:
             raise ValueError(f"Duplicate checklist item id: {item_id}")
         seen.add(item_id)
-        title = str(item.get("title") or "").strip()
-        if not title:
-            raise ValueError(f"Checklist item {item_id} missing title")
         out_items.append(
             {
                 "id": item_id,
@@ -581,6 +605,7 @@ def checklist_run_schema() -> Dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "item_number": {"type": "integer", "minimum": 1},
             "item_id": {"type": "string"},
             "status": {"type": "string", "enum": ["pass", "fail", "needs_review"]},
             "confidence": {"type": "number"},
@@ -588,7 +613,7 @@ def checklist_run_schema() -> Dict[str, Any]:
             "citations": {"type": "array", "items": citation},
             "missing_evidence": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["item_id", "status", "confidence", "rationale", "citations", "missing_evidence"],
+        "required": ["item_number", "item_id", "status", "confidence", "rationale", "citations", "missing_evidence"],
     }
     return {
         "type": "object",
@@ -603,15 +628,34 @@ def checklist_run_schema() -> Dict[str, Any]:
 
 
 def build_system_prompt() -> str:
-    return (
-        "You are a meticulous document review assistant. "
-        "Evaluate checklist items using only the provided evidence segments. "
-        "Every conclusion must cite one or more evidence anchors. "
-        "Citations must reference source_key and anchor_id exactly as provided. "
-        "If evidence is insufficient, ambiguous, or the document is image/scanned-only without usable text, "
-        "return status='needs_review' and explain what is missing. "
-        "Do not invent citations. Use verbatim quotes copied from the cited segment text when available. "
-        "For image-only/scanned pages without text, set quote to an empty string and cite the page anchor."
+    return build_review_system_prompt()
+
+
+def estimate_llm_input_tokens_for_card(
+    paths: WorkbenchPaths,
+    *,
+    card_id: str,
+    card_name: str,
+    card_url: str,
+    card_packet: Dict[str, Any],
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    checklist = load_checklist(paths)
+    try:
+        evidence, _ = _collect_evidence_segments(paths, card_id)
+        workspace_exists = True
+    except FileNotFoundError:
+        evidence = []
+        workspace_exists = False
+    return estimate_review_input_tokens(
+        checklist=checklist,
+        evidence=evidence,
+        card_id=card_id,
+        card_name=card_name,
+        card_url=card_url,
+        card_packet=card_packet,
+        model=model,
+        workspace_exists=workspace_exists,
     )
 
 
@@ -724,6 +768,63 @@ def _validate_citations(result: Dict[str, Any], index_lookup: Dict[str, Dict[str
     return result
 
 
+def _align_run_items_to_checklist(result: Dict[str, Any], checklist: Dict[str, Any]) -> Dict[str, Any]:
+    checklist_items = checklist.get("items") or []
+    raw_items = result.get("items") or []
+    by_id: Dict[str, Dict[str, Any]] = {}
+    by_num: Dict[int, Dict[str, Any]] = {}
+    extras: List[Dict[str, Any]] = []
+    for row in raw_items:
+        if not isinstance(row, dict):
+            continue
+        item_id = str(row.get("item_id") or "").strip()
+        item_number = row.get("item_number")
+        stored = False
+        if item_id and item_id not in by_id:
+            by_id[item_id] = row
+            stored = True
+        if isinstance(item_number, int) and item_number > 0 and item_number not in by_num:
+            by_num[item_number] = row
+            stored = True
+        if not stored:
+            extras.append(row)
+
+    aligned: List[Dict[str, Any]] = []
+    for idx, ck in enumerate(checklist_items, start=1):
+        expected_id = str((ck or {}).get("id") or "")
+        row = by_id.get(expected_id) or by_num.get(idx) or {}
+        if not isinstance(row, dict):
+            row = {}
+        try:
+            confidence = float(row.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        aligned.append(
+            {
+                "item_number": idx,
+                "item_id": expected_id,
+                "status": row.get("status") if row.get("status") in {"pass", "fail", "needs_review"} else "needs_review",
+                "confidence": confidence,
+                "rationale": str(row.get("rationale") or "No model answer returned for this checklist item.").strip(),
+                "citations": row.get("citations") if isinstance(row.get("citations"), list) else [],
+                "missing_evidence": (
+                    row.get("missing_evidence")
+                    if isinstance(row.get("missing_evidence"), list)
+                    else ["Model omitted this checklist item in the response."]
+                ),
+            }
+        )
+
+    result["items"] = aligned
+    if extras:
+        notes = result.get("global_notes")
+        if not isinstance(notes, list):
+            notes = []
+        notes.append(f"Ignored {len(extras)} extra checklist item result(s) not matching the current checklist.")
+        result["global_notes"] = notes
+    return result
+
+
 def _summarize_run(result: Dict[str, Any]) -> Dict[str, Any]:
     counts = {"pass": 0, "fail": 0, "needs_review": 0}
     for item in result.get("items") or []:
@@ -759,31 +860,14 @@ def run_checklist_for_card(
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY in environment")
     model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.2").strip()
-
-    user_payload = {
-        "task": "Evaluate checklist against indexed evidence and return structured results with citations.",
-        "card": {
-            "id": card_id,
-            "name": card_name,
-            "url": card_url,
-            "metadata": {
-                "labels": [l.get("name") or l.get("color") for l in (card_packet.get("card") or {}).get("labels", [])],
-                "members": [
-                    m.get("fullName") or m.get("username")
-                    for m in (card_packet.get("members") or [])
-                    if (m.get("fullName") or m.get("username"))
-                ],
-            },
-        },
-        "checklist": checklist,
-        "citation_rules": {
-            "must_cite_every_item": True,
-            "cite_only_provided_source_key_and_anchor_id": True,
-            "prefer_exact_quote": True,
-            "for_image_or_scanned_pdf_without_text": "Use page anchor citation and empty quote, then mark needs_review unless other evidence resolves the item.",
-        },
-        "evidence_documents": evidence,
-    }
+    user_payload = build_review_user_payload(
+        checklist=checklist,
+        evidence=evidence,
+        card_id=card_id,
+        card_name=card_name,
+        card_url=card_url,
+        card_packet=card_packet,
+    )
 
     raw_api = _openai_request(
         api_key=api_key,
@@ -799,6 +883,7 @@ def run_checklist_for_card(
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Model output was not valid JSON: {e}\n{text[:1000]}") from e
 
+    parsed = _align_run_items_to_checklist(parsed, checklist)
     parsed = _validate_citations(parsed, index_lookup)
     summary = _summarize_run(parsed)
 

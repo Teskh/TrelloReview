@@ -5,10 +5,18 @@
   "items": [
     {
       "id": "item_001",
-      "title": "Required document is present",
-      "description": "Confirm the required supporting document exists and appears complete.",
-      "pass_criteria": "Document exists and contains the expected content/sections.",
-      "fail_criteria": "Document missing, incomplete, or clearly inconsistent.",
+      "title": "Datos del cliente",
+      "description": "Los datos del cliente cómo aparecen descritos en la tarjeta de Trello debe coincidir con:\nEl nombre\nRUT\nNacionalidad\nEstado Civil\nDomicilio\nen todos los documentos subsecuentes. Cualquier desviación (aunque fuera una diacrítica faltante) debe ser mencionada y citada. Todos aquellos datos que estén correctamente citados también deben ser citados",
+      "pass_criteria": "Los datos requeridos están y coinciden según lo indicado anteriormente",
+      "fail_criteria": "Datos faltantes o discrepantes.",
+      "required_evidence_types": []
+    },
+    {
+      "id": "item_documentaci_n_de_bienes_registrables",
+      "title": "Documentación de bienes registrables",
+      "description": "Cuando hay bienes registrables se debe adjuntar la documentación fundante (por ejemplo, si se menciona la entrega de un vehículo se debe adjuntar el CAV (Certificado de Anotaciones Vigentes))",
+      "pass_criteria": "De haber bienes registrables, estos adjuntan su documentación relevante",
+      "fail_criteria": "Hay bienes registrables que no presentan documentación o esta tiene problemas",
       "required_evidence_types": []
     }
   ]
