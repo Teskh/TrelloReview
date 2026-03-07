@@ -64,6 +64,7 @@ const els = {
   citationBadge: document.getElementById("citationBadge"),
 
   tabs: Array.from(document.querySelectorAll(".tab")),
+  ptabs: Array.from(document.querySelectorAll(".ptab")),
   boardItemTpl: document.getElementById("boardItemTpl"),
   cardItemTpl: document.getElementById("cardItemTpl"),
 };
@@ -117,6 +118,12 @@ function escapeHtml(str) {
 
 function setBodyLoading(on) {
   document.body.classList.toggle("loading", !!on);
+}
+
+function setMainTab(tabId) {
+  els.ptabs.forEach((b) => b.classList.toggle("active", b.dataset.ptab === tabId));
+  document.querySelectorAll(".main-pane").forEach((p) => p.classList.remove("active"));
+  document.getElementById(`ptab-${tabId}`)?.classList.add("active");
 }
 
 function setActiveTab(tabId) {
@@ -1279,6 +1286,7 @@ async function runChecklist() {
     renderWorkspace();
     renderResults();
     if (state.runResult) {
+      setMainTab("results");
       setViewerState(`Run complete: ${state.runResult.summary?.status || "ok"}`);
     } else {
       setViewerState("Run completed but no result payload returned.", false);
@@ -1342,6 +1350,7 @@ function clearCitationHighlights(root) {
   root?.querySelectorAll?.(".quote-highlight").forEach((el) => {
     el.replaceWith(document.createTextNode(el.textContent || ""));
   });
+  root?.querySelectorAll?.(".pdf-highlight-rect").forEach((el) => el.remove());
 }
 
 function highlightQuoteInElement(el, quote) {
@@ -1382,6 +1391,100 @@ function highlightQuoteInElement(el, quote) {
   }
 }
 
+function normalizeLoosePdfMatchText(text) {
+  return String(text || "")
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function buildPdfItemMatchIndex(textItems) {
+  const parts = [];
+  const itemRanges = [];
+  let cursor = 0;
+  for (let i = 0; i < textItems.length; i += 1) {
+    const item = textItems[i];
+    const raw = String(item?.str || "");
+    const norm = normalizeLoosePdfMatchText(raw);
+    if (!norm) continue;
+    if (parts.length) {
+      parts.push(" ");
+      cursor += 1;
+    }
+    const start = cursor;
+    parts.push(norm);
+    cursor += norm.length;
+    itemRanges.push({ itemIndex: i, start, end: cursor });
+  }
+  return {
+    normalizedText: parts.join(""),
+    itemRanges,
+  };
+}
+
+function findPdfQuoteItemIndices(textItems, quote, opts = {}) {
+  const q = normalizeLoosePdfMatchText(quote);
+  if (!q) return [];
+  const { normalizedText, itemRanges } = buildPdfItemMatchIndex(textItems);
+  if (!normalizedText) return [];
+
+  const matchStart = normalizedText.indexOf(q);
+  if (matchStart >= 0) {
+    const matchEnd = matchStart + q.length;
+    return itemRanges
+      .filter((r) => r.start < matchEnd && r.end > matchStart)
+      .map((r) => r.itemIndex);
+  }
+
+  if (!opts.allowTokenFallback) return [];
+
+  const qTokens = q.split(/\s+/).filter((t) => t.length >= 3);
+  if (qTokens.length < 4) return [];
+  const matched = [];
+  for (let i = 0; i < textItems.length; i += 1) {
+    const norm = normalizeLoosePdfMatchText(textItems[i]?.str || "");
+    if (!norm) continue;
+    const hits = qTokens.filter((t) => norm.includes(t)).length;
+    if (hits > 0) matched.push({ i, hits, len: norm.length });
+  }
+  matched.sort((a, b) => b.hits - a.hits || a.len - b.len);
+  const best = matched
+    .slice(0, Math.min(6, matched.length))
+    .filter((m) => m.hits >= Math.max(2, Math.floor(qTokens.length / 3)));
+  return best.map((m) => m.i);
+}
+
+function pdfItemToViewportRect(pdfjsLib, viewport, item) {
+  if (!item?.transform) return null;
+  const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+  const x = tx[4];
+  const y = tx[5];
+  const width = Math.max(1, (Number(item.width) || 0) * viewport.scale);
+  const height = Math.max(1, (Number(item.height) || 0) * viewport.scale);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) return null;
+  return { x, y: y - height, width, height };
+}
+
+function renderPdfHighlightRects(layer, rects) {
+  if (!layer || !Array.isArray(rects)) return 0;
+  let count = 0;
+  for (const rect of rects) {
+    if (!rect) continue;
+    const el = document.createElement("div");
+    el.className = "pdf-highlight-rect";
+    el.style.left = `${Math.max(0, rect.x)}px`;
+    el.style.top = `${Math.max(0, rect.y)}px`;
+    el.style.width = `${Math.max(1, rect.width)}px`;
+    el.style.height = `${Math.max(1, rect.height)}px`;
+    layer.appendChild(el);
+    count += 1;
+  }
+  return count;
+}
+
 async function openCitation(citation) {
   try {
     if (!citation?.source_key) throw new Error("Citation missing source_key");
@@ -1391,6 +1494,7 @@ async function openCitation(citation) {
     els.citationBadge.textContent = `${citation.source_key} → ${citation.anchor_id || "?"}`;
     els.citationBadge.classList.remove("muted");
     await renderCitationDocument(indexResp, citation);
+    setMainTab("viewer");
     setActiveTab("citation-doc");
     setViewerState(`Citation opened (${citation.validation?.status || "unvalidated"}).`);
   } catch (err) {
@@ -1593,8 +1697,15 @@ async function renderPdfCitation(indexResp, citation) {
 
   const canvasBox = document.createElement("div");
   canvasBox.className = "pdf-canvas-box";
+  const stage = document.createElement("div");
+  stage.className = "pdf-page-stage";
   const canvas = document.createElement("canvas");
-  canvasBox.appendChild(canvas);
+  canvas.className = "pdf-page-canvas";
+  const highlightLayer = document.createElement("div");
+  highlightLayer.className = "pdf-highlight-layer";
+  stage.appendChild(canvas);
+  stage.appendChild(highlightLayer);
+  canvasBox.appendChild(stage);
   wrap.appendChild(canvasBox);
 
   const textBox = document.createElement("div");
@@ -1612,13 +1723,39 @@ async function renderPdfCitation(indexResp, citation) {
   const ctx = canvas.getContext("2d");
   canvas.width = viewport.width;
   canvas.height = viewport.height;
+  stage.style.width = `${viewport.width}px`;
+  stage.style.height = `${viewport.height}px`;
   await page.render({ canvasContext: ctx, viewport }).promise;
+
+  let nativeHighlightCount = 0;
+  try {
+    const textContent = await page.getTextContent();
+    const textItems = Array.isArray(textContent?.items) ? textContent.items : [];
+    const matchIndices = findPdfQuoteItemIndices(textItems, citation.quote || "", { allowTokenFallback: true });
+    if (matchIndices.length) {
+      const rects = matchIndices
+        .map((i) => pdfItemToViewportRect(window.pdfjsLib, viewport, textItems[i]))
+        .filter(Boolean);
+      nativeHighlightCount = renderPdfHighlightRects(highlightLayer, rects);
+    }
+  } catch {
+    nativeHighlightCount = 0;
+  }
 
   const anchorEl = textBox.querySelector(`[data-anchor-id="${CSS.escape(pageSeg?.anchor_id || `page_${pageNum}`)}"]`);
   if (anchorEl) {
     anchorEl.classList.add("cited-anchor");
     highlightQuoteInElement(anchorEl, citation.quote || "");
   }
+
+  const highlightMeta = document.createElement("div");
+  highlightMeta.className = "inline-meta";
+  if (nativeHighlightCount > 0) {
+    highlightMeta.textContent = `In-document highlight applied on PDF page (${nativeHighlightCount} text region${nativeHighlightCount === 1 ? "" : "s"}).`;
+  } else {
+    highlightMeta.textContent = "In-document highlight unavailable for this citation on the page text layer. Showing extracted-text highlight below.";
+  }
+  toolbar.appendChild(highlightMeta);
 }
 
 function colIndexToName(index) {
@@ -1649,6 +1786,9 @@ async function copyMarkdown() {
 function initTabs() {
   els.tabs.forEach((tabBtn) => {
     tabBtn.addEventListener("click", () => setActiveTab(tabBtn.dataset.tab));
+  });
+  els.ptabs.forEach((btn) => {
+    btn.addEventListener("click", () => setMainTab(btn.dataset.ptab));
   });
 }
 

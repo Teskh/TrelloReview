@@ -30,122 +30,138 @@
     </header>
 
     <main class="layout">
-      <section class="panel boards-panel">
-        <div class="panel-head">
-          <h2>Boards</h2>
-          <span id="identity" class="pill muted">Not loaded</span>
-        </div>
-        <input id="boardSearch" type="search" placeholder="Filter boards..." />
-        <ul id="boardsList" class="list"></ul>
-      </section>
-
-      <section class="panel cards-panel">
-        <div class="panel-head">
-          <h2>Cards</h2>
-          <div class="panel-controls">
-            <label for="cardLimit">Limit</label>
-            <input id="cardLimit" type="number" min="1" max="500" value="100" />
-            <button id="loadCardsBtn" class="btn" disabled>Load Cards</button>
+      <aside class="left-nav">
+        <section class="panel boards-panel">
+          <div class="panel-head">
+            <h2>Boards</h2>
+            <span id="identity" class="pill muted">Not loaded</span>
           </div>
-        </div>
-        <input id="cardSearch" type="search" placeholder="Search cards (name/description)..." />
-        <div id="selectedBoardMeta" class="meta-block muted">Select a board.</div>
-        <ul id="cardsList" class="list card-list"></ul>
-      </section>
+          <input id="boardSearch" type="search" placeholder="Filter boards..." />
+          <ul id="boardsList" class="list"></ul>
+        </section>
 
-      <section class="panel workspace-panel">
-        <div class="panel-head">
-          <h2>Card Workspace</h2>
+        <section class="panel cards-panel">
+          <div class="panel-head">
+            <h2>Cards</h2>
+            <div class="panel-controls">
+              <label for="cardLimit">Limit</label>
+              <input id="cardLimit" type="number" min="1" max="500" value="100" />
+              <button id="loadCardsBtn" class="btn" disabled>Load Cards</button>
+            </div>
+          </div>
+          <input id="cardSearch" type="search" placeholder="Search cards (name/description)..." />
+          <div id="selectedBoardMeta" class="meta-block muted">Select a board.</div>
+          <ul id="cardsList" class="list card-list"></ul>
+        </section>
+      </aside>
+
+      <div class="right-main">
+        <div class="status-bar">
           <span id="cardBadge" class="pill">No card selected</span>
-        </div>
-        <div id="viewerState" class="meta-block muted">Select a card to fetch a packet and workspace state.</div>
-
-        <div class="toolbar-row">
-          <button id="createWorkspaceBtn" class="btn" disabled>Create Folder</button>
-          <button id="refreshWorkspaceBtn" class="btn" disabled>Refresh Workspace</button>
-          <button id="indexLocalBtn" class="btn" disabled>Index Local Attachments</button>
-          <button id="indexTrelloBtn" class="btn" disabled>Index Trello Attachments</button>
+          <span id="viewerState" class="muted status-text">Select a card to fetch a packet and workspace state.</span>
         </div>
 
-        <div class="toolbar-row">
-          <label for="modelInput">Model</label>
-          <input id="modelInput" type="text" value="gpt-5.2" />
-          <button id="runChecklistBtn" class="btn btn-accent" disabled>Run Checklist (OpenAI)</button>
-        </div>
+        <nav class="primary-tabs">
+          <button class="ptab active" data-ptab="workspace">Workspace</button>
+          <button class="ptab" data-ptab="checklist">Checklist</button>
+          <button class="ptab" data-ptab="results">Results</button>
+          <button class="ptab" data-ptab="viewer">Viewer</button>
+        </nav>
 
-        <div id="tokenEstimate" class="meta-block muted">Token estimate: no card selected.</div>
-        <div id="workspaceMeta" class="meta-block muted">No workspace created.</div>
-        <div id="workspaceLists" class="split-grid">
-          <div>
-            <h3>Local Files (`attachments/`)</h3>
-            <ul id="localFilesList" class="list compact-list"></ul>
-          </div>
-          <div>
-            <h3>Indexed Sources</h3>
-            <ul id="indexesList" class="list compact-list"></ul>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel checklist-panel">
-        <div class="panel-head">
-          <h2>Checklist Editor</h2>
-          <div class="panel-controls">
-            <button id="loadChecklistBtn" class="btn">Reload</button>
-            <button id="saveChecklistBtn" class="btn btn-accent">Save Checklist</button>
-          </div>
-        </div>
-        <div id="checklistStatus" class="meta-block muted">Checklist not loaded yet.</div>
-        <div class="checklist-form">
-          <div class="checklist-meta-grid">
-            <div class="field-block">
-              <label for="checklistNameInput">Checklist Name</label>
-              <input id="checklistNameInput" type="text" placeholder="Review Checklist" />
+        <div class="main-pane active" id="ptab-workspace">
+          <section class="panel workspace-panel">
+            <div class="toolbar-row">
+              <button id="createWorkspaceBtn" class="btn" disabled>Create Folder</button>
+              <button id="refreshWorkspaceBtn" class="btn" disabled>Refresh Workspace</button>
+              <button id="indexLocalBtn" class="btn" disabled>Index Local Attachments</button>
+              <button id="indexTrelloBtn" class="btn" disabled>Index Trello Attachments</button>
             </div>
-            <div class="field-block">
-              <label for="checklistInstructionsInput">Instructions (optional)</label>
-              <textarea id="checklistInstructionsInput" class="input-multiline" rows="3" placeholder="Extra instructions for the reviewer / LLM."></textarea>
+            <div class="toolbar-row">
+              <label for="modelInput">Model</label>
+              <input id="modelInput" type="text" value="gpt-5.2" />
+              <button id="runChecklistBtn" class="btn btn-accent" disabled>Run Checklist (OpenAI)</button>
             </div>
-          </div>
-          <div class="checklist-items-head">
-            <h3>Items</h3>
-            <button id="addChecklistItemBtn" class="btn">Add Item</button>
-          </div>
-          <div id="checklistItemsList" class="checklist-items-list"></div>
+            <div id="tokenEstimate" class="meta-block muted">Token estimate: no card selected.</div>
+            <div id="workspaceMeta" class="meta-block muted">No workspace created.</div>
+            <div id="workspaceLists" class="split-grid">
+              <div>
+                <h3>Local Files (`attachments/`)</h3>
+                <ul id="localFilesList" class="list compact-list"></ul>
+              </div>
+              <div>
+                <h3>Indexed Sources</h3>
+                <ul id="indexesList" class="list compact-list"></ul>
+              </div>
+            </div>
+          </section>
         </div>
-      </section>
 
-      <section class="panel results-panel">
-        <div class="panel-head">
-          <h2>Checklist Results</h2>
-          <div class="panel-controls">
-            <label for="runHistorySelect">Run</label>
-            <select id="runHistorySelect"></select>
-            <button id="loadRunBtn" class="btn" disabled>Load Run</button>
-          </div>
+        <div class="main-pane" id="ptab-checklist">
+          <section class="panel checklist-panel">
+            <div class="panel-head">
+              <h2>Checklist Editor</h2>
+              <div class="panel-controls">
+                <button id="loadChecklistBtn" class="btn">Reload</button>
+                <button id="saveChecklistBtn" class="btn btn-accent">Save Checklist</button>
+              </div>
+            </div>
+            <div id="checklistStatus" class="meta-block muted">Checklist not loaded yet.</div>
+            <div class="checklist-form">
+              <div class="checklist-meta-grid">
+                <div class="field-block">
+                  <label for="checklistNameInput">Checklist Name</label>
+                  <input id="checklistNameInput" type="text" placeholder="Review Checklist" />
+                </div>
+                <div class="field-block">
+                  <label for="checklistInstructionsInput">Instructions (optional)</label>
+                  <textarea id="checklistInstructionsInput" class="input-multiline" rows="3" placeholder="Extra instructions for the reviewer / LLM."></textarea>
+                </div>
+              </div>
+              <div class="checklist-items-head">
+                <h3>Items</h3>
+                <button id="addChecklistItemBtn" class="btn">Add Item</button>
+              </div>
+              <div id="checklistItemsList" class="checklist-items-list"></div>
+            </div>
+          </section>
         </div>
-        <div id="runSummary" class="meta-block muted">No run yet.</div>
-        <div id="resultsList" class="results-list"></div>
-      </section>
 
-      <section class="panel viewer-panel">
-        <div class="panel-head">
-          <h2>Citation Viewer</h2>
-          <span id="citationBadge" class="pill muted">No citation selected</span>
+        <div class="main-pane" id="ptab-results">
+          <section class="panel results-panel">
+            <div class="panel-head">
+              <h2>Checklist Results</h2>
+              <div class="panel-controls">
+                <label for="runHistorySelect">Run</label>
+                <select id="runHistorySelect"></select>
+                <button id="loadRunBtn" class="btn" disabled>Load Run</button>
+              </div>
+            </div>
+            <div id="runSummary" class="meta-block muted">No run yet.</div>
+            <div id="resultsList" class="results-list"></div>
+          </section>
         </div>
-        <div class="tabs">
-          <button class="tab active" data-tab="packet-rendered">Packet Rendered</button>
-          <button class="tab" data-tab="packet-markdown">Packet Markdown</button>
-          <button class="tab" data-tab="packet-json">Packet JSON</button>
-          <button class="tab" data-tab="citation-doc">Cited Document</button>
-          <button class="tab" data-tab="citation-json">Index JSON</button>
+
+        <div class="main-pane" id="ptab-viewer">
+          <section class="panel viewer-panel">
+            <div class="panel-head">
+              <h2>Citation Viewer</h2>
+              <span id="citationBadge" class="pill muted">No citation selected</span>
+            </div>
+            <div class="tabs">
+              <button class="tab active" data-tab="packet-rendered">Packet Rendered</button>
+              <button class="tab" data-tab="packet-markdown">Packet Markdown</button>
+              <button class="tab" data-tab="packet-json">Packet JSON</button>
+              <button class="tab" data-tab="citation-doc">Cited Document</button>
+              <button class="tab" data-tab="citation-json">Index JSON</button>
+            </div>
+            <div id="packetRenderedView" class="viewer md-render tab-pane active"></div>
+            <pre id="packetMarkdownView" class="viewer tab-pane"></pre>
+            <pre id="packetJsonView" class="viewer tab-pane"></pre>
+            <div id="citationDocView" class="viewer doc-view tab-pane"></div>
+            <pre id="citationJsonView" class="viewer tab-pane"></pre>
+          </section>
         </div>
-        <div id="packetRenderedView" class="viewer md-render tab-pane active"></div>
-        <pre id="packetMarkdownView" class="viewer tab-pane"></pre>
-        <pre id="packetJsonView" class="viewer tab-pane"></pre>
-        <div id="citationDocView" class="viewer doc-view tab-pane"></div>
-        <pre id="citationJsonView" class="viewer tab-pane"></pre>
-      </section>
+      </div>
     </main>
 
     <template id="boardItemTpl">

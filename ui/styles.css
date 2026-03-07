@@ -25,6 +25,10 @@ body {
 }
 
 body {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
   color: var(--ink);
   background:
     radial-gradient(circle at 12% 10%, rgba(180, 63, 45, 0.13), transparent 38%),
@@ -55,11 +59,15 @@ body {
 }
 
 .topbar {
+  flex: 0 0 auto;
+}
+
+.topbar {
   display: flex;
   justify-content: space-between;
   gap: 16px;
   align-items: flex-start;
-  padding: 20px 22px 10px;
+  padding: 16px 22px 8px;
 }
 
 .eyebrow {
@@ -128,21 +136,107 @@ h3 {
 
 .layout {
   display: grid;
-  grid-template-columns: 260px 340px minmax(360px, 1fr) minmax(360px, 1fr);
-  grid-template-areas:
-    "boards cards workspace checklist"
-    "boards cards results viewer";
+  grid-template-columns: 300px 1fr;
   gap: 14px;
-  padding: 8px 18px 18px;
-  min-height: calc(100vh - 84px);
+  padding: 8px 18px 14px;
+  flex: 1 1 0;
+  min-height: 0;
 }
 
-.boards-panel { grid-area: boards; }
-.cards-panel { grid-area: cards; }
-.workspace-panel { grid-area: workspace; }
-.checklist-panel { grid-area: checklist; }
-.results-panel { grid-area: results; }
-.viewer-panel { grid-area: viewer; }
+.left-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.boards-panel {
+  flex: 0 0 auto;
+  max-height: 270px;
+}
+
+.cards-panel {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.right-main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 2px 8px;
+  flex-wrap: wrap;
+}
+
+.status-text {
+  font-size: 12px;
+  flex: 1;
+  min-width: 0;
+}
+
+.primary-tabs {
+  display: flex;
+  gap: 3px;
+  border-bottom: 1px solid rgba(33, 31, 28, 0.12);
+  margin-bottom: 10px;
+}
+
+.ptab {
+  appearance: none;
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 7px 16px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 10px 10px 0 0;
+  transition: color 120ms, background-color 120ms;
+}
+
+.ptab:hover:not(.active) {
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.ptab.active {
+  color: var(--ink);
+  background: var(--panel);
+  border-color: rgba(33, 31, 28, 0.09);
+  border-bottom-color: var(--panel);
+  margin-bottom: -1px;
+}
+
+.main-pane {
+  display: none;
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.main-pane.active {
+  display: flex;
+  flex-direction: column;
+}
+
+.workspace-panel,
+.checklist-panel,
+.results-panel,
+.viewer-panel {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.workspace-panel .toolbar-row:first-child {
+  padding-top: 12px;
+}
 
 .panel {
   display: flex;
@@ -608,11 +702,37 @@ input[type="number"] {
   overflow: auto;
 }
 
+.pdf-page-stage {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+}
+
 .pdf-canvas-box canvas {
   display: block;
   width: 100%;
   height: auto;
   max-width: 100%;
+}
+
+.pdf-page-canvas {
+  width: auto !important;
+  height: auto !important;
+  max-width: none !important;
+}
+
+.pdf-highlight-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.pdf-highlight-rect {
+  position: absolute;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+  outline: 1px solid color-mix(in srgb, var(--accent) 50%, white);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35) inset;
 }
 
 .pdf-text-box,
@@ -698,32 +818,39 @@ input[type="number"] {
   opacity: 0.72;
 }
 
-@media (max-width: 1500px) {
-  .layout {
-    grid-template-columns: 240px 300px 1fr;
-    grid-template-areas:
-      "boards cards workspace"
-      "boards cards checklist"
-      "boards cards results"
-      "boards cards viewer";
+@media (max-width: 768px) {
+  body {
+    height: auto;
+    overflow: auto;
   }
-}
 
-@media (max-width: 1024px) {
   .layout {
     grid-template-columns: 1fr;
-    grid-template-areas:
-      "boards"
-      "cards"
-      "workspace"
-      "checklist"
-      "results"
-      "viewer";
-    min-height: auto;
+    flex: none;
+    height: auto;
   }
 
-  .panel {
-    min-height: 260px;
+  .left-nav {
+    overflow: visible;
+  }
+
+  .boards-panel {
+    max-height: none;
+  }
+
+  .right-main {
+    height: auto;
+  }
+
+  .main-pane.active {
+    height: auto;
+  }
+
+  .workspace-panel,
+  .checklist-panel,
+  .results-panel,
+  .viewer-panel {
+    min-height: 300px;
   }
 
   .viewer-panel {
