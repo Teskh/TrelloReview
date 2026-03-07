@@ -123,7 +123,7 @@ def estimate_review_input_tokens(
     model: Optional[str] = None,
     workspace_exists: bool = True,
 ) -> Dict[str, Any]:
-    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.2").strip()
+    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.4").strip()
     system_prompt = build_review_system_prompt()
     user_payload = build_review_user_payload(
         checklist=checklist,

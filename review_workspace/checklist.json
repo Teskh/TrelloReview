@@ -18,6 +18,22 @@
       "pass_criteria": "De haber bienes registrables, estos adjuntan su documentación relevante",
       "fail_criteria": "Hay bienes registrables que no presentan documentación o esta tiene problemas",
       "required_evidence_types": []
+    },
+    {
+      "id": "item_longevidad_de_la_morosidad_seg_n_documento_de_la",
+      "title": "Longevidad de la morosidad según documento de la CMF",
+      "description": "Revusar que la información contenida en la CMF respecto a los acreedores tenga más de 90 días de morosidad (deuda en rojo), y si no tiene la morosidad necesaria saber si esto es ya sea porque cliente está efectivamente pagando a sus acreedores, renegoció o repactó con ellos, o bien el crédito fue solicitado de forma reciente.",
+      "pass_criteria": "Todas las deudas de la acreditadas en el documento de la tienen más de 90 días de morosidad",
+      "fail_criteria": "Deudas con morosidad menor a 90 días.",
+      "required_evidence_types": []
+    },
+    {
+      "id": "item_acreditaci_n_de_las_deudas",
+      "title": "Acreditación de las deudas",
+      "description": "NÓMINA DE ACREEDORES en los anexos indica la totalidad de la deuda que el cliente debe acreditar.\n1. todas las deudas que indica en este documento deben ser acreditadas en otros documentos\n2. todas las deudas en documentos adjuntos deben aparecer en la NÓMINA DE ACREEDORES",
+      "pass_criteria": "Que todas las deudas citadas en NÓMINA DE ACREEDORES tenga respaldo adjunto y que cualquier deuda adjunta venga citada en NÓMINA DE ACREEDORES",
+      "fail_criteria": "Cualquier deuda en NÓMINA DE ACREEDORES que no tenga respaldo adjunto o cualquier respaldo de una deuda que no venga citada en NÓMINA DE ACREEDORES",
+      "required_evidence_types": []
     }
   ]
 }

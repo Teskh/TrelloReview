@@ -46,6 +46,7 @@ from workbench_store import (
 
 ROOT_DIR = Path(__file__).resolve().parent
 UI_DIR = ROOT_DIR / "ui"
+VALID_REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
 
 
 @dataclass
@@ -71,6 +72,17 @@ def load_config() -> AppConfig:
 
 def make_client(cfg: AppConfig) -> TrelloClient:
     return TrelloClient(api_key=cfg.api_key, token=cfg.token)
+
+
+def parse_reasoning_effort(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if not value:
+        return "high"
+    if value not in VALID_REASONING_EFFORTS:
+        raise ValueError(
+            f"Invalid reasoning_effort '{value}'. Expected one of: {', '.join(sorted(VALID_REASONING_EFFORTS))}"
+        )
+    return value
 
 
 def get_me_and_boards(client: TrelloClient) -> Dict[str, Any]:
@@ -664,6 +676,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 card_packet = get_card_packet(client, card_id=card_id)
                 card = card_packet.get("card") or {}
                 model = (payload.get("model") or "").strip() if isinstance(payload.get("model"), str) else None
+                reasoning_effort = parse_reasoning_effort(payload.get("reasoning_effort"))
                 result = run_checklist_for_card(
                     self.workbench_paths,
                     card_id=card_id,
@@ -671,6 +684,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     card_url=card.get("url") or "",
                     card_packet=card_packet,
                     model=model,
+                    reasoning_effort=reasoning_effort,
                 )
                 self._send_json({"ok": True, **result})
                 return

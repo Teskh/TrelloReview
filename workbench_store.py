@@ -663,12 +663,14 @@ def _openai_request(
     *,
     api_key: str,
     model: str,
+    reasoning_effort: str = "high",
     system_prompt: str,
     user_payload: Dict[str, Any],
 ) -> Dict[str, Any]:
+    timeout_seconds = max(30, int(float(os.getenv("OPENAI_HTTP_TIMEOUT_SECONDS", "600"))))
     base_body = {
         "model": model,
-        "reasoning": {"effort": "high"},
+        "reasoning": {"effort": reasoning_effort},
         "input": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
@@ -707,7 +709,7 @@ def _openai_request(
             },
         )
         try:
-            with urlopen(req, timeout=180) as resp:
+            with urlopen(req, timeout=timeout_seconds) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
@@ -717,7 +719,10 @@ def _openai_request(
                 continue
             raise last_err from e
         except URLError as e:
-            raise RuntimeError(f"OpenAI Responses API network error: {e}") from e
+            raise RuntimeError(
+                f"OpenAI Responses API network error for model={model} reasoning={reasoning_effort} "
+                f"(timeout={timeout_seconds}s): {e}"
+            ) from e
     if last_err:
         raise last_err
     raise RuntimeError("OpenAI Responses API request failed")
@@ -847,6 +852,7 @@ def run_checklist_for_card(
     card_url: str,
     card_packet: Dict[str, Any],
     model: Optional[str] = None,
+    reasoning_effort: str = "high",
 ) -> Dict[str, Any]:
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
@@ -859,7 +865,7 @@ def run_checklist_for_card(
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY in environment")
-    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.2").strip()
+    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.4").strip()
     user_payload = build_review_user_payload(
         checklist=checklist,
         evidence=evidence,
@@ -872,6 +878,7 @@ def run_checklist_for_card(
     raw_api = _openai_request(
         api_key=api_key,
         model=model_name,
+        reasoning_effort=reasoning_effort,
         system_prompt=build_system_prompt(),
         user_payload=user_payload,
     )
@@ -897,6 +904,7 @@ def run_checklist_for_card(
         "run_id": run_id,
         "created_at": utc_now_iso(),
         "model": model_name,
+        "reasoning_effort": reasoning_effort,
         "summary": summary,
         "card": {"id": card_id, "name": card_name, "url": card_url},
         "result": parsed,
@@ -914,6 +922,7 @@ def run_checklist_for_card(
             "run_id": run_id,
             "created_at": run_result["created_at"],
             "model": model_name,
+            "reasoning_effort": reasoning_effort,
             "summary": summary,
         },
     )

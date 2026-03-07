@@ -78,7 +78,14 @@
             </div>
             <div class="toolbar-row">
               <label for="modelInput">Model</label>
-              <input id="modelInput" type="text" value="gpt-5.2" />
+              <input id="modelInput" type="text" value="gpt-5.4" />
+              <label for="reasoningEffortSelect">Reasoning</label>
+              <select id="reasoningEffortSelect">
+                <option value="minimal">minimal</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high" selected>high</option>
+              </select>
               <button id="runChecklistBtn" class="btn btn-accent" disabled>Run Checklist (OpenAI)</button>
             </div>
             <div id="tokenEstimate" class="meta-block muted">Token estimate: no card selected.</div>

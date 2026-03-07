@@ -38,6 +38,7 @@ const els = {
   indexTrelloBtn: document.getElementById("indexTrelloBtn"),
   runChecklistBtn: document.getElementById("runChecklistBtn"),
   modelInput: document.getElementById("modelInput"),
+  reasoningEffortSelect: document.getElementById("reasoningEffortSelect"),
   tokenEstimate: document.getElementById("tokenEstimate"),
   workspaceMeta: document.getElementById("workspaceMeta"),
   localFilesList: document.getElementById("localFilesList"),
@@ -307,7 +308,7 @@ function renderTokenEstimate() {
     els.tokenEstimate.classList.add("muted");
     return;
   }
-  const model = est.model || (els.modelInput?.value || "gpt-5.2");
+  const model = est.model || (els.modelInput?.value || "gpt-5.4");
   const total = est.counts?.total_input_tokens;
   const docs = est.payload_stats?.evidence_documents ?? 0;
   const segs = est.payload_stats?.evidence_segments ?? 0;
@@ -320,7 +321,8 @@ function renderTokenEstimate() {
   const headline = Number.isFinite(total)
     ? `Token estimate (${model}): ${total.toLocaleString()} input tokens`
     : `Token estimate (${model}): unavailable`;
-  const detail = `Checklist: ${checklistItems} item(s) • Comments: ${commentsCount} (${commentsChars.toLocaleString()} chars) • Desc: ${descChars.toLocaleString()} chars • Evidence: ${docs} doc(s), ${segs} segment(s) • Encoder: ${encoding}`;
+  const reasoning = els.reasoningEffortSelect?.value || "high";
+  const detail = `Checklist: ${checklistItems} item(s) • Comments: ${commentsCount} (${commentsChars.toLocaleString()} chars) • Desc: ${descChars.toLocaleString()} chars • Evidence: ${docs} doc(s), ${segs} segment(s) • Encoder: ${encoding} • Reasoning: ${reasoning}`;
   const extra = est.error ? `\n${est.error}` : notes.length ? `\n${notes[0]}` : "";
   els.tokenEstimate.textContent = `${headline}\n${detail}${extra}`;
   els.tokenEstimate.classList.toggle("muted", !Number.isFinite(total));
@@ -722,7 +724,7 @@ async function loadCards() {
 
 async function loadCard(card) {
   state.selectedCard = card;
-  state.tokenEstimate = { loading: true, model: (els.modelInput.value || "gpt-5.2").trim() };
+  state.tokenEstimate = { loading: true, model: (els.modelInput.value || "gpt-5.4").trim() };
   state.indexCache.clear();
   renderCards();
   renderTokenEstimate();
@@ -1277,10 +1279,14 @@ async function runChecklist() {
     return;
   }
   els.runChecklistBtn.disabled = true;
-  setViewerState("Running checklist with OpenAI Responses API (reasoning=high)...", false);
+  const reasoningEffort = els.reasoningEffortSelect?.value || "high";
+  setViewerState(`Running checklist with OpenAI Responses API (reasoning=${reasoningEffort})...`, false);
   try {
-    const model = (els.modelInput.value || "gpt-5.2").trim();
-    const data = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/run`, { model });
+    const model = (els.modelInput.value || "gpt-5.4").trim();
+    const data = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/run`, {
+      model,
+      reasoning_effort: reasoningEffort,
+    });
     state.runResult = data.run || null;
     if (state.workspace) state.workspace.runs = data.runs || state.workspace.runs || [];
     renderWorkspace();
@@ -1305,7 +1311,7 @@ async function refreshTokenEstimate() {
     return;
   }
   const cardId = state.selectedCard.id;
-  const model = (els.modelInput.value || "gpt-5.2").trim();
+  const model = (els.modelInput.value || "gpt-5.4").trim();
   state.tokenEstimate = { loading: true, model };
   renderTokenEstimate();
   try {
@@ -1827,6 +1833,7 @@ function bindEvents() {
   els.indexTrelloBtn.addEventListener("click", indexTrelloAttachments);
   els.runChecklistBtn.addEventListener("click", runChecklist);
   els.modelInput.addEventListener("change", refreshTokenEstimate);
+  els.reasoningEffortSelect.addEventListener("change", refreshTokenEstimate);
 
   els.loadRunBtn.addEventListener("click", loadSelectedRun);
 }
