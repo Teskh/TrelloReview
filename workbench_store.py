@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -664,6 +666,47 @@ def get_local_file_path(paths: WorkbenchPaths, card_id: str, rel_path: str) -> P
     if not candidate.is_file():
         raise FileNotFoundError("File not found")
     return candidate
+
+
+def import_local_files_for_card(
+    paths: WorkbenchPaths,
+    *,
+    card_id: str,
+    card_name: str,
+    card_url: str,
+    files: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ensure_card_workspace(paths, card_id=card_id, card_name=card_name, card_url=card_url)
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        raise RuntimeError("Workspace create/load failed")
+    attachments_dir = _attachments_dir(ws_dir).resolve()
+    saved: List[Dict[str, Any]] = []
+
+    for idx, payload in enumerate(files, start=1):
+        if not isinstance(payload, dict):
+            raise ValueError(f"File payload #{idx} must be an object")
+        raw_name = str(payload.get("name") or "").strip()
+        if not raw_name:
+            raise ValueError(f"File payload #{idx} missing name")
+        safe_name = Path(raw_name.replace("\\", "/")).name.strip()
+        if not safe_name:
+            raise ValueError(f"File payload #{idx} has invalid name")
+        raw_content = payload.get("contentBase64")
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            raise ValueError(f"File payload #{idx} missing contentBase64")
+        try:
+            body = base64.b64decode(raw_content.encode("ascii"), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError(f"File payload #{idx} has invalid base64 content") from exc
+
+        target = (attachments_dir / safe_name).resolve()
+        if attachments_dir not in [target, *target.parents]:
+            raise ValueError(f"Invalid target path for file payload #{idx}")
+        target.write_bytes(body)
+        saved.append({"name": safe_name, "size": len(body)})
+
+    return {"saved": saved, "workspace": get_card_workspace_info(paths, card_id)}
 
 
 def _index_filename(source_key: str, file_kind: str) -> str:

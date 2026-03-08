@@ -36,6 +36,7 @@ const els = {
   viewerState: document.getElementById("viewerState"),
 
   prepareReviewBtn: document.getElementById("prepareReviewBtn"),
+  uploadWorkspaceFilesBtn: document.getElementById("uploadWorkspaceFilesBtn"),
   createWorkspaceBtn: document.getElementById("createWorkspaceBtn"),
   refreshWorkspaceBtn: document.getElementById("refreshWorkspaceBtn"),
   indexLocalBtn: document.getElementById("indexLocalBtn"),
@@ -57,6 +58,7 @@ const els = {
   importChecklistBtn: document.getElementById("importChecklistBtn"),
   exportChecklistBtn: document.getElementById("exportChecklistBtn"),
   importChecklistInput: document.getElementById("importChecklistInput"),
+  uploadWorkspaceFilesInput: document.getElementById("uploadWorkspaceFilesInput"),
   saveChecklistBtn: document.getElementById("saveChecklistBtn"),
   addChecklistItemBtn: document.getElementById("addChecklistItemBtn"),
 
@@ -112,6 +114,17 @@ async function apiPost(path, body) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `Request failed: ${res.status}`);
   return data;
+}
+
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
 }
 
 function setViewerState(text) {
@@ -350,6 +363,7 @@ function renderPrepSummary(ws, prep) {
 function renderWorkspace() {
   const hasCard = !!state.selectedCard;
   els.prepareReviewBtn.disabled = !hasCard;
+  els.uploadWorkspaceFilesBtn.disabled = !hasCard;
   els.createWorkspaceBtn.disabled = !hasCard;
   els.refreshWorkspaceBtn.disabled = !hasCard;
   
@@ -819,6 +833,39 @@ async function createWorkspace() {
     setViewerState("Review folder initialized.");
   } catch (err) { setViewerState(`Init failed: ${err.message}`); }
   finally { els.createWorkspaceBtn.disabled = false; }
+}
+
+function promptWorkspaceFilesImport() {
+  if (!state.selectedCard || !els.uploadWorkspaceFilesInput) return;
+  els.uploadWorkspaceFilesInput.value = "";
+  els.uploadWorkspaceFilesInput.click();
+}
+
+async function importWorkspaceFiles(fileList) {
+  const files = Array.from(fileList || []);
+  if (!state.selectedCard || !files.length) return;
+  els.uploadWorkspaceFilesBtn.disabled = true;
+  try {
+    if (!state.workspace?.exists) {
+      state.workspace = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/create`);
+    }
+    const payloadFiles = [];
+    for (const file of files) {
+      const buffer = await file.arrayBuffer();
+      payloadFiles.push({
+        name: file.name,
+        contentBase64: arrayBufferToBase64(buffer),
+      });
+    }
+    await apiPost(`/api/cards/${state.selectedCard.id}/workspace/files/import`, { files: payloadFiles });
+    await loadWorkspaceStatus(state.currentPacket);
+    setViewerState(`Imported ${payloadFiles.length} file(s). Click Prepare Review to index them.`);
+  } catch (err) {
+    setViewerState(`Upload failed: ${err.message}`);
+  } finally {
+    els.uploadWorkspaceFilesBtn.disabled = false;
+    if (els.uploadWorkspaceFilesInput) els.uploadWorkspaceFilesInput.value = "";
+  }
 }
 
 async function refreshWorkspace() {
@@ -1835,6 +1882,7 @@ function bindEvents() {
   els.cardSearch.onkeydown = (e) => { if (e.key === "Enter") loadCards(); };
   
   els.prepareReviewBtn.onclick = prepareReview;
+  els.uploadWorkspaceFilesBtn.onclick = promptWorkspaceFilesImport;
   els.createWorkspaceBtn.onclick = createWorkspace;
   els.refreshWorkspaceBtn.onclick = refreshWorkspace;
   els.indexLocalBtn.onclick = () => indexLocalAttachments();
@@ -1847,6 +1895,7 @@ function bindEvents() {
   els.importChecklistBtn.onclick = promptChecklistImport;
   els.exportChecklistBtn.onclick = exportChecklist;
   els.importChecklistInput.onchange = (e) => importChecklistFile(e.target.files?.[0]);
+  els.uploadWorkspaceFilesInput.onchange = (e) => importWorkspaceFiles(e.target.files);
   els.saveChecklistBtn.onclick = saveChecklist;
   els.addChecklistItemBtn.onclick = () => { ensureChecklistDraft().items.push(newChecklistItemDraft()); renderChecklistBuilder(); };
   

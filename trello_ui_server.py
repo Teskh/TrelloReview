@@ -7,15 +7,21 @@ Starts an HTTP server that:
 
 Usage:
   python trello_ui_server.py
-  python trello_ui_server.py --port 8765
+  python trello_ui_server.py --port 9266
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import mimetypes
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -36,6 +42,7 @@ from workbench_store import (
     get_index_for_card,
     get_local_file_path,
     get_run_result,
+    import_local_files_for_card,
     init_workbench_paths,
     list_index_summaries,
     load_checklist,
@@ -47,6 +54,14 @@ from workbench_store import (
     save_checklist_text,
     save_indexes_for_card,
 )
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except Exception:  # pragma: no cover - optional in local dev, bundled for desktop app
+    pystray = None
+    Image = None
+    ImageDraw = None
 
 APP_PATHS = resolve_app_paths()
 ROOT_DIR = APP_PATHS.resource_root
@@ -79,6 +94,157 @@ def load_config() -> AppConfig:
 
 def make_client(cfg: AppConfig) -> TrelloClient:
     return TrelloClient(api_key=cfg.api_key, token=cfg.token)
+
+
+def maybe_show_error_dialog(title: str, message: str) -> None:
+    if os.name != "nt" and not getattr(sys, "frozen", False):
+        return
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except Exception:
+        return
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        messagebox.showerror(title, message)
+    except Exception:
+        return
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+def open_browser_soon(url: str) -> None:
+    def _open() -> None:
+        try:
+            webbrowser.open(url, new=1)
+        except Exception:
+            pass
+
+    timer = threading.Timer(0.6, _open)
+    timer.daemon = True
+    timer.start()
+
+
+def open_path_in_shell(path: Path) -> None:
+    try:
+        if hasattr(os, "startfile"):
+            os.startfile(str(path))  # type: ignore[attr-defined]
+            return
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+            return
+        subprocess.Popen(["xdg-open", str(path)])
+    except Exception:
+        return
+
+
+def probe_status(url: str, timeout: float = 1.5) -> bool:
+    try:
+        with urlopen(url, timeout=timeout) as resp:
+            if resp.status != HTTPStatus.OK:
+                return False
+            payload = json.loads(resp.read().decode("utf-8"))
+            return bool(payload.get("ok"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError):
+        return False
+
+
+def open_browser_when_ready(app_url: str, *, wait_seconds: float = 8.0) -> None:
+    status_url = app_url.rstrip("/") + "/api/status"
+
+    def _wait_then_open() -> None:
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            if probe_status(status_url, timeout=1.0):
+                try:
+                    webbrowser.open(app_url, new=1)
+                except Exception:
+                    pass
+                return
+            time.sleep(0.2)
+
+    thread = threading.Thread(target=_wait_then_open, daemon=True)
+    thread.start()
+
+
+def create_tray_icon_image() -> Any:
+    if Image is None or ImageDraw is None:
+        return None
+    image = Image.new("RGBA", (64, 64), (246, 242, 235, 255))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((4, 4, 60, 60), radius=14, fill=(252, 249, 244, 255), outline=(33, 31, 28, 255), width=2)
+    draw.rounded_rectangle((15, 14, 27, 49), radius=4, fill=(33, 31, 28, 255))
+    draw.rounded_rectangle((37, 14, 49, 34), radius=4, fill=(193, 86, 47, 255))
+    draw.rounded_rectangle((37, 39, 49, 49), radius=4, fill=(120, 138, 102, 255))
+    return image
+
+
+def stop_server(server: ThreadingHTTPServer) -> None:
+    try:
+        server.shutdown()
+    except Exception:
+        pass
+    try:
+        server.server_close()
+    except Exception:
+        pass
+
+
+def run_with_tray(
+    *,
+    server: ThreadingHTTPServer,
+    app_url: str,
+    user_root: Path,
+    open_browser: bool,
+) -> None:
+    if pystray is None:
+        raise RuntimeError("pystray is not installed")
+    tray_image = create_tray_icon_image()
+    if tray_image is None:
+        raise RuntimeError("Pillow is not installed")
+
+    def on_open(_: Any, __: Any) -> None:
+        open_browser_soon(app_url)
+
+    def on_open_data(_: Any, __: Any) -> None:
+        open_path_in_shell(user_root)
+
+    def on_quit(icon: Any, _: Any) -> None:
+        def _shutdown() -> None:
+            stop_server(server)
+            try:
+                icon.stop()
+            except Exception:
+                pass
+
+        threading.Thread(target=_shutdown, daemon=True).start()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open Trello Review", on_open, default=True),
+        pystray.MenuItem("Open Data Folder", on_open_data),
+        pystray.MenuItem("Quit", on_quit),
+    )
+    icon = pystray.Icon("trello_review", tray_image, "Trello Review", menu)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    def setup(_: Any) -> None:
+        if open_browser:
+            open_browser_when_ready(app_url)
+
+    try:
+        icon.run(setup=setup)
+    finally:
+        stop_server(server)
+        server_thread.join(timeout=2.0)
 
 
 def parse_reasoning_effort(raw: Any) -> str:
@@ -367,6 +533,14 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory=str(UI_DIR), **kwargs)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        # Windowed PyInstaller builds on Windows may not have a usable stderr.
+        # Avoid crashing request handling just to emit access logs.
+        try:
+            super().log_message(format, *args)
+        except Exception:
+            return
 
     @property
     def app_config(self) -> AppConfig:
@@ -691,6 +865,27 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 self._send_json({"ok": True, **result})
                 return
 
+            if path.startswith("/api/cards/") and path.endswith("/workspace/files/import"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 6:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace file import route")
+                    return
+                card_id = parts[2]
+                files = payload.get("files")
+                if not isinstance(files, list) or not files:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Body must contain a non-empty files array")
+                    return
+                card = client.get("/cards/" + card_id, fields="id,name,url")
+                result = import_local_files_for_card(
+                    self.workbench_paths,
+                    card_id=card_id,
+                    card_name=card.get("name") or card_id,
+                    card_url=card.get("url") or "",
+                    files=files,
+                )
+                self._send_json({"ok": True, **result})
+                return
+
             if path.startswith("/api/cards/") and path.endswith("/workspace/indexes/prune"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 6:
@@ -743,22 +938,41 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local Trello workbench UI server")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=9266)
+    parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the browser")
+    parser.add_argument("--no-tray", action="store_true", help="Do not show the system tray icon")
     args = parser.parse_args()
 
     if not UI_DIR.exists():
         raise SystemExit(f"UI directory not found: {UI_DIR}")
 
-    cfg = load_config()
-    server = ThreadingHTTPServer((args.host, args.port), TrelloWorkbenchHandler)
-    server.app_config = cfg  # type: ignore[attr-defined]
-    server.workbench_paths = init_workbench_paths(
-        APP_PATHS.review_workspace_dir,
-        checklist_file=APP_PATHS.user_checklist_file,
-        checklist_template_file=APP_PATHS.default_checklist_file,
-    )  # type: ignore[attr-defined]
+    app_url = f"http://{args.host}:{args.port}"
+    try:
+        cfg = load_config()
+        server = ThreadingHTTPServer((args.host, args.port), TrelloWorkbenchHandler)
+        server.app_config = cfg  # type: ignore[attr-defined]
+        server.workbench_paths = init_workbench_paths(
+            APP_PATHS.review_workspace_dir,
+            checklist_file=APP_PATHS.user_checklist_file,
+            checklist_template_file=APP_PATHS.default_checklist_file,
+        )  # type: ignore[attr-defined]
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            if not args.no_browser and probe_status(app_url.rstrip("/") + "/api/status"):
+                open_browser_soon(app_url)
+                return 0
+            maybe_show_error_dialog(
+                "Trello Review",
+                f"Port {args.port} is already in use by another app. Close it or run on a different port.",
+            )
+            return 0
+        maybe_show_error_dialog("Trello Review", str(e))
+        raise
+    except Exception as e:
+        maybe_show_error_dialog("Trello Review", str(e))
+        raise
 
-    print(f"Trello workbench: http://{args.host}:{args.port}")
+    print(f"Trello workbench: {app_url}")
     print(f"User data: {APP_PATHS.user_root}")
     print("Endpoints:")
     print("  GET /api/boards")
@@ -773,14 +987,25 @@ def main() -> int:
     print("  POST /api/cards/<cardId>/workspace/status")
     print("  POST /api/cards/<cardId>/workspace/create")
     print("  POST /api/cards/<cardId>/workspace/indexes")
+    print("  POST /api/cards/<cardId>/workspace/files/import")
     print("  POST /api/cards/<cardId>/workspace/indexes/prune")
     print("  POST /api/cards/<cardId>/workspace/run")
     try:
-        server.serve_forever()
+        if pystray is not None and not args.no_tray:
+            run_with_tray(
+                server=server,
+                app_url=app_url,
+                user_root=APP_PATHS.user_root,
+                open_browser=not args.no_browser,
+            )
+        else:
+            if not args.no_browser:
+                open_browser_when_ready(app_url)
+            server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping server.")
     finally:
-        server.server_close()
+        stop_server(server)
     return 0
 
 

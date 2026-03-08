@@ -87,6 +87,7 @@
               <div class="toolbar glass-panel">
                 <div class="toolbar-group">
                   <button id="prepareReviewBtn" class="action-btn primary" disabled>Prepare Review</button>
+                  <button id="uploadWorkspaceFilesBtn" class="action-btn outline" disabled>Upload Files</button>
                   <button id="refreshWorkspaceBtn" class="action-btn outline" disabled>Refresh Status</button>
                   <details class="advanced-tools">
                     <summary>Advanced</summary>
@@ -236,6 +237,7 @@
     </div>
 
     <input id="importChecklistInput" type="file" accept=".json,application/json" hidden />
+    <input id="uploadWorkspaceFilesInput" type="file" multiple hidden />
 
     <!-- Templates -->
     <template id="boardItemTpl">
