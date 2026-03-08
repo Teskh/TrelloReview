@@ -64,6 +64,7 @@ const els = {
   citationModal: document.getElementById("citationModal"),
   closeModalBtn: document.getElementById("closeModalBtn"),
   modalCitationTitle: document.getElementById("modalCitationTitle"),
+  modalCitationMeta: document.getElementById("modalCitationMeta"),
   citationDocView: document.getElementById("modalCitationDocView"),
 
   innerTabs: Array.from(document.querySelectorAll(".inner-tab")),
@@ -430,6 +431,24 @@ function buildChecklistPayload() {
   return { version: 1, name: draft.name, instructions: draft.instructions, items };
 }
 
+function citationEffectClass(effect) {
+  return ["supports", "contradicts", "insufficient"].includes(effect) ? effect : "insufficient";
+}
+
+function citationEffectLabel(effect) {
+  return {
+    supports: "Supports",
+    contradicts: "Contradicts",
+    insufficient: "Insufficient",
+  }[citationEffectClass(effect)];
+}
+
+function citationValidationLabel(citation) {
+  const status = citation?.validation?.status || "unvalidated";
+  const score = citation?.validation?.score;
+  return Number.isFinite(Number(score)) ? `${status} (${Number(score).toFixed(2)})` : status;
+}
+
 function renderRunHistorySelect() {
   const runs = state.workspace?.runs || [];
   els.runHistorySelect.innerHTML = "";
@@ -496,10 +515,16 @@ function renderResults() {
       
       for (const cit of citations) {
         const card = document.createElement("div");
-        card.className = "evidence-card";
+        const effectClass = citationEffectClass(cit.effect);
+        card.className = `evidence-card ${effectClass}`;
         card.innerHTML = `
+          <div class="evidence-topline">
+            <span class="evidence-effect ${effectClass}">${citationEffectLabel(cit.effect)}</span>
+            <span class="evidence-meta">${escapeHtml(cit.source_key || "?")} -> ${escapeHtml(cit.anchor_id || "?")}</span>
+          </div>
           <div class="evidence-quote">"${escapeHtml(cit.quote || "...")}"</div>
           <div class="evidence-reason">${escapeHtml(cit.reason || "N/A")}</div>
+          <div class="evidence-meta">Validation: ${escapeHtml(citationValidationLabel(cit))}</div>
         `;
         const btn = document.createElement("button");
         btn.className = "action-btn outline sm evidence-action";
@@ -640,6 +665,461 @@ async function refreshWorkspace() {
   } catch (err) { setViewerState(`Sync failed: ${err.message}`); }
 }
 
+function getExt(name) {
+  const i = String(name || "").lastIndexOf(".");
+  return i >= 0 ? String(name).slice(i).toLowerCase() : "";
+}
+
+function detectFileKind(name, mimeType = "") {
+  const ext = getExt(name);
+  const mime = (mimeType || "").toLowerCase();
+  if (ext === ".docx" || mime.includes("wordprocessingml")) return "docx";
+  if (ext === ".xlsx" || ext === ".xlsm" || mime.includes("spreadsheetml") || mime.includes("excel")) return "xlsx";
+  if (ext === ".pdf" || mime === "application/pdf") return "pdf";
+  if ([".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic"].includes(ext) || mime.startsWith("image/")) return "image";
+  if ([".txt", ".md", ".csv", ".tsv"].includes(ext) || mime.startsWith("text/")) return "text";
+  return "unknown";
+}
+
+async function sha256Hex(arrayBuffer) {
+  const digest = await crypto.subtle.digest("SHA-256", arrayBuffer);
+  const bytes = new Uint8Array(digest);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function normalizeWhitespace(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function buildTextSegments(blocks, baseKind) {
+  let n = 0;
+  const segments = [];
+  for (const block of blocks) {
+    const text = normalizeWhitespace(block.text || "");
+    if (!text) continue;
+    n += 1;
+    segments.push({
+      anchor_id: block.anchor_id || `${baseKind}_${n}`,
+      kind: block.kind || baseKind,
+      text,
+      page: block.page ?? null,
+      sheet: block.sheet ?? null,
+      meta: block.meta || {},
+    });
+  }
+  return segments;
+}
+
+async function extractDocxIndex(arrayBuffer, meta) {
+  if (!window.mammoth) throw new Error("Mammoth library not loaded");
+  const result = await window.mammoth.convertToHtml({ arrayBuffer });
+  const html = result.value || "";
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(`<body>${html}</body>`, "text/html");
+  const body = doc.body;
+  const selectors = "h1,h2,h3,h4,h5,h6,p,li,tr,blockquote";
+  const blocks = [];
+  let i = 0;
+  body.querySelectorAll(selectors).forEach((el) => {
+    const text = normalizeWhitespace(el.textContent || "");
+    if (!text) return;
+    i += 1;
+    const anchorId = `block_${i}`;
+    el.setAttribute("data-anchor-id", anchorId);
+    blocks.push({
+      anchor_id: anchorId,
+      kind: "docx_block",
+      text,
+      meta: { tag: el.tagName.toLowerCase() },
+    });
+  });
+  return {
+    version: 1,
+    file_kind: "docx",
+    display_name: meta.displayName,
+    file_name: meta.fileName,
+    mime_type: meta.mimeType,
+    content_hash: meta.contentHash,
+    extracted_at: new Date().toISOString(),
+    warnings: (result.messages || []).map((m) => `${m.type || "info"}: ${m.message || ""}`),
+    render: {
+      type: "html",
+      html: body.innerHTML,
+    },
+    segments: buildTextSegments(blocks, "docx_block"),
+  };
+}
+
+function decodeCellValue(cell) {
+  if (!cell) return "";
+  if (cell.w != null) return String(cell.w);
+  if (cell.v == null) return "";
+  return String(cell.v);
+}
+
+async function extractXlsxIndex(arrayBuffer, meta) {
+  if (!window.XLSX) throw new Error("SheetJS library not loaded");
+  const wb = window.XLSX.read(arrayBuffer, { type: "array", cellFormula: true, cellDates: true });
+  const workbookPreview = [];
+  const segments = [];
+  let segCount = 0;
+
+  for (const sheetName of wb.SheetNames || []) {
+    const ws = wb.Sheets[sheetName];
+    const ref = ws?.["!ref"];
+    const sheetPreview = { sheet: sheetName, ref: ref || null, rows: [] };
+    if (!ref) {
+      workbookPreview.push(sheetPreview);
+      continue;
+    }
+    const range = window.XLSX.utils.decode_range(ref);
+    const maxRows = Math.min(range.e.r, range.s.r + 79);
+    const maxCols = Math.min(range.e.c, range.s.c + 19);
+
+    for (let r = range.s.r; r <= range.e.r; r += 1) {
+      const rowCells = [];
+      for (let c = range.s.c; c <= range.e.c; c += 1) {
+        const addr = window.XLSX.utils.encode_cell({ r, c });
+        const cell = ws[addr];
+        if (!cell) continue;
+        const display = decodeCellValue(cell);
+        const formula = cell.f ? String(cell.f) : null;
+        if (display === "" && !formula) continue;
+
+        const anchor = `${sheetName}!${addr}`;
+        if (segCount < 6000) {
+          segments.push({
+            anchor_id: anchor,
+            kind: "xlsx_cell",
+            text: `${anchor} = ${display}${formula ? ` (formula: ${formula})` : ""}`,
+            page: null,
+            sheet: sheetName,
+            meta: { cell: addr, formula },
+          });
+          segCount += 1;
+        }
+
+        if (r <= maxRows && c <= maxCols) {
+          rowCells.push({ c, addr, display, formula });
+        }
+      }
+      if (r <= maxRows) {
+        sheetPreview.rows.push({ r, cells: rowCells });
+      }
+    }
+
+    workbookPreview.push(sheetPreview);
+  }
+
+  return {
+    version: 1,
+    file_kind: "xlsx",
+    display_name: meta.displayName,
+    file_name: meta.fileName,
+    mime_type: meta.mimeType,
+    content_hash: meta.contentHash,
+    extracted_at: new Date().toISOString(),
+    warnings: [],
+    render: {
+      type: "xlsx_preview",
+      workbook: workbookPreview,
+      sheet_names: wb.SheetNames || [],
+    },
+    segments,
+  };
+}
+
+function groupPdfItemsToPageText(items) {
+  return items
+    .map((it) => String(it.str || "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function extractPdfIndex(arrayBuffer, meta) {
+  if (!window.pdfjsLib) throw new Error("pdf.js library not loaded");
+  const pdf = await window.pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
+  const segments = [];
+  const pages = [];
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum += 1) {
+    const page = await pdf.getPage(pageNum);
+    const viewport = page.getViewport({ scale: 1 });
+    let text = "";
+    let itemCount = 0;
+    try {
+      const tc = await page.getTextContent();
+      itemCount = (tc.items || []).length;
+      text = groupPdfItemsToPageText(tc.items || []);
+    } catch {
+      text = "";
+    }
+    const anchor = `page_${pageNum}`;
+    segments.push({
+      anchor_id: anchor,
+      kind: "pdf_page",
+      text,
+      page: pageNum,
+      sheet: null,
+      meta: {
+        width: viewport.width,
+        height: viewport.height,
+        text_item_count: itemCount,
+        ocr_status: text ? "text_available" : "image_only",
+      },
+    });
+    pages.push({ page: pageNum, width: viewport.width, height: viewport.height, textLength: text.length, anchor_id: anchor });
+  }
+  return {
+    version: 1,
+    file_kind: "pdf",
+    display_name: meta.displayName,
+    file_name: meta.fileName,
+    mime_type: meta.mimeType,
+    content_hash: meta.contentHash,
+    extracted_at: new Date().toISOString(),
+    warnings: segments.some((s) => !s.text) ? ["Some pages appear scanned/image-only (no extractable text)."] : [],
+    render: {
+      type: "pdf",
+      page_count: pdf.numPages,
+      pages,
+    },
+    segments,
+  };
+}
+
+async function extractTextIndex(arrayBuffer, meta) {
+  let text = "";
+  try {
+    text = new TextDecoder("utf-8", { fatal: false }).decode(arrayBuffer);
+  } catch {
+    text = new TextDecoder().decode(arrayBuffer);
+  }
+  const lines = String(text).split(/\r?\n/);
+  const blocks = [];
+  let buf = [];
+  let n = 0;
+  const flush = () => {
+    const joined = normalizeWhitespace(buf.join("\n"));
+    if (!joined) {
+      buf = [];
+      return;
+    }
+    n += 1;
+    blocks.push({ anchor_id: `text_${n}`, kind: "text_block", text: joined, meta: {} });
+    buf = [];
+  };
+  for (const line of lines) {
+    if (!line.trim()) {
+      flush();
+    } else {
+      buf.push(line);
+    }
+  }
+  flush();
+  return {
+    version: 1,
+    file_kind: "text",
+    display_name: meta.displayName,
+    file_name: meta.fileName,
+    mime_type: meta.mimeType,
+    content_hash: meta.contentHash,
+    extracted_at: new Date().toISOString(),
+    warnings: [],
+    render: { type: "text", text: String(text).slice(0, 500000) },
+    segments: buildTextSegments(blocks, "text_block"),
+  };
+}
+
+async function imageDimensionsFromBuffer(arrayBuffer, mimeType) {
+  return new Promise((resolve) => {
+    const blob = new Blob([arrayBuffer], { type: mimeType || "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      URL.revokeObjectURL(url);
+    };
+    img.onerror = () => {
+      resolve({ width: null, height: null });
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
+  });
+}
+
+async function extractImageIndex(arrayBuffer, meta) {
+  const dims = await imageDimensionsFromBuffer(arrayBuffer, meta.mimeType);
+  return {
+    version: 1,
+    file_kind: "image",
+    display_name: meta.displayName,
+    file_name: meta.fileName,
+    mime_type: meta.mimeType,
+    content_hash: meta.contentHash,
+    extracted_at: new Date().toISOString(),
+    warnings: ["Image indexing is metadata-only in MVP; add OCR/region anchors later for precise evidence."],
+    render: { type: "image", ...dims },
+    segments: [
+      {
+        anchor_id: "image_full",
+        kind: "image",
+        text: "",
+        page: null,
+        sheet: null,
+        meta: { ...dims },
+      },
+    ],
+  };
+}
+
+async function extractUnknownIndex(meta) {
+  return {
+    version: 1,
+    file_kind: "unknown",
+    display_name: meta.displayName,
+    file_name: meta.fileName,
+    mime_type: meta.mimeType,
+    content_hash: meta.contentHash,
+    extracted_at: new Date().toISOString(),
+    warnings: ["Unsupported file type for structured extraction in MVP."],
+    render: { type: "none" },
+    segments: [],
+  };
+}
+
+async function buildIndexRecord({ source, cardId, displayName, fileName, mimeType, arrayBuffer, sourceLocator, localFile, trelloAttachment }) {
+  const contentHash = await sha256Hex(arrayBuffer);
+  const fileKind = detectFileKind(fileName, mimeType);
+  const meta = { source, cardId, displayName, fileName, mimeType, contentHash };
+  let index;
+  if (fileKind === "docx") index = await extractDocxIndex(arrayBuffer, meta);
+  else if (fileKind === "xlsx") index = await extractXlsxIndex(arrayBuffer, meta);
+  else if (fileKind === "pdf") index = await extractPdfIndex(arrayBuffer, meta);
+  else if (fileKind === "text") index = await extractTextIndex(arrayBuffer, meta);
+  else if (fileKind === "image") index = await extractImageIndex(arrayBuffer, meta);
+  else index = await extractUnknownIndex(meta);
+
+  return {
+    source,
+    sourceKey: source === "local" ? `local:${localFile.relativePath}` : `trello:${trelloAttachment.attachmentId}`,
+    cardId,
+    displayName,
+    fileName,
+    mimeType,
+    contentHash,
+    sourceLocator,
+    localFile,
+    trelloAttachment,
+    index,
+  };
+}
+
+async function fetchArrayBuffer(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  const buf = await res.arrayBuffer();
+  return { buffer: buf, contentType: res.headers.get("Content-Type") || "application/octet-stream" };
+}
+
+function localContentUrl(cardId, relativePath) {
+  return `/api/cards/${encodeURIComponent(cardId)}/workspace/files/content?path=${encodeURIComponent(relativePath)}`;
+}
+
+async function indexLocalAttachments() {
+  if (!state.selectedCard) return;
+  if (!state.workspace?.exists) {
+    setViewerState("Create the workspace folder first.");
+    return;
+  }
+  const files = state.workspace.localFiles || [];
+  if (!files.length) {
+    setViewerState("No local files found in attachments/. Copy files there first.");
+    return;
+  }
+  els.indexLocalBtn.disabled = true;
+  setViewerState(`Indexing ${files.length} local attachment(s)...`);
+  try {
+    const batch = [];
+    for (let i = 0; i < files.length; i += 1) {
+      const f = files[i];
+      setViewerState(`Indexing local ${i + 1}/${files.length}: ${f.relativePath}`);
+      const url = localContentUrl(state.selectedCard.id, f.relativePath);
+      const { buffer, contentType } = await fetchArrayBuffer(url);
+      const fileName = f.relativePath.split("/").pop() || f.relativePath;
+      const record = await buildIndexRecord({
+        source: "local",
+        cardId: state.selectedCard.id,
+        displayName: fileName,
+        fileName,
+        mimeType: contentType.split(";")[0] || "application/octet-stream",
+        arrayBuffer: buffer,
+        sourceLocator: { type: "local_file", relativePath: f.relativePath, url },
+        localFile: { relativePath: f.relativePath },
+      });
+      batch.push(record);
+    }
+    await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: batch });
+    await refreshWorkspace();
+    setViewerState(`Indexed ${batch.length} local attachment(s).`);
+  } catch (err) {
+    setViewerState(`Local indexing failed: ${err.message}`);
+  } finally {
+    els.indexLocalBtn.disabled = false;
+  }
+}
+
+async function indexTrelloAttachments() {
+  if (!state.selectedCard || !state.currentPacket) return;
+  const attachments = state.currentPacket.attachments || [];
+  if (!attachments.length) {
+    setViewerState("Card has no Trello attachments to index.");
+    return;
+  }
+  if (!state.workspace?.exists) {
+    setViewerState("Create the workspace folder first.");
+    return;
+  }
+  els.indexTrelloBtn.disabled = true;
+  setViewerState(`Indexing ${attachments.length} Trello attachment(s)...`);
+  try {
+    const batch = [];
+    for (let i = 0; i < attachments.length; i += 1) {
+      const att = attachments[i];
+      const proxyUrl = att.proxyUrl;
+      if (!proxyUrl) continue;
+      const fileName = att.fileName || att.name || `attachment_${att.id}`;
+      setViewerState(`Indexing Trello ${i + 1}/${attachments.length}: ${fileName}`);
+      const { buffer, contentType } = await fetchArrayBuffer(proxyUrl);
+      const record = await buildIndexRecord({
+        source: "trello",
+        cardId: state.selectedCard.id,
+        displayName: att.name || fileName,
+        fileName,
+        mimeType: (att.mimeType || contentType || "").split(";")[0],
+        arrayBuffer: buffer,
+        sourceLocator: { type: "trello_attachment", proxyUrl, sourceUrl: att.url || null },
+        trelloAttachment: {
+          attachmentId: att.id,
+          name: att.name || fileName,
+          mimeType: att.mimeType || contentType,
+          proxyUrl,
+          sourceUrl: att.url || null,
+        },
+      });
+      batch.push(record);
+    }
+    await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: batch });
+    await refreshWorkspace();
+    setViewerState(`Indexed ${batch.length} Trello attachment(s).`);
+  } catch (err) {
+    setViewerState(`Trello indexing failed: ${err.message}`);
+  } finally {
+    els.indexTrelloBtn.disabled = false;
+  }
+}
+
 async function runChecklist() {
   if (!state.selectedCard || !state.workspace?.exists) return;
   els.runChecklistBtn.disabled = true;
@@ -696,51 +1176,431 @@ async function getIndexBySourceKey(sourceKey) {
   return data;
 }
 
+function clearCitationHighlights(root) {
+  root?.querySelectorAll?.(".cited-anchor").forEach((el) => el.classList.remove("cited-anchor"));
+  root?.querySelectorAll?.(".quote-highlight").forEach((el) => {
+    el.replaceWith(document.createTextNode(el.textContent || ""));
+  });
+  root?.querySelectorAll?.(".pdf-highlight-rect").forEach((el) => el.remove());
+}
+
+function highlightQuoteInElement(el, quote) {
+  const q = String(quote || "").trim();
+  if (!q || !el) return;
+  const text = el.textContent || "";
+  const idx = text.toLowerCase().indexOf(q.toLowerCase());
+  if (idx < 0) return;
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let pos = 0;
+  const targets = [];
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    const len = node.nodeValue?.length || 0;
+    const start = pos;
+    const end = pos + len;
+    const qStart = idx;
+    const qEnd = idx + q.length;
+    if (qStart < end && qEnd > start) {
+      targets.push({ node, start: Math.max(0, qStart - start), end: Math.min(len, qEnd - start) });
+    }
+    pos = end;
+    if (pos >= qEnd) break;
+  }
+  for (const t of targets.reverse()) {
+    const value = t.node.nodeValue || "";
+    const before = value.slice(0, t.start);
+    const middle = value.slice(t.start, t.end);
+    const after = value.slice(t.end);
+    const frag = document.createDocumentFragment();
+    if (before) frag.append(document.createTextNode(before));
+    const mark = document.createElement("mark");
+    mark.className = "quote-highlight";
+    mark.textContent = middle;
+    frag.append(mark);
+    if (after) frag.append(document.createTextNode(after));
+    t.node.parentNode?.replaceChild(frag, t.node);
+  }
+}
+
+function normalizeLoosePdfMatchText(text) {
+  return String(text || "")
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function buildPdfItemMatchIndex(textItems) {
+  const parts = [];
+  const itemRanges = [];
+  let cursor = 0;
+  for (let i = 0; i < textItems.length; i += 1) {
+    const item = textItems[i];
+    const raw = String(item?.str || "");
+    const norm = normalizeLoosePdfMatchText(raw);
+    if (!norm) continue;
+    if (parts.length) {
+      parts.push(" ");
+      cursor += 1;
+    }
+    const start = cursor;
+    parts.push(norm);
+    cursor += norm.length;
+    itemRanges.push({ itemIndex: i, start, end: cursor });
+  }
+  return {
+    normalizedText: parts.join(""),
+    itemRanges,
+  };
+}
+
+function findPdfQuoteItemIndices(textItems, quote, opts = {}) {
+  const q = normalizeLoosePdfMatchText(quote);
+  if (!q) return [];
+  const { normalizedText, itemRanges } = buildPdfItemMatchIndex(textItems);
+  if (!normalizedText) return [];
+
+  const matchStart = normalizedText.indexOf(q);
+  if (matchStart >= 0) {
+    const matchEnd = matchStart + q.length;
+    return itemRanges
+      .filter((r) => r.start < matchEnd && r.end > matchStart)
+      .map((r) => r.itemIndex);
+  }
+
+  if (!opts.allowTokenFallback) return [];
+
+  const qTokens = q.split(/\s+/).filter((t) => t.length >= 3);
+  if (qTokens.length < 4) return [];
+  const matched = [];
+  for (let i = 0; i < textItems.length; i += 1) {
+    const norm = normalizeLoosePdfMatchText(textItems[i]?.str || "");
+    if (!norm) continue;
+    const hits = qTokens.filter((t) => norm.includes(t)).length;
+    if (hits > 0) matched.push({ i, hits, len: norm.length });
+  }
+  matched.sort((a, b) => b.hits - a.hits || a.len - b.len);
+  const best = matched
+    .slice(0, Math.min(6, matched.length))
+    .filter((m) => m.hits >= Math.max(2, Math.floor(qTokens.length / 3)));
+  return best.map((m) => m.i);
+}
+
+function pdfItemToViewportRect(pdfjsLib, viewport, item) {
+  if (!item?.transform) return null;
+  const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+  const x = tx[4];
+  const y = tx[5];
+  const width = Math.max(1, (Number(item.width) || 0) * viewport.scale);
+  const height = Math.max(1, (Number(item.height) || 0) * viewport.scale);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) return null;
+  return { x, y: y - height, width, height };
+}
+
+function renderPdfHighlightRects(layer, rects) {
+  if (!layer || !Array.isArray(rects)) return 0;
+  let count = 0;
+  for (const rect of rects) {
+    if (!rect) continue;
+    const el = document.createElement("div");
+    el.className = "pdf-highlight-rect";
+    el.style.left = `${Math.max(0, rect.x)}px`;
+    el.style.top = `${Math.max(0, rect.y)}px`;
+    el.style.width = `${Math.max(1, rect.width)}px`;
+    el.style.height = `${Math.max(1, rect.height)}px`;
+    layer.appendChild(el);
+    count += 1;
+  }
+  return count;
+}
+
 async function openCitation(citation) {
   try {
-    setViewerState(`Opening evidence...`);
+    if (!citation?.source_key) throw new Error("Citation missing source_key");
+    setViewerState(`Opening evidence ${citation.source_key} -> ${citation.anchor_id}...`);
     const indexResp = await getIndexBySourceKey(citation.source_key);
     els.modalCitationTitle.textContent = `${citation.source_key} → ${citation.anchor_id}`;
-    
-    // Quick text render for MVP (PDF/DOCX logic omitted for brevity in this full replacement, 
-    // but the structure is perfectly set up for it. I'll inject the raw text segments).
-    els.citationDocView.innerHTML = "";
-    const index = indexResp.index || {};
-    const segs = index.segments || [];
-    
-    const wrapper = document.createElement("div");
-    wrapper.className = "docx-html-box";
-    
-    if (segs.length === 0) {
-      wrapper.innerHTML = `<div class="mono-text">No text segments extracted for this source.</div><pre class="code-view mt-4">${escapeHtml(JSON.stringify(index.render || {}, null, 2))}</pre>`;
-    } else {
-      let html = "";
-      for (const seg of segs) {
-        const isTarget = seg.anchor_id === citation.anchor_id;
-        const cls = isTarget ? "cited-anchor" : "";
-        html += `<div class="${cls}" style="margin-bottom:12px;" id="anch_${seg.anchor_id}"><span class="mono-text muted" style="font-size:10px; display:block; margin-bottom:4px;">${seg.anchor_id}</span><p>${escapeHtml(seg.text)}</p></div>`;
-      }
-      wrapper.innerHTML = html;
-    }
-    
-    els.citationDocView.appendChild(wrapper);
+    els.modalCitationMeta.textContent = [
+      `${citationEffectLabel(citation.effect)}`,
+      `validation=${citationValidationLabel(citation)}`,
+      citation.page ? `page=${citation.page}` : null,
+      citation.sheet ? `sheet=${citation.sheet}` : null,
+    ].filter(Boolean).join(" • ");
+    await renderCitationDocument(indexResp, citation);
     els.citationModal.setAttribute("aria-hidden", "false");
-    
-    setTimeout(() => {
-      const target = document.getElementById(`anch_${citation.anchor_id}`);
-      if (target) {
-        target.scrollIntoView({ behavior: "smooth", block: "center" });
-        // Basic naive highlight
-        if (citation.quote) {
-          target.innerHTML = target.innerHTML.replace(escapeHtml(citation.quote), `<mark class="quote-highlight">${escapeHtml(citation.quote)}</mark>`);
-        }
-      }
-    }, 100);
-
-    setViewerState(`Evidence opened.`);
+    setViewerState(`Evidence opened (${citationValidationLabel(citation)}).`);
   } catch (err) {
     setViewerState(`Failed to open evidence: ${err.message}`);
   }
+}
+
+function sourceLocatorToFetchUrl(summary) {
+  const loc = summary?.source_locator || summary?.sourceLocator || {};
+  if (loc.type === "local_file" && loc.relativePath && state.selectedCard) {
+    return localContentUrl(state.selectedCard.id, loc.relativePath);
+  }
+  if (loc.type === "trello_attachment" && loc.proxyUrl) {
+    return loc.proxyUrl;
+  }
+  return null;
+}
+
+async function renderCitationDocument(indexResp, citation) {
+  const summary = indexResp.summary || {};
+  const index = indexResp.index || {};
+  const fileKind = index.file_kind || summary.file_kind || "unknown";
+  els.citationDocView.innerHTML = "";
+  clearCitationHighlights(els.citationDocView);
+
+  if (fileKind === "docx") {
+    renderDocxCitation(index, citation);
+    return;
+  }
+  if (fileKind === "xlsx") {
+    renderXlsxCitation(index, citation);
+    return;
+  }
+  if (fileKind === "pdf") {
+    await renderPdfCitation(indexResp, citation);
+    return;
+  }
+  if (fileKind === "image") {
+    renderImageCitation(indexResp, citation);
+    return;
+  }
+  if (fileKind === "text") {
+    renderTextCitation(index, citation);
+    return;
+  }
+  els.citationDocView.innerHTML = `<div class="json-box">Unsupported viewer for <code>${escapeHtml(fileKind)}</code>.</div>`;
+}
+
+function renderDocxCitation(index, citation) {
+  const html = index?.render?.html || "";
+  const box = document.createElement("div");
+  box.className = "docx-html-box";
+  box.innerHTML = html || "<p class='inline-meta'>No DOCX HTML preview stored.</p>";
+  els.citationDocView.appendChild(box);
+  const target = box.querySelector(`[data-anchor-id="${CSS.escape(citation.anchor_id || "")}"]`);
+  if (target) {
+    target.classList.add("cited-anchor");
+    highlightQuoteInElement(target, citation.quote || "");
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+}
+
+function colIndexToName(index) {
+  let n = Number(index) + 1;
+  let s = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+function renderXlsxCitation(index, citation) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "xlsx-box";
+  const wb = index?.render?.workbook || [];
+  if (!wb.length) {
+    wrapper.textContent = "No workbook preview stored.";
+    els.citationDocView.appendChild(wrapper);
+    return;
+  }
+
+  const targetAnchor = citation.anchor_id || "";
+  const sheetHint = citation.sheet || (targetAnchor.includes("!") ? targetAnchor.split("!")[0] : null);
+  const activeSheet = wb.find((s) => s.sheet === sheetHint) || wb[0];
+
+  const sheetPicker = document.createElement("div");
+  sheetPicker.className = "pdf-toolbar";
+  const label = document.createElement("span");
+  label.textContent = `Sheet: ${activeSheet.sheet}`;
+  sheetPicker.appendChild(label);
+  wrapper.appendChild(sheetPicker);
+
+  const table = document.createElement("table");
+  table.className = "xlsx-table";
+  const thead = document.createElement("thead");
+  const tbody = document.createElement("tbody");
+  table.appendChild(thead);
+  table.appendChild(tbody);
+
+  const rows = activeSheet.rows || [];
+  const colSet = new Set();
+  for (const row of rows) {
+    for (const cell of row.cells || []) colSet.add(cell.c);
+  }
+  const cols = Array.from(colSet).sort((a, b) => a - b).slice(0, 20);
+
+  const headTr = document.createElement("tr");
+  const rowHead = document.createElement("th");
+  rowHead.textContent = "Row";
+  headTr.appendChild(rowHead);
+  for (const c of cols) {
+    const th = document.createElement("th");
+    th.textContent = colIndexToName(c);
+    headTr.appendChild(th);
+  }
+  thead.appendChild(headTr);
+
+  for (const row of rows.slice(0, 80)) {
+    const tr = document.createElement("tr");
+    const rowLabel = document.createElement("th");
+    rowLabel.textContent = String((row.r || 0) + 1);
+    tr.appendChild(rowLabel);
+    const cellsByCol = new Map((row.cells || []).map((c) => [c.c, c]));
+    for (const c of cols) {
+      const td = document.createElement("td");
+      const cell = cellsByCol.get(c);
+      if (cell) {
+        td.setAttribute("data-cell-anchor", `${activeSheet.sheet}!${cell.addr}`);
+        td.textContent = cell.display || "";
+        if (cell.formula) td.title = `formula: ${cell.formula}`;
+      }
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+
+  wrapper.appendChild(table);
+  els.citationDocView.appendChild(wrapper);
+
+  const target = wrapper.querySelector(`[data-cell-anchor="${CSS.escape(targetAnchor)}"]`);
+  if (target) {
+    target.classList.add("cited-anchor");
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+}
+
+function renderTextCitation(index, citation) {
+  const wrap = document.createElement("div");
+  wrap.className = "json-box";
+  const pre = document.createElement("pre");
+  pre.style.margin = "0";
+  pre.textContent = index?.render?.text || "No text preview.";
+  wrap.appendChild(pre);
+  els.citationDocView.appendChild(wrap);
+
+  const seg = (index.segments || []).find((s) => s.anchor_id === citation.anchor_id);
+  if (seg) {
+    const note = document.createElement("div");
+    note.className = "inline-meta";
+    note.textContent = `Anchor: ${seg.anchor_id} • Quote: ${citation.quote || ""}`;
+    els.citationDocView.prepend(note);
+  }
+}
+
+function renderImageCitation(indexResp, citation) {
+  const summary = indexResp.summary || {};
+  const fetchUrl = sourceLocatorToFetchUrl(summary);
+  const wrap = document.createElement("div");
+  wrap.className = "docx-html-box";
+  if (!fetchUrl) {
+    wrap.textContent = "Image source unavailable.";
+    els.citationDocView.appendChild(wrap);
+    return;
+  }
+  wrap.innerHTML = `
+    <div class="inline-meta">Image citations are image-level in MVP (no OCR/region anchors yet).</div>
+    <img src="${escapeHtml(fetchUrl)}" alt="cited image" style="max-width:100%; height:auto; margin-top:8px; border-radius:8px; border:1px solid rgba(33,31,28,0.08);" />
+    <div class="inline-meta" style="margin-top:8px;">Reason: ${escapeHtml(citation.reason || "")}</div>
+  `;
+  els.citationDocView.appendChild(wrap);
+}
+
+async function getPdfDocForSource(indexResp) {
+  const summary = indexResp.summary || {};
+  const sourceKey = indexResp.sourceKey;
+  if (state.pdfCache.has(sourceKey)) return state.pdfCache.get(sourceKey);
+  const fetchUrl = sourceLocatorToFetchUrl(summary);
+  if (!fetchUrl) throw new Error("PDF binary source unavailable");
+  const { buffer } = await fetchArrayBuffer(fetchUrl);
+  const pdf = await window.pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+  state.pdfCache.set(sourceKey, { pdf, buffer });
+  return { pdf, buffer };
+}
+
+async function renderPdfCitation(indexResp, citation) {
+  if (!window.pdfjsLib) throw new Error("pdf.js library not loaded");
+  const index = indexResp.index || {};
+  const pageFromAnchor = Number(String(citation.anchor_id || "").replace("page_", ""));
+  const pageNum = Number.isFinite(pageFromAnchor) && pageFromAnchor > 0 ? pageFromAnchor : Math.max(1, Number(citation.page) || 1);
+
+  const wrap = document.createElement("div");
+  wrap.className = "doc-canvas-wrap";
+  const toolbar = document.createElement("div");
+  toolbar.className = "pdf-toolbar";
+  const pageLabel = document.createElement("span");
+  pageLabel.textContent = `Page ${pageNum}`;
+  toolbar.appendChild(pageLabel);
+  wrap.appendChild(toolbar);
+
+  const canvasBox = document.createElement("div");
+  canvasBox.className = "pdf-canvas-box";
+  const stage = document.createElement("div");
+  stage.className = "pdf-page-stage";
+  const canvas = document.createElement("canvas");
+  canvas.className = "pdf-page-canvas";
+  const highlightLayer = document.createElement("div");
+  highlightLayer.className = "pdf-highlight-layer";
+  stage.appendChild(canvas);
+  stage.appendChild(highlightLayer);
+  canvasBox.appendChild(stage);
+  wrap.appendChild(canvasBox);
+
+  const textBox = document.createElement("div");
+  textBox.className = "pdf-text-box";
+  const pageSeg = (index.segments || []).find((s) => s.anchor_id === (citation.anchor_id || `page_${pageNum}`));
+  const pageText = pageSeg?.text || "";
+  textBox.innerHTML = `<div data-anchor-id="${escapeHtml(pageSeg?.anchor_id || `page_${pageNum}`)}">${escapeHtml(pageText || "(No extractable text on this page. Possibly scanned/image-only PDF.)")}</div>`;
+  wrap.appendChild(textBox);
+
+  els.citationDocView.appendChild(wrap);
+
+  const { pdf } = await getPdfDocForSource(indexResp);
+  const page = await pdf.getPage(pageNum);
+  const viewport = page.getViewport({ scale: 1.2 });
+  const ctx = canvas.getContext("2d");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  stage.style.width = `${viewport.width}px`;
+  stage.style.height = `${viewport.height}px`;
+  await page.render({ canvasContext: ctx, viewport }).promise;
+
+  let nativeHighlightCount = 0;
+  try {
+    const textContent = await page.getTextContent();
+    const textItems = Array.isArray(textContent?.items) ? textContent.items : [];
+    const matchIndices = findPdfQuoteItemIndices(textItems, citation.quote || "", { allowTokenFallback: true });
+    if (matchIndices.length) {
+      const rects = matchIndices
+        .map((i) => pdfItemToViewportRect(window.pdfjsLib, viewport, textItems[i]))
+        .filter(Boolean);
+      nativeHighlightCount = renderPdfHighlightRects(highlightLayer, rects);
+    }
+  } catch {
+    nativeHighlightCount = 0;
+  }
+
+  const anchorEl = textBox.querySelector(`[data-anchor-id="${CSS.escape(pageSeg?.anchor_id || `page_${pageNum}`)}"]`);
+  if (anchorEl) {
+    anchorEl.classList.add("cited-anchor");
+    highlightQuoteInElement(anchorEl, citation.quote || "");
+  }
+
+  const highlightMeta = document.createElement("div");
+  highlightMeta.className = "inline-meta";
+  if (nativeHighlightCount > 0) {
+    highlightMeta.textContent = `In-document highlight applied on PDF page (${nativeHighlightCount} text region${nativeHighlightCount === 1 ? "" : "s"}).`;
+  } else {
+    highlightMeta.textContent = "In-document highlight unavailable for this citation on the page text layer. Showing extracted-text highlight below.";
+  }
+  toolbar.appendChild(highlightMeta);
 }
 
 function bindEvents() {
@@ -770,8 +1630,26 @@ function bindEvents() {
   els.citationModal.onclick = (e) => { if(e.target === els.citationModal) els.citationModal.setAttribute("aria-hidden", "true"); };
 }
 
+function configurePdfJs() {
+  if (!window.pdfjsLib) return;
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+}
+
+function verifyLibraries() {
+  const missing = [];
+  if (!window.mammoth) missing.push("mammoth");
+  if (!window.XLSX) missing.push("xlsx");
+  if (!window.pdfjsLib) missing.push("pdf.js");
+  if (missing.length) {
+    setViewerState(`Some viewer/indexer libraries failed to load: ${missing.join(", ")}`);
+  }
+}
+
 async function init() {
   bindEvents();
+  configurePdfJs();
+  verifyLibraries();
   renderChecklistBuilder();
   renderWorkspace();
   renderResults();

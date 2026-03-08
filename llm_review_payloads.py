@@ -17,6 +17,8 @@ def build_review_system_prompt() -> str:
         "Return exactly one result for every checklist item, in the same order, with the same item_number and item_id. "
         "Every conclusion must cite one or more evidence anchors. "
         "Citations must reference source_key and anchor_id exactly as provided. "
+        "For each citation, set effect='supports' when it supports the item conclusion, effect='contradicts' when it cuts against the conclusion, "
+        "and effect='insufficient' when the cited evidence is relevant but incomplete or ambiguous. "
         "Treat card description and comments as contextual guidance; use indexed attachment evidence as the primary source for documentary claims whenever possible. "
         "If evidence is insufficient, ambiguous, or the document is image/scanned-only without usable text, "
         "return status='needs_review' and explain what is missing. "
@@ -91,6 +93,11 @@ def build_review_user_payload(
             "must_cite_every_item": True,
             "cite_only_provided_source_key_and_anchor_id": True,
             "prefer_exact_quote": True,
+            "citation_effect_values": {
+                "supports": "Evidence supports the checklist conclusion.",
+                "contradicts": "Evidence cuts against the checklist conclusion.",
+                "insufficient": "Evidence is relevant but not enough to resolve the checklist conclusion.",
+            },
             "for_image_or_scanned_pdf_without_text": "Use page anchor citation and empty quote, then mark needs_review unless other evidence resolves the item.",
         },
         "evidence_documents": evidence,

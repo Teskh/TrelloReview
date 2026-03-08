@@ -636,6 +636,51 @@ input[type="text"]:focus, textarea:focus {
   border-color: var(--line-focus);
   background: var(--bg-surface);
 }
+.evidence-card.supports {
+  border-color: var(--status-pass-fg);
+  background: var(--status-pass-bg);
+}
+.evidence-card.contradicts {
+  border-color: var(--status-fail-fg);
+  background: var(--status-fail-bg);
+}
+.evidence-card.insufficient {
+  border-color: var(--status-warn-fg);
+  background: var(--status-warn-bg);
+}
+.evidence-topline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.evidence-effect {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.evidence-effect.supports {
+  background: var(--status-pass-bg);
+  color: var(--status-pass-fg);
+}
+.evidence-effect.contradicts {
+  background: var(--status-fail-bg);
+  color: var(--status-fail-fg);
+}
+.evidence-effect.insufficient {
+  background: var(--status-warn-bg);
+  color: var(--status-warn-fg);
+}
+.evidence-meta {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+}
 .evidence-quote {
   font-size: 0.875rem;
   font-style: italic;
@@ -697,6 +742,11 @@ input[type="text"]:focus, textarea:focus {
   background: rgba(255,255,255,0.8);
 }
 .modal-title { font-size: 1.125rem; font-weight: 500; margin-bottom: 4px; }
+.modal-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
 .modal-body {
   flex: 1;
   overflow-y: auto;
@@ -783,6 +833,11 @@ input[type="text"]:focus, textarea:focus {
   max-width: 900px;
   margin: 0 auto;
   box-shadow: var(--shadow-diffuse);
+}
+.inline-meta {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--fg-muted);
 }
 
 .xlsx-table { border-collapse: collapse; font-size: 0.8125rem; width: 100%; }

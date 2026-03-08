@@ -588,6 +588,7 @@ def checklist_run_schema() -> Dict[str, Any]:
         "properties": {
             "source_key": {"type": "string"},
             "anchor_id": {"type": "string"},
+            "effect": {"type": "string", "enum": ["supports", "contradicts", "insufficient"]},
             "quote": {"type": "string"},
             "reason": {"type": "string"},
             "page": {"type": ["integer", "null"]},
@@ -599,7 +600,7 @@ def checklist_run_schema() -> Dict[str, Any]:
                 "maxItems": 4,
             },
         },
-        "required": ["source_key", "anchor_id", "quote", "reason", "page", "sheet", "bbox"],
+        "required": ["source_key", "anchor_id", "effect", "quote", "reason", "page", "sheet", "bbox"],
     }
     item = {
         "type": "object",
@@ -749,6 +750,8 @@ def _validate_citations(result: Dict[str, Any], index_lookup: Dict[str, Dict[str
             seg = segment_maps.get(source_key, {}).get(anchor_id)
             quote = str(cit.get("quote") or "")
             val = dict(cit)
+            if val.get("effect") not in {"supports", "contradicts", "insufficient"}:
+                val["effect"] = "insufficient"
             if not seg:
                 val["validation"] = {"status": "missing_anchor", "score": 0}
             else:
