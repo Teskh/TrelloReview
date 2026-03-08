@@ -24,7 +24,7 @@
         </div>
 
         <div class="sidebar-content">
-          <div class="section">
+          <div class="section boards-section">
             <div class="section-header">
               <h2>Tableros</h2>
               <button id="refreshBoardsBtn" class="icon-btn" title="Actualizar tableros">
@@ -35,12 +35,22 @@
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
               <input id="boardSearch" type="text" placeholder="Filtrar tableros..." />
             </div>
-            <div class="list-container">
+            <div class="list-container board-list-container">
               <ul id="boardsList" class="nav-list"></ul>
             </div>
           </div>
 
-          <div class="section flex-grow">
+          <div class="section recent-section">
+            <div class="section-header">
+              <h2>Recientes</h2>
+              <div id="recentJobsMeta" class="meta-inline">Sin actividad.</div>
+            </div>
+            <div class="list-container recent-list-container">
+              <ul id="recentJobsList" class="nav-list recent-jobs-list"></ul>
+            </div>
+          </div>
+
+          <div class="section flex-grow cards-section">
             <div class="section-header">
               <h2>Tarjetas</h2>
               <div class="controls-row">
@@ -76,7 +86,7 @@
           <button class="view-tab active" data-ptab="workspace">Espacio de trabajo</button>
           <button class="view-tab" data-ptab="checklist">Motor de Checklist</button>
           <button class="view-tab" data-ptab="results">Resultados del análisis</button>
-          <button class="view-tab" data-ptab="viewer">Visor del paquete</button>
+          <button class="view-tab" data-ptab="viewer">Visor de datos</button>
           <div class="tab-indicator"></div>
         </nav>
 
@@ -102,12 +112,11 @@
                 <div class="toolbar-group">
                   <div class="field-group row">
                     <label>Modelo</label>
-                    <input id="modelInput" type="text" value="gpt-5.4" class="compact-input" />
+                    <input id="modelInput" type="text" value="gpt-5.4" class="compact-input" readonly disabled />
                   </div>
                   <div class="field-group row">
                     <label>Razonamiento</label>
                     <select id="reasoningEffortSelect" class="compact-input">
-                      <option value="minimal">Mínimo</option>
                       <option value="low">Bajo</option>
                       <option value="medium">Medio</option>
                       <option value="high" selected>Alto</option>

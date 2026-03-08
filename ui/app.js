@@ -15,11 +15,18 @@ const state = {
   checklistDraft: null,
   runResult: null,
   runHistory: [],
+  reviewJobs: [],
+  dismissedReviewJobIds: new Set(),
+  reviewJobsPollTimer: null,
+  cardLoadSeq: 0,
   indexCache: new Map(),
   pdfCache: new Map(),
 };
 
 const PREFERRED_BOARD_NAME = "IG Tramitacion Training";
+const DISMISSED_REVIEW_JOBS_KEY = "trelloReview.dismissedReviewJobs";
+const REVIEW_JOBS_POLL_MS = 3000;
+const FIXED_MODEL = "gpt-5.4";
 
 const els = {
   refreshBoardsBtn: document.getElementById("refreshBoardsBtn"),
@@ -32,6 +39,8 @@ const els = {
   loadCardsBtn: document.getElementById("loadCardsBtn"),
   selectedBoardMeta: document.getElementById("selectedBoardMeta"),
   cardsList: document.getElementById("cardsList"),
+  recentJobsMeta: document.getElementById("recentJobsMeta"),
+  recentJobsList: document.getElementById("recentJobsList"),
   cardBadge: document.getElementById("cardBadge"),
   viewerState: document.getElementById("viewerState"),
 
@@ -96,6 +105,10 @@ function bytesLabel(n) {
   if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 ** 3) return `${(n / (1024 ** 2)).toFixed(1)} MB`;
   return `${(n / (1024 ** 3)).toFixed(1)} GB`;
+}
+
+function skeletonLines(widths = ["100%"]) {
+  return `<div class="skeleton-lines">${widths.map((width) => `<div class="skeleton-line" style="width:${width};"></div>`).join("")}</div>`;
 }
 
 async function apiGet(path) {
@@ -275,6 +288,217 @@ function renderCards() {
   else if (!visibleCards.length) els.cardsList.innerHTML = `<li class="meta-text" style="padding:0 24px;">No hay coincidencias.</li>`;
 }
 
+function syncFixedModelUi() {
+  if (!els.modelInput) return;
+  els.modelInput.value = FIXED_MODEL;
+}
+
+function loadDismissedReviewJobIds() {
+  try {
+    const raw = window.localStorage.getItem(DISMISSED_REVIEW_JOBS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.map((value) => String(value || "")).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+function persistDismissedReviewJobIds() {
+  try {
+    const ids = Array.from(state.dismissedReviewJobIds).slice(-200);
+    window.localStorage.setItem(DISMISSED_REVIEW_JOBS_KEY, JSON.stringify(ids));
+  } catch {
+    // Ignore storage failures in desktop/webview environments.
+  }
+}
+
+function visibleReviewJobs() {
+  return state.reviewJobs.filter((job) => !state.dismissedReviewJobIds.has(job.job_id));
+}
+
+function isReviewJobActive(job) {
+  return ["queued", "running"].includes(job?.status || "");
+}
+
+function hasActiveReviewJobForCard(cardId) {
+  return !!cardId && state.reviewJobs.some((job) => job?.card?.id === cardId && isReviewJobActive(job));
+}
+
+function reviewJobStatusLabel(status) {
+  return {
+    queued: "En cola",
+    running: "Analizando",
+    succeeded: "Lista",
+    failed: "Error",
+  }[status] || "Desconocido";
+}
+
+function reviewJobStatusTone(status) {
+  if (status === "succeeded") return "ready";
+  if (status === "failed") return "stale";
+  return "pending";
+}
+
+function reviewJobMeta(job) {
+  const parts = [];
+  if (job?.model) parts.push(job.model);
+  if (job?.finished_at) parts.push(`Term. ${fmtDate(job.finished_at)}`);
+  else if (job?.started_at) parts.push(`Inicio ${fmtDate(job.started_at)}`);
+  else if (job?.created_at) parts.push(`Creada ${fmtDate(job.created_at)}`);
+  return parts.join(" • ");
+}
+
+function reviewJobSummaryText(job) {
+  const counts = job?.run_summary?.counts || {};
+  if (job?.status === "succeeded") return `Cumple ${counts.pass || 0} • Falla ${counts.fail || 0} • Revisar ${counts.needs_review || 0}`;
+  if (job?.status === "failed") return job?.error || "La ejecución falló.";
+  return "La revisión sigue ejecutándose en segundo plano.";
+}
+
+function dismissReviewJob(jobId) {
+  if (!jobId) return;
+  state.dismissedReviewJobIds.add(jobId);
+  persistDismissedReviewJobIds();
+  renderRecentJobs();
+}
+
+async function openReviewJob(job) {
+  if (!job?.card?.id || !job?.run_id) return;
+  const card = {
+    id: job.card.id,
+    name: job.card.name || job.card.id,
+    url: job.card.url || "",
+  };
+  if (state.selectedCard?.id !== card.id) {
+    await loadCard(card);
+  }
+  els.runHistorySelect.value = job.run_id;
+  await loadRunById(card.id, job.run_id);
+  setMainTab("results");
+}
+
+function renderRecentJobs() {
+  const jobs = visibleReviewJobs();
+  const activeCount = jobs.filter(isReviewJobActive).length;
+  els.recentJobsMeta.textContent = jobs.length ? `${activeCount} en curso • ${jobs.length} total` : "Sin actividad.";
+  els.recentJobsList.innerHTML = "";
+
+  if (!jobs.length) {
+    els.recentJobsList.innerHTML = `<li class="meta-text" style="padding:0 8px;">Las revisiones recientes aparecerán aquí.</li>`;
+    return;
+  }
+
+  for (const job of jobs) {
+    const item = document.createElement("li");
+    item.className = "recent-job-item";
+
+    const body = document.createElement("div");
+    body.className = "recent-job-body";
+
+    const top = document.createElement("div");
+    top.className = "recent-job-top";
+    top.innerHTML = `
+      <div class="recent-job-title-wrap">
+        ${isReviewJobActive(job) ? '<span class="recent-job-spinner" aria-hidden="true"></span>' : ""}
+        <span class="recent-job-title">${escapeHtml(job.card?.name || job.card?.id || "Tarjeta")}</span>
+      </div>
+      <span class="data-item-status ${reviewJobStatusTone(job.status)}">${escapeHtml(reviewJobStatusLabel(job.status))}</span>
+    `;
+
+    const meta = document.createElement("div");
+    meta.className = "recent-job-meta";
+    meta.textContent = reviewJobMeta(job) || "Sin metadatos.";
+
+    const summary = document.createElement("div");
+    summary.className = `recent-job-summary ${job.status === "failed" ? "is-error" : ""}`;
+    summary.textContent = reviewJobSummaryText(job);
+
+    body.append(top, meta, summary);
+
+    const actions = document.createElement("div");
+    actions.className = "recent-job-actions";
+    if (job.status === "succeeded" && job.run_id) {
+      const openBtn = document.createElement("button");
+      openBtn.className = "action-btn outline sm";
+      openBtn.textContent = "Abrir";
+      openBtn.onclick = () => openReviewJob(job).catch((err) => setViewerState(`No se pudo abrir la ejecución: ${err.message}`));
+      actions.appendChild(openBtn);
+    }
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "icon-btn recent-job-close";
+    closeBtn.title = "Cerrar";
+    closeBtn.setAttribute("aria-label", `Cerrar ${job.card?.name || job.card?.id || "reciente"}`);
+    closeBtn.innerHTML = `
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="18" y1="6" x2="6" y2="18"></line>
+        <line x1="6" y1="6" x2="18" y2="18"></line>
+      </svg>
+    `;
+    closeBtn.onclick = () => dismissReviewJob(job.job_id);
+    actions.appendChild(closeBtn);
+
+    item.append(body, actions);
+    els.recentJobsList.appendChild(item);
+  }
+}
+
+async function syncSelectedCardRunHistory() {
+  if (!state.selectedCard?.id) return;
+  try {
+    state.workspace = await apiGet(`/api/cards/${state.selectedCard.id}/workspace`);
+    renderWorkspace();
+  } catch {
+    // Background sync failures should not interrupt the current task.
+  }
+}
+
+function notifyReviewJobTransition(job) {
+  if (job.status === "succeeded") {
+    setViewerState(`La revisión de ${job.card?.name || job.card?.id || "la tarjeta"} terminó. Revisa Recientes para abrir el resultado.`);
+    return;
+  }
+  if (job.status === "failed") {
+    setViewerState(`Falló la revisión de ${job.card?.name || job.card?.id || "la tarjeta"}: ${job.error || "Error desconocido"}`);
+  }
+}
+
+function applyReviewJobs(jobs) {
+  const previous = new Map((state.reviewJobs || []).map((job) => [job.job_id, job]));
+  state.reviewJobs = Array.isArray(jobs) ? jobs : [];
+
+  for (const job of visibleReviewJobs()) {
+    const before = previous.get(job.job_id);
+    if (!before || before.status === job.status) continue;
+    if (["succeeded", "failed"].includes(job.status)) {
+      notifyReviewJobTransition(job);
+      if (job.status === "succeeded" && state.selectedCard?.id === job.card?.id) {
+        syncSelectedCardRunHistory();
+      }
+    }
+  }
+
+  renderRecentJobs();
+  renderWorkspace();
+}
+
+async function refreshReviewJobs({ silent = true } = {}) {
+  try {
+    const data = await apiGet("/api/review-jobs");
+    applyReviewJobs(data.jobs || []);
+  } catch (err) {
+    if (!silent) setViewerState(`No se pudieron cargar las revisiones recientes: ${err.message}`);
+  }
+}
+
+function startReviewJobsPolling() {
+  if (state.reviewJobsPollTimer) window.clearInterval(state.reviewJobsPollTimer);
+  refreshReviewJobs({ silent: true });
+  state.reviewJobsPollTimer = window.setInterval(() => {
+    refreshReviewJobs({ silent: true });
+  }, REVIEW_JOBS_POLL_MS);
+}
+
 function renderPacketViews() {
   els.packetMarkdownView.textContent = state.currentMarkdown || "";
   els.packetJsonView.textContent = state.currentPacket ? JSON.stringify(state.currentPacket, null, 2) : "";
@@ -290,7 +514,10 @@ function renderTokenEstimate() {
   }
   const est = state.tokenEstimate;
   if (!est) { els.tokenEstimate.textContent = "Sin calcular."; return; }
-  if (est.loading) { els.tokenEstimate.textContent = "Calculando..."; return; }
+  if (est.loading) {
+    els.tokenEstimate.innerHTML = skeletonLines(["58%", "84%", "46%"]);
+    return;
+  }
   
   const total = est.counts?.total_input_tokens;
   const docs = est.payload_stats?.evidence_documents ?? 0;
@@ -370,7 +597,9 @@ function renderWorkspace() {
   const hasWorkspace = !!state.workspace?.exists;
   els.indexLocalBtn.disabled = !hasWorkspace;
   els.indexTrelloBtn.disabled = !hasWorkspace || !state.currentPacket;
-  els.runChecklistBtn.disabled = !state.workspaceStatus?.readyForRun;
+  const runInFlight = hasActiveReviewJobForCard(state.selectedCard?.id);
+  els.runChecklistBtn.disabled = !state.workspaceStatus?.readyForRun || runInFlight;
+  els.runChecklistBtn.textContent = runInFlight ? "Revisión en curso..." : "Ejecutar revisión";
 
   if (!hasCard) {
     els.workspaceMeta.textContent = "No hay ninguna tarjeta seleccionada.";
@@ -380,9 +609,15 @@ function renderWorkspace() {
   }
 
   if (!state.workspaceStatus) {
-    els.workspaceMeta.textContent = "Cargando estado...";
-    els.localFilesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Cargando...</span></li>`;
-    els.indexesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Cargando...</span></li>`;
+    els.workspaceMeta.innerHTML = skeletonLines(["42%", "78%", "55%"]);
+    els.localFilesList.innerHTML = `
+      <li class="data-item is-skeleton">${skeletonLines(["72%", "34%"])}</li>
+      <li class="data-item is-skeleton">${skeletonLines(["64%", "28%"])}</li>
+    `;
+    els.indexesList.innerHTML = `
+      <li class="data-item is-skeleton">${skeletonLines(["70%", "30%"])}</li>
+      <li class="data-item is-skeleton">${skeletonLines(["60%", "36%"])}</li>
+    `;
     return;
   }
 
@@ -567,6 +802,7 @@ function runItemStatusLabel(status) {
 
 function renderRunHistorySelect() {
   const runs = state.workspace?.runs || [];
+  const preferredRunId = state.runResult?.run_id || els.runHistorySelect.value || "";
   els.runHistorySelect.innerHTML = "";
   if (!runs.length) {
     els.runHistorySelect.innerHTML = `<option value="">Sin historial</option>`;
@@ -578,6 +814,11 @@ function renderRunHistorySelect() {
     opt.value = r.run_id;
     opt.textContent = `${fmtDate(r.created_at)} • cumple:${r.counts?.pass||0} falla:${r.counts?.fail||0}`;
     els.runHistorySelect.appendChild(opt);
+  }
+  if (preferredRunId && runs.some((r) => r.run_id === preferredRunId)) {
+    els.runHistorySelect.value = preferredRunId;
+  } else if (runs[0]?.run_id) {
+    els.runHistorySelect.value = runs[0].run_id;
   }
   els.loadRunBtn.disabled = false;
 }
@@ -718,29 +959,50 @@ async function loadCards() {
 }
 
 async function loadCard(card) {
+  const loadSeq = ++state.cardLoadSeq;
   state.selectedCard = card;
+  state.workspace = null;
   state.workspaceStatus = null;
+  state.currentPacket = null;
+  state.currentMarkdown = "";
+  state.runResult = null;
   state.tokenEstimate = { loading: true };
   renderCards();
+  renderPacketViews();
+  renderWorkspace();
+  renderResults();
   renderTokenEstimate();
   els.cardBadge.textContent = card.name || card.id;
   setViewerState("Cargando paquete y estado de la revisión...");
   try {
     const packet = await apiGet(`/api/cards/${card.id}/packet`);
+    if (loadSeq !== state.cardLoadSeq || state.selectedCard?.id !== card.id) return;
     state.currentPacket = packet.packet;
     state.currentMarkdown = packet.markdown || "";
-    const status = await apiPost(`/api/cards/${card.id}/workspace/status`, { cardPacket: state.currentPacket });
+    renderPacketViews();
+    const statusPromise = apiPost(`/api/cards/${card.id}/workspace/status`, { cardPacket: state.currentPacket });
+    refreshTokenEstimate();
+    const status = await statusPromise;
+    if (loadSeq !== state.cardLoadSeq || state.selectedCard?.id !== card.id) return;
     state.workspace = status.workspace || null;
     state.workspaceStatus = status.prep || null;
-    state.runResult = null;
-    renderPacketViews();
     renderWorkspace();
     renderResults();
     setViewerState(state.workspaceStatus?.summary || "Tarjeta contextualizada.");
-    refreshTokenEstimate();
   } catch (err) {
+    if (loadSeq !== state.cardLoadSeq || state.selectedCard?.id !== card.id) return;
     setViewerState(`Error de contexto: ${err.message}`);
     state.tokenEstimate = { error: err.message };
+    state.workspaceStatus = {
+      readyForRun: false,
+      local: { items: [], stale: [] },
+      remote: { items: [], stale: [] },
+      summary: "No se pudo cargar el estado del espacio de trabajo.",
+      state: "error",
+      counts: {},
+      actions: [],
+    };
+    renderWorkspace();
     renderTokenEstimate();
   }
 }
@@ -1412,48 +1674,65 @@ async function prepareReview() {
 
 async function runChecklist() {
   if (!state.selectedCard || !state.workspaceStatus?.readyForRun) return;
+  if (hasActiveReviewJobForCard(state.selectedCard.id)) {
+    setViewerState("Ya hay una revisión en curso para esta tarjeta. Sigue su estado en Recientes.");
+    return;
+  }
   els.runChecklistBtn.disabled = true;
-  setViewerState("Ejecutando revisión...");
+  setViewerState("Encolando revisión...");
   try {
-    const data = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/run`, {
-      model: els.modelInput.value,
+    const data = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/run-async`, {
+      model: FIXED_MODEL,
       reasoning_effort: els.reasoningEffortSelect.value,
+      cardPacket: state.currentPacket,
     });
-    state.runResult = data.run;
-    if (state.workspace) state.workspace.runs = data.runs || state.workspace.runs || [];
-    renderWorkspace();
-    renderResults();
-    if (state.runResult) setMainTab("results");
-    setViewerState("Ejecución completada.");
+    if (data.job?.job_id) {
+      state.dismissedReviewJobIds.delete(data.job.job_id);
+      persistDismissedReviewJobIds();
+    }
+    await refreshReviewJobs({ silent: true });
+    setViewerState(
+      data.existing
+        ? "La revisión ya estaba en curso. Sigue el progreso en Recientes."
+        : "La revisión sigue ejecutándose en segundo plano. Puedes cambiar de tarjeta sin perder el resultado."
+    );
   } catch (err) {
     setViewerState(`Falló la ejecución: ${err.message}`);
   } finally {
-    els.runChecklistBtn.disabled = false;
+    renderWorkspace();
   }
 }
 
 async function refreshTokenEstimate() {
-  if (!state.selectedCard || !state.currentPacket) return;
+  const selectedCardId = state.selectedCard?.id;
+  const cardPacket = state.currentPacket;
+  if (!selectedCardId || !cardPacket) return;
   state.tokenEstimate = { loading: true };
   renderTokenEstimate();
   try {
-    const data = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/token-estimate`, {
-      model: els.modelInput.value,
-      cardPacket: state.currentPacket,
+    const data = await apiPost(`/api/cards/${selectedCardId}/workspace/token-estimate`, {
+      model: FIXED_MODEL,
+      cardPacket,
     });
+    if (selectedCardId !== state.selectedCard?.id || cardPacket !== state.currentPacket) return;
     state.tokenEstimate = data.estimate || { error: "Error desconocido" };
     renderTokenEstimate();
   } catch (err) {
+    if (selectedCardId !== state.selectedCard?.id || cardPacket !== state.currentPacket) return;
     state.tokenEstimate = { error: err.message };
     renderTokenEstimate();
   }
 }
 
+async function loadRunById(cardId, runId) {
+  state.runResult = await apiGet(`/api/cards/${cardId}/workspace/runs/${encodeURIComponent(runId)}`);
+  renderResults();
+}
+
 async function loadSelectedRun() {
   if (!state.selectedCard || !els.runHistorySelect.value) return;
   try {
-    state.runResult = await apiGet(`/api/cards/${state.selectedCard.id}/workspace/runs/${encodeURIComponent(els.runHistorySelect.value)}`);
-    renderResults();
+    await loadRunById(state.selectedCard.id, els.runHistorySelect.value);
     setViewerState("Historial cargado.");
   } catch (err) { setViewerState(`Falló la carga del historial: ${err.message}`); }
 }
@@ -1907,6 +2186,7 @@ function bindEvents() {
   els.indexTrelloBtn.onclick = () => indexTrelloAttachments();
   els.runChecklistBtn.onclick = runChecklist;
   els.loadRunBtn.onclick = loadSelectedRun;
+  els.runHistorySelect.onchange = loadSelectedRun;
   
   els.loadChecklistBtn.onclick = loadChecklist;
   els.resetChecklistBtn.onclick = resetChecklistToAppDefault;
@@ -1917,7 +2197,6 @@ function bindEvents() {
   els.saveChecklistBtn.onclick = saveChecklist;
   els.addChecklistItemBtn.onclick = () => { ensureChecklistDraft().items.push(newChecklistItemDraft()); renderChecklistBuilder(); };
   
-  els.modelInput.onchange = refreshTokenEstimate;
   els.reasoningEffortSelect.onchange = refreshTokenEstimate;
 
   // Tabs
@@ -1946,12 +2225,16 @@ function verifyLibraries() {
 }
 
 async function init() {
+  state.dismissedReviewJobIds = loadDismissedReviewJobIds();
   bindEvents();
+  syncFixedModelUi();
   configurePdfJs();
   verifyLibraries();
   renderChecklistBuilder();
+  renderRecentJobs();
   renderWorkspace();
   renderResults();
+  startReviewJobsPolling();
   await Promise.all([loadChecklist(), loadBoards()]);
 }
 

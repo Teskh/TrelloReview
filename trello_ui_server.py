@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -53,6 +54,7 @@ from workbench_store import (
     save_checklist,
     save_checklist_text,
     save_indexes_for_card,
+    utc_now_iso,
 )
 
 try:
@@ -66,13 +68,163 @@ except Exception:  # pragma: no cover - optional in local dev, bundled for deskt
 APP_PATHS = resolve_app_paths()
 ROOT_DIR = APP_PATHS.resource_root
 UI_DIR = APP_PATHS.ui_dir
-VALID_REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
+VALID_REASONING_EFFORTS = {"low", "medium", "high"}
+FIXED_OPENAI_MODEL = "gpt-5.4"
 
 
 @dataclass
 class AppConfig:
     api_key: str
     token: str
+
+
+@dataclass
+class ReviewJob:
+    job_id: str
+    card_id: str
+    card_name: str
+    card_url: str
+    model: str
+    reasoning_effort: str
+    status: str
+    created_at: str
+    updated_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    run_id: str | None = None
+    run_summary: Dict[str, Any] | None = None
+    error: str | None = None
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "card": {
+                "id": self.card_id,
+                "name": self.card_name,
+                "url": self.card_url,
+            },
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "status": self.status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "run_id": self.run_id,
+            "run_summary": self.run_summary,
+            "error": self.error,
+        }
+
+
+class ReviewJobManager:
+    def __init__(self, paths: Any) -> None:
+        self._paths = paths
+        self._lock = threading.Lock()
+        self._jobs: Dict[str, ReviewJob] = {}
+
+    def list_jobs(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            jobs = [job.to_payload() for job in self._jobs.values()]
+        jobs.sort(key=lambda row: (row.get("updated_at") or row.get("created_at") or ""), reverse=True)
+        return jobs[:50]
+
+    def start_job(
+        self,
+        *,
+        card_id: str,
+        card_name: str,
+        card_url: str,
+        card_packet: Dict[str, Any],
+        model: str,
+        reasoning_effort: str,
+    ) -> tuple[Dict[str, Any], bool]:
+        with self._lock:
+            for job in self._jobs.values():
+                if job.card_id == card_id and job.status in {"queued", "running"}:
+                    return job.to_payload(), True
+
+            now = utc_now_iso()
+            job = ReviewJob(
+                job_id=f"job_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
+                card_id=card_id,
+                card_name=card_name,
+                card_url=card_url,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                status="queued",
+                created_at=now,
+                updated_at=now,
+            )
+            self._jobs[job.job_id] = job
+
+        worker = threading.Thread(
+            target=self._run_job,
+            kwargs={
+                "job_id": job.job_id,
+                "card_id": card_id,
+                "card_name": card_name,
+                "card_url": card_url,
+                "card_packet": card_packet,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+            },
+            daemon=True,
+        )
+        worker.start()
+        return job.to_payload(), False
+
+    def _run_job(
+        self,
+        *,
+        job_id: str,
+        card_id: str,
+        card_name: str,
+        card_url: str,
+        card_packet: Dict[str, Any],
+        model: str,
+        reasoning_effort: str,
+    ) -> None:
+        started_at = utc_now_iso()
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.status = "running"
+            job.started_at = started_at
+            job.updated_at = started_at
+
+        try:
+            result = run_checklist_for_card(
+                self._paths,
+                card_id=card_id,
+                card_name=card_name,
+                card_url=card_url,
+                card_packet=card_packet,
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+            finished_at = utc_now_iso()
+            run = result.get("run") or {}
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if not job:
+                    return
+                job.status = "succeeded"
+                job.updated_at = finished_at
+                job.finished_at = finished_at
+                job.run_id = run.get("run_id")
+                job.run_summary = run.get("summary") if isinstance(run, dict) else None
+                job.error = None
+        except Exception as exc:
+            finished_at = utc_now_iso()
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if not job:
+                    return
+                job.status = "failed"
+                job.updated_at = finished_at
+                job.finished_at = finished_at
+                job.error = str(exc)
 
 
 def load_config() -> AppConfig:
@@ -550,6 +702,10 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
     def workbench_paths(self) -> Any:
         return self.server.workbench_paths  # type: ignore[attr-defined]
 
+    @property
+    def review_job_manager(self) -> ReviewJobManager:
+        return self.server.review_job_manager  # type: ignore[attr-defined]
+
     def _client(self) -> TrelloClient:
         return make_client(self.app_config)
 
@@ -678,6 +834,10 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 )
                 return
 
+            if path == "/api/review-jobs":
+                self._send_json({"jobs": self.review_job_manager.list_jobs()})
+                return
+
             if path.startswith("/api/boards/") and path.endswith("/cards"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 4:
@@ -798,7 +958,6 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de estimación de tokens del espacio de trabajo no válida")
                     return
                 card_id = parts[2]
-                model = (payload.get("model") or "").strip() if isinstance(payload.get("model"), str) else None
                 card_packet = payload.get("cardPacket")
                 if not isinstance(card_packet, dict):
                     card_packet = get_card_packet(client, card_id=card_id)
@@ -811,7 +970,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     card_name=card_obj.get("name") or card_id,
                     card_url=card_obj.get("url") or "",
                     card_packet=card_packet if isinstance(card_packet, dict) else {},
-                    model=model,
+                    model=FIXED_OPENAI_MODEL,
                 )
                 self._send_json({"ok": True, "estimate": estimate})
                 return
@@ -912,7 +1071,6 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 card_id = parts[2]
                 card_packet = get_card_packet(client, card_id=card_id)
                 card = card_packet.get("card") or {}
-                model = (payload.get("model") or "").strip() if isinstance(payload.get("model"), str) else None
                 reasoning_effort = parse_reasoning_effort(payload.get("reasoning_effort"))
                 result = run_checklist_for_card(
                     self.workbench_paths,
@@ -920,10 +1078,34 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     card_name=card.get("name") or card_id,
                     card_url=card.get("url") or "",
                     card_packet=card_packet,
-                    model=model,
+                    model=FIXED_OPENAI_MODEL,
                     reasoning_effort=reasoning_effort,
                 )
                 self._send_json({"ok": True, **result})
+                return
+
+            if path.startswith("/api/cards/") and path.endswith("/workspace/run-async"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 5:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de ejecución asíncrona del espacio de trabajo no válida")
+                    return
+                card_id = parts[2]
+                card_packet = payload.get("cardPacket")
+                if not isinstance(card_packet, dict):
+                    card_packet = get_card_packet(client, card_id=card_id)
+                card = card_packet.get("card") if isinstance(card_packet, dict) else {}
+                if not isinstance(card, dict):
+                    card = {}
+                reasoning_effort = parse_reasoning_effort(payload.get("reasoning_effort"))
+                job, existing = self.review_job_manager.start_job(
+                    card_id=card_id,
+                    card_name=str(card.get("name") or card_id),
+                    card_url=str(card.get("url") or ""),
+                    card_packet=card_packet,
+                    model=FIXED_OPENAI_MODEL,
+                    reasoning_effort=reasoning_effort,
+                )
+                self._send_json({"ok": True, "job": job, "existing": existing})
                 return
 
             self._send_error_json(HTTPStatus.NOT_FOUND, "Ruta no encontrada")
@@ -956,6 +1138,7 @@ def main() -> int:
             checklist_file=APP_PATHS.user_checklist_file,
             checklist_template_file=APP_PATHS.default_checklist_file,
         )  # type: ignore[attr-defined]
+        server.review_job_manager = ReviewJobManager(server.workbench_paths)  # type: ignore[attr-defined]
     except OSError as e:
         if e.errno == errno.EADDRINUSE:
             if not args.no_browser and probe_status(app_url.rstrip("/") + "/api/status"):
@@ -980,6 +1163,7 @@ def main() -> int:
     print("  GET /api/cards/<cardId>/packet")
     print("  GET /api/cards/<cardId>/attachments/<attachmentId>/content")
     print("  GET /api/checklist")
+    print("  GET /api/review-jobs")
     print("  POST /api/checklist")
     print("  POST /api/checklist/reset")
     print("  GET /api/cards/<cardId>/workspace")
@@ -990,8 +1174,10 @@ def main() -> int:
     print("  POST /api/cards/<cardId>/workspace/files/import")
     print("  POST /api/cards/<cardId>/workspace/indexes/prune")
     print("  POST /api/cards/<cardId>/workspace/run")
+    print("  POST /api/cards/<cardId>/workspace/run-async")
     try:
-        if pystray is not None and not args.no_tray:
+        use_tray = pystray is not None and not args.no_tray and getattr(sys, "frozen", False)
+        if use_tray:
             run_with_tray(
                 server=server,
                 app_url=app_url,
