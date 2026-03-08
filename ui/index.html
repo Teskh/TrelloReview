@@ -4,9 +4,6 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Review Workbench</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/styles.css" />
     <script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js" defer></script>
     <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" defer></script>
@@ -89,10 +86,16 @@
             <div class="content-wrapper">
               <div class="toolbar glass-panel">
                 <div class="toolbar-group">
-                  <button id="createWorkspaceBtn" class="action-btn outline" disabled>Initialize Workspace</button>
-                  <button id="refreshWorkspaceBtn" class="action-btn outline" disabled>Sync State</button>
-                  <button id="indexLocalBtn" class="action-btn outline" disabled>Index Local</button>
-                  <button id="indexTrelloBtn" class="action-btn outline" disabled>Index Remote</button>
+                  <button id="prepareReviewBtn" class="action-btn primary" disabled>Prepare Review</button>
+                  <button id="refreshWorkspaceBtn" class="action-btn outline" disabled>Refresh Status</button>
+                  <details class="advanced-tools">
+                    <summary>Advanced</summary>
+                    <div class="advanced-tools-panel">
+                      <button id="createWorkspaceBtn" class="action-btn outline" disabled>Initialize Folder</button>
+                      <button id="indexLocalBtn" class="action-btn outline" disabled>Reindex Local</button>
+                      <button id="indexTrelloBtn" class="action-btn outline" disabled>Reindex Trello</button>
+                    </div>
+                  </details>
                 </div>
                 <div class="toolbar-divider"></div>
                 <div class="toolbar-group">
@@ -109,7 +112,7 @@
                       <option value="high" selected>High</option>
                     </select>
                   </div>
-                  <button id="runChecklistBtn" class="action-btn primary" disabled>Execute Run</button>
+                  <button id="runChecklistBtn" class="action-btn outline" disabled>Run Review</button>
                 </div>
               </div>
 
@@ -119,18 +122,18 @@
                   <div id="tokenEstimate" class="mono-text muted">No card selected.</div>
                 </div>
                 <div class="info-cell">
-                  <h3>Workspace State</h3>
+                  <h3>Review Readiness</h3>
                   <div id="workspaceMeta" class="mono-text muted">Not initialized.</div>
                 </div>
               </div>
 
               <div class="data-split">
                 <div class="data-col">
-                  <h3>Local Attachments <span class="mono-sub">/attachments</span></h3>
+                  <h3>Local Files <span class="mono-sub">/attachments</span></h3>
                   <ul id="localFilesList" class="data-list"></ul>
                 </div>
                 <div class="data-col">
-                  <h3>Indexed Sources</h3>
+                  <h3>Trello Attachments</h3>
                   <ul id="indexesList" class="data-list"></ul>
                 </div>
               </div>
@@ -147,6 +150,9 @@
                 </div>
                 <div class="pane-actions">
                   <button id="loadChecklistBtn" class="action-btn outline">Reload</button>
+                  <button id="resetChecklistBtn" class="action-btn outline">Use App Default</button>
+                  <button id="importChecklistBtn" class="action-btn outline">Import</button>
+                  <button id="exportChecklistBtn" class="action-btn outline">Export</button>
                   <button id="saveChecklistBtn" class="action-btn primary">Commit Changes</button>
                 </div>
               </div>
@@ -228,6 +234,8 @@
         </div>
       </div>
     </div>
+
+    <input id="importChecklistInput" type="file" accept=".json,application/json" hidden />
 
     <!-- Templates -->
     <template id="boardItemTpl">

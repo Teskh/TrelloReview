@@ -68,20 +68,31 @@ class WorkbenchPaths:
     root: Path
     cards_dir: Path
     checklist_file: Path
+    checklist_template_file: Optional[Path] = None
 
 
-def init_workbench_paths(project_root: Path) -> WorkbenchPaths:
-    root = project_root / "review_workspace"
+def init_workbench_paths(
+    root: Path,
+    *,
+    checklist_file: Optional[Path] = None,
+    checklist_template_file: Optional[Path] = None,
+) -> WorkbenchPaths:
     cards_dir = root / "cards"
     root.mkdir(parents=True, exist_ok=True)
     cards_dir.mkdir(parents=True, exist_ok=True)
-    checklist_file = root / "checklist.json"
-    if not checklist_file.exists():
-        _json_dump(checklist_file, default_checklist())
-    return WorkbenchPaths(root=root, cards_dir=cards_dir, checklist_file=checklist_file)
+    checklist_path = checklist_file or (root / "checklist.json")
+    checklist_path.parent.mkdir(parents=True, exist_ok=True)
+    paths = WorkbenchPaths(
+        root=root,
+        cards_dir=cards_dir,
+        checklist_file=checklist_path,
+        checklist_template_file=checklist_template_file,
+    )
+    _ensure_checklist_file(paths)
+    return paths
 
 
-def default_checklist() -> Dict[str, Any]:
+def _built_in_default_checklist() -> Dict[str, Any]:
     return {
         "version": 1,
         "name": "Review Checklist",
@@ -98,14 +109,32 @@ def default_checklist() -> Dict[str, Any]:
     }
 
 
+def default_checklist(template_file: Optional[Path] = None) -> Dict[str, Any]:
+    fallback = _built_in_default_checklist()
+    if not template_file or not template_file.exists():
+        return fallback
+    raw = _json_load(template_file, fallback)
+    if not isinstance(raw, dict):
+        return fallback
+    try:
+        return validate_and_normalize_checklist(raw)
+    except Exception:
+        return fallback
+
+
+def _ensure_checklist_file(paths: WorkbenchPaths) -> None:
+    if not paths.checklist_file.exists():
+        _json_dump(paths.checklist_file, default_checklist(paths.checklist_template_file))
+
+
 def load_checklist(paths: WorkbenchPaths) -> Dict[str, Any]:
-    raw = _json_load(paths.checklist_file, default_checklist())
+    _ensure_checklist_file(paths)
+    raw = _json_load(paths.checklist_file, default_checklist(paths.checklist_template_file))
     return validate_and_normalize_checklist(raw)
 
 
 def load_checklist_text(paths: WorkbenchPaths) -> str:
-    if not paths.checklist_file.exists():
-        _json_dump(paths.checklist_file, default_checklist())
+    _ensure_checklist_file(paths)
     return paths.checklist_file.read_text(encoding="utf-8")
 
 
@@ -118,6 +147,10 @@ def save_checklist(paths: WorkbenchPaths, payload: Dict[str, Any]) -> Dict[str, 
 def save_checklist_text(paths: WorkbenchPaths, text: str) -> Dict[str, Any]:
     parsed = json.loads(text)
     return save_checklist(paths, parsed)
+
+
+def reset_checklist(paths: WorkbenchPaths) -> Dict[str, Any]:
+    return save_checklist(paths, default_checklist(paths.checklist_template_file))
 
 
 def _auto_item_id(idx: int, title: str, seen: set[str]) -> str:
@@ -360,6 +393,266 @@ def get_card_workspace_info(paths: WorkbenchPaths, card_id: str) -> Dict[str, An
     }
 
 
+def _index_file_exists(ws_dir: Path, idx_rel: Any) -> bool:
+    if not idx_rel:
+        return False
+    idx_path = (ws_dir / str(idx_rel)).resolve()
+    if ws_dir.resolve() not in [idx_path, *idx_path.parents]:
+        return False
+    return idx_path.is_file()
+
+
+def _scan_local_workspace_sources(ws_dir: Path, manifest: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    attachments_dir = _attachments_dir(ws_dir)
+    manifest_local = manifest.get("local_files", {})
+    local_items: List[Dict[str, Any]] = []
+    seen_rels: set[str] = set()
+    for p in _iter_local_files(attachments_dir):
+        rel = _rel_posix(attachments_dir, p)
+        seen_rels.add(rel)
+        fp = file_stat_fingerprint(p)
+        entry = manifest_local.get(rel, {}) if isinstance(manifest_local, dict) else {}
+        has_index = _index_file_exists(ws_dir, entry.get("index_file"))
+        changed = has_index and (
+            entry.get("size") != fp["size"] or entry.get("mtime_ns") != fp["mtime_ns"]
+        )
+        status = "indexed" if has_index else "not_indexed"
+        if changed:
+            status = "changed"
+        local_items.append(
+            {
+                "relativePath": rel,
+                "size": fp["size"],
+                "mtimeNs": fp["mtime_ns"],
+                "lastIndexedAt": entry.get("last_indexed_at"),
+                "sourceKey": entry.get("source_key") or f"local:{rel}",
+                "indexStatus": status,
+                "indexFileKind": entry.get("file_kind"),
+                "indexWarnings": entry.get("warnings") or [],
+            }
+        )
+
+    stale_local: List[Dict[str, Any]] = []
+    if isinstance(manifest_local, dict):
+        for rel, entry in manifest_local.items():
+            if rel in seen_rels or not isinstance(entry, dict):
+                continue
+            stale_local.append(
+                {
+                    "relativePath": rel,
+                    "sourceKey": entry.get("source_key") or f"local:{rel}",
+                    "indexStatus": "missing",
+                    "lastIndexedAt": entry.get("last_indexed_at"),
+                    "indexFileKind": entry.get("file_kind"),
+                    "indexWarnings": entry.get("warnings") or [],
+                }
+            )
+
+    return local_items, stale_local
+
+
+def _scan_remote_workspace_sources(
+    ws_dir: Path,
+    manifest: Dict[str, Any],
+    card_packet: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    attachments = [a for a in (card_packet.get("attachments") or []) if isinstance(a, dict)]
+    manifest_remote = manifest.get("trello_sources", {})
+    remote_items: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for att in attachments:
+        attachment_id = str(att.get("id") or "").strip()
+        if not attachment_id:
+            continue
+        seen_ids.add(attachment_id)
+        entry = manifest_remote.get(attachment_id, {}) if isinstance(manifest_remote, dict) else {}
+        has_index = _index_file_exists(ws_dir, entry.get("index_file"))
+        remote_items.append(
+            {
+                "attachmentId": attachment_id,
+                "name": att.get("name") or att.get("fileName") or attachment_id,
+                "fileName": att.get("fileName") or att.get("name") or attachment_id,
+                "mimeType": att.get("mimeType") or "",
+                "proxyUrl": att.get("proxyUrl"),
+                "sourceUrl": att.get("url"),
+                "date": att.get("date"),
+                "sourceKey": entry.get("source_key") or f"trello:{attachment_id}",
+                "indexStatus": "indexed" if has_index else "not_indexed",
+                "lastIndexedAt": entry.get("last_indexed_at"),
+                "indexFileKind": ((manifest.get("indexes") or {}).get(entry.get("source_key"), {}) or {}).get("file_kind"),
+                "indexWarnings": entry.get("warnings") or [],
+            }
+        )
+
+    stale_remote: List[Dict[str, Any]] = []
+    if isinstance(manifest_remote, dict):
+        for attachment_id, entry in manifest_remote.items():
+            if attachment_id in seen_ids or not isinstance(entry, dict):
+                continue
+            stale_remote.append(
+                {
+                    "attachmentId": attachment_id,
+                    "name": entry.get("name") or attachment_id,
+                    "mimeType": entry.get("mime_type") or "",
+                    "sourceKey": entry.get("source_key") or f"trello:{attachment_id}",
+                    "indexStatus": "missing",
+                    "lastIndexedAt": entry.get("last_indexed_at"),
+                    "indexFileKind": ((manifest.get("indexes") or {}).get(entry.get("source_key"), {}) or {}).get("file_kind"),
+                    "indexWarnings": entry.get("warnings") or [],
+                }
+            )
+
+    return remote_items, stale_remote
+
+
+def _summarize_preparation_state(
+    *,
+    workspace_exists: bool,
+    local_items: List[Dict[str, Any]],
+    stale_local: List[Dict[str, Any]],
+    remote_items: List[Dict[str, Any]],
+    stale_remote: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    pending_local = [row for row in local_items if row.get("indexStatus") in ("not_indexed", "changed")]
+    pending_remote = [row for row in remote_items if row.get("indexStatus") == "not_indexed"]
+    indexed_local = [row for row in local_items if row.get("indexStatus") == "indexed"]
+    indexed_remote = [row for row in remote_items if row.get("indexStatus") == "indexed"]
+    evidence_docs = len(indexed_local) + len(indexed_remote)
+
+    actions: List[str] = []
+    if not workspace_exists:
+        actions.append("Create the review folder.")
+    if pending_local:
+        changed_count = sum(1 for row in pending_local if row.get("indexStatus") == "changed")
+        new_count = len(pending_local) - changed_count
+        if new_count:
+            actions.append(f"Index {new_count} local file(s).")
+        if changed_count:
+            actions.append(f"Re-index {changed_count} changed local file(s).")
+    if pending_remote:
+        actions.append(f"Index {len(pending_remote)} Trello attachment(s).")
+    if stale_local:
+        actions.append(f"Remove {len(stale_local)} stale local index reference(s).")
+    if stale_remote:
+        actions.append(f"Remove {len(stale_remote)} stale Trello index reference(s).")
+    if workspace_exists and evidence_docs == 0 and not pending_local and not pending_remote:
+        actions.append("Add local files to /attachments or attach files in Trello.")
+
+    if not workspace_exists:
+        state = "needs_prepare"
+        summary = "Prepare review to create the workspace and index evidence."
+    elif actions:
+        state = "needs_prepare"
+        summary = "Preparation required before the review is current."
+    elif evidence_docs:
+        state = "ready"
+        summary = "Ready to run."
+    else:
+        state = "empty"
+        summary = "No evidence found yet."
+
+    ready_for_run = state == "ready" and evidence_docs > 0
+    blocking_message = ""
+    if not ready_for_run:
+        if actions:
+            blocking_message = "Preparation required: " + " ".join(actions)
+        elif evidence_docs == 0:
+            blocking_message = "No evidence found. Add local files or Trello attachments, then prepare the review."
+        else:
+            blocking_message = "Preparation required before running the review."
+
+    return {
+        "state": state,
+        "summary": summary,
+        "actions": actions,
+        "readyForRun": ready_for_run,
+        "blockingMessage": blocking_message,
+        "counts": {
+            "localTotal": len(local_items),
+            "localIndexed": len(indexed_local),
+            "localPending": len(pending_local),
+            "localStale": len(stale_local),
+            "remoteTotal": len(remote_items),
+            "remoteIndexed": len(indexed_remote),
+            "remotePending": len(pending_remote),
+            "remoteStale": len(stale_remote),
+            "evidenceDocs": evidence_docs,
+        },
+        "validSourceKeys": [str(row.get("sourceKey")) for row in indexed_local + indexed_remote if row.get("sourceKey")],
+    }
+
+
+def get_card_workspace_status(
+    paths: WorkbenchPaths,
+    *,
+    card_id: str,
+    card_packet: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    workspace = get_card_workspace_info(paths, card_id)
+    packet = card_packet if isinstance(card_packet, dict) else {}
+    if not workspace.get("exists"):
+        remote_items = []
+        for att in [a for a in (packet.get("attachments") or []) if isinstance(a, dict)]:
+            attachment_id = str(att.get("id") or "").strip()
+            if not attachment_id:
+                continue
+            remote_items.append(
+                {
+                    "attachmentId": attachment_id,
+                    "name": att.get("name") or att.get("fileName") or attachment_id,
+                    "fileName": att.get("fileName") or att.get("name") or attachment_id,
+                    "mimeType": att.get("mimeType") or "",
+                    "proxyUrl": att.get("proxyUrl"),
+                    "sourceUrl": att.get("url"),
+                    "date": att.get("date"),
+                    "sourceKey": f"trello:{attachment_id}",
+                    "indexStatus": "not_indexed",
+                    "lastIndexedAt": None,
+                    "indexFileKind": None,
+                    "indexWarnings": [],
+                }
+            )
+        prep = _summarize_preparation_state(
+            workspace_exists=False,
+            local_items=[],
+            stale_local=[],
+            remote_items=remote_items,
+            stale_remote=[],
+        )
+        return {
+            "workspace": workspace,
+            "prep": {
+                **prep,
+                "attachmentsPath": None,
+                "local": {"items": [], "stale": []},
+                "remote": {"items": remote_items, "stale": []},
+            },
+        }
+
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        raise FileNotFoundError("Workspace not found")
+    manifest = _load_manifest(ws_dir, card_id)
+    local_items, stale_local = _scan_local_workspace_sources(ws_dir, manifest)
+    remote_items, stale_remote = _scan_remote_workspace_sources(ws_dir, manifest, packet)
+    prep = _summarize_preparation_state(
+        workspace_exists=True,
+        local_items=local_items,
+        stale_local=stale_local,
+        remote_items=remote_items,
+        stale_remote=stale_remote,
+    )
+    return {
+        "workspace": workspace,
+        "prep": {
+            **prep,
+            "attachmentsPath": workspace.get("attachmentsPath"),
+            "local": {"items": local_items, "stale": stale_local},
+            "remote": {"items": remote_items, "stale": stale_remote},
+        },
+    }
+
+
 def get_local_file_path(paths: WorkbenchPaths, card_id: str, rel_path: str) -> Path:
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
@@ -473,6 +766,44 @@ def save_indexes_for_card(
     return {"saved": saved, "workspace": get_card_workspace_info(paths, card_id)}
 
 
+def remove_index_sources_for_card(
+    paths: WorkbenchPaths,
+    *,
+    card_id: str,
+    source_keys: List[str],
+) -> Dict[str, Any]:
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        raise FileNotFoundError("Workspace not found")
+    manifest = _load_manifest(ws_dir, card_id)
+    remove_set = {str(key).strip() for key in source_keys if str(key).strip()}
+    if not remove_set:
+        return {"removed": [], "workspace": get_card_workspace_info(paths, card_id)}
+
+    removed = []
+    indexes = manifest.get("indexes") or {}
+    for source_key in list(indexes.keys()):
+        if source_key in remove_set:
+            removed.append(source_key)
+            indexes.pop(source_key, None)
+    manifest["indexes"] = indexes
+
+    local_files = manifest.get("local_files") or {}
+    for rel, entry in list(local_files.items()):
+        if isinstance(entry, dict) and entry.get("source_key") in remove_set:
+            local_files.pop(rel, None)
+    manifest["local_files"] = local_files
+
+    trello_sources = manifest.get("trello_sources") or {}
+    for attachment_id, entry in list(trello_sources.items()):
+        if isinstance(entry, dict) and entry.get("source_key") in remove_set:
+            trello_sources.pop(attachment_id, None)
+    manifest["trello_sources"] = trello_sources
+
+    _save_manifest(ws_dir, manifest)
+    return {"removed": sorted(removed), "workspace": get_card_workspace_info(paths, card_id)}
+
+
 def _load_index_by_source_key(ws_dir: Path, manifest: Dict[str, Any], source_key: str) -> Dict[str, Any]:
     entry = (manifest.get("indexes") or {}).get(source_key)
     if not entry:
@@ -517,7 +848,11 @@ def list_index_summaries(paths: WorkbenchPaths, card_id: str) -> Dict[str, Any]:
     return {"indexes": indexes}
 
 
-def _collect_evidence_segments(paths: WorkbenchPaths, card_id: str) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+def _collect_evidence_segments(
+    paths: WorkbenchPaths,
+    card_id: str,
+    allowed_source_keys: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
         raise FileNotFoundError("Workspace not found")
@@ -525,8 +860,11 @@ def _collect_evidence_segments(paths: WorkbenchPaths, card_id: str) -> Tuple[Lis
     idx_entries = manifest.get("indexes") or {}
     evidence: List[Dict[str, Any]] = []
     index_lookup: Dict[str, Dict[str, Any]] = {}
+    allowed = {str(key).strip() for key in (allowed_source_keys or []) if str(key).strip()} if allowed_source_keys else None
     for source_key, entry in idx_entries.items():
         if not isinstance(entry, dict):
+            continue
+        if allowed is not None and source_key not in allowed:
             continue
         try:
             data = _load_index_by_source_key(ws_dir, manifest, source_key)
@@ -860,10 +1198,13 @@ def run_checklist_for_card(
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
         raise FileNotFoundError("Workspace not found for card. Create it first.")
+    prep = get_card_workspace_status(paths, card_id=card_id, card_packet=card_packet).get("prep") or {}
+    if not prep.get("readyForRun"):
+        raise ValueError(str(prep.get("blockingMessage") or "Preparation required before running the review."))
     checklist = load_checklist(paths)
-    evidence, index_lookup = _collect_evidence_segments(paths, card_id)
+    evidence, index_lookup = _collect_evidence_segments(paths, card_id, allowed_source_keys=prep.get("validSourceKeys"))
     if not evidence:
-        raise ValueError("No indexed evidence found. Index local and/or Trello attachments first.")
+        raise ValueError("No indexed evidence found after reconciliation. Prepare the review first.")
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:

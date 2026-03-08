@@ -5,6 +5,7 @@ node_modules/
 /.pnp
 .pnp.js
 review_workspace/
+.appdata/
 
 # backups
 /backup_metadata.json
@@ -15,6 +16,8 @@ review_workspace/
 
 # production
 /build
+/dist
+*.spec
 
 # misc
 .DS_Store

@@ -25,12 +25,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+from app_paths import resolve_app_paths
 from trello_smoke_test import TrelloClient, load_dotenv
 from workbench_store import (
     detect_mime_from_name,
     estimate_llm_input_tokens_for_card,
     ensure_card_workspace,
     get_card_workspace_info,
+    get_card_workspace_status,
     get_index_for_card,
     get_local_file_path,
     get_run_result,
@@ -38,14 +40,17 @@ from workbench_store import (
     list_index_summaries,
     load_checklist,
     load_checklist_text,
+    remove_index_sources_for_card,
+    reset_checklist,
     run_checklist_for_card,
     save_checklist,
     save_checklist_text,
     save_indexes_for_card,
 )
 
-ROOT_DIR = Path(__file__).resolve().parent
-UI_DIR = ROOT_DIR / "ui"
+APP_PATHS = resolve_app_paths()
+ROOT_DIR = APP_PATHS.resource_root
+UI_DIR = APP_PATHS.ui_dir
 VALID_REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
 
 
@@ -56,7 +61,9 @@ class AppConfig:
 
 
 def load_config() -> AppConfig:
-    env = load_dotenv(ROOT_DIR / ".env")
+    env: Dict[str, str] = {}
+    for env_path in APP_PATHS.env_search_paths:
+        env.update(load_dotenv(env_path))
     # Populate process env for other modules (e.g., checklist runs) that read OpenAI vars directly.
     for key in ("OPENAI_API_KEY", "OPENAI_MODEL"):
         if env.get(key) and not os.getenv(key):
@@ -606,6 +613,11 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 self._send_json({"ok": True, "parsed": parsed_checklist, "text": load_checklist_text(self.workbench_paths)})
                 return
 
+            if path == "/api/checklist/reset":
+                parsed_checklist = reset_checklist(self.workbench_paths)
+                self._send_json({"ok": True, "parsed": parsed_checklist, "text": load_checklist_text(self.workbench_paths)})
+                return
+
             if path.startswith("/api/cards/") and path.endswith("/workspace/token-estimate"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 5:
@@ -628,6 +640,18 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     model=model,
                 )
                 self._send_json({"ok": True, "estimate": estimate})
+                return
+
+            if path.startswith("/api/cards/") and path.endswith("/workspace/status"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 5:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace status route")
+                    return
+                card_id = parts[2]
+                card_packet = payload.get("cardPacket")
+                if not isinstance(card_packet, dict):
+                    card_packet = get_card_packet(client, card_id=card_id)
+                self._send_json(get_card_workspace_status(self.workbench_paths, card_id=card_id, card_packet=card_packet))
                 return
 
             if path.startswith("/api/cards/") and path.endswith("/workspace/create"):
@@ -663,6 +687,24 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     card_name=card.get("name") or card_id,
                     card_url=card.get("url") or "",
                     indexes=indexes,
+                )
+                self._send_json({"ok": True, **result})
+                return
+
+            if path.startswith("/api/cards/") and path.endswith("/workspace/indexes/prune"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 6:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace prune route")
+                    return
+                card_id = parts[2]
+                source_keys = payload.get("sourceKeys")
+                if not isinstance(source_keys, list):
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Body must contain sourceKeys array")
+                    return
+                result = remove_index_sources_for_card(
+                    self.workbench_paths,
+                    card_id=card_id,
+                    source_keys=[str(key) for key in source_keys],
                 )
                 self._send_json({"ok": True, **result})
                 return
@@ -710,9 +752,14 @@ def main() -> int:
     cfg = load_config()
     server = ThreadingHTTPServer((args.host, args.port), TrelloWorkbenchHandler)
     server.app_config = cfg  # type: ignore[attr-defined]
-    server.workbench_paths = init_workbench_paths(ROOT_DIR)  # type: ignore[attr-defined]
+    server.workbench_paths = init_workbench_paths(
+        APP_PATHS.review_workspace_dir,
+        checklist_file=APP_PATHS.user_checklist_file,
+        checklist_template_file=APP_PATHS.default_checklist_file,
+    )  # type: ignore[attr-defined]
 
     print(f"Trello workbench: http://{args.host}:{args.port}")
+    print(f"User data: {APP_PATHS.user_root}")
     print("Endpoints:")
     print("  GET /api/boards")
     print("  GET /api/boards/<boardId>/cards?limit=200")
@@ -720,10 +767,13 @@ def main() -> int:
     print("  GET /api/cards/<cardId>/attachments/<attachmentId>/content")
     print("  GET /api/checklist")
     print("  POST /api/checklist")
+    print("  POST /api/checklist/reset")
     print("  GET /api/cards/<cardId>/workspace")
     print("  POST /api/cards/<cardId>/workspace/token-estimate")
+    print("  POST /api/cards/<cardId>/workspace/status")
     print("  POST /api/cards/<cardId>/workspace/create")
     print("  POST /api/cards/<cardId>/workspace/indexes")
+    print("  POST /api/cards/<cardId>/workspace/indexes/prune")
     print("  POST /api/cards/<cardId>/workspace/run")
     try:
         server.serve_forever()

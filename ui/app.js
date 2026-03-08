@@ -9,6 +9,7 @@ const state = {
   currentMarkdown: "",
   currentPacket: null,
   workspace: null,
+  workspaceStatus: null,
   tokenEstimate: null,
   checklistParsed: null,
   checklistDraft: null,
@@ -17,6 +18,8 @@ const state = {
   indexCache: new Map(),
   pdfCache: new Map(),
 };
+
+const PREFERRED_BOARD_NAME = "IG Tramitacion Training";
 
 const els = {
   refreshBoardsBtn: document.getElementById("refreshBoardsBtn"),
@@ -32,6 +35,7 @@ const els = {
   cardBadge: document.getElementById("cardBadge"),
   viewerState: document.getElementById("viewerState"),
 
+  prepareReviewBtn: document.getElementById("prepareReviewBtn"),
   createWorkspaceBtn: document.getElementById("createWorkspaceBtn"),
   refreshWorkspaceBtn: document.getElementById("refreshWorkspaceBtn"),
   indexLocalBtn: document.getElementById("indexLocalBtn"),
@@ -49,6 +53,10 @@ const els = {
   checklistInstructionsInput: document.getElementById("checklistInstructionsInput"),
   checklistItemsList: document.getElementById("checklistItemsList"),
   loadChecklistBtn: document.getElementById("loadChecklistBtn"),
+  resetChecklistBtn: document.getElementById("resetChecklistBtn"),
+  importChecklistBtn: document.getElementById("importChecklistBtn"),
+  exportChecklistBtn: document.getElementById("exportChecklistBtn"),
+  importChecklistInput: document.getElementById("importChecklistInput"),
   saveChecklistBtn: document.getElementById("saveChecklistBtn"),
   addChecklistItemBtn: document.getElementById("addChecklistItemBtn"),
 
@@ -199,31 +207,34 @@ function renderBoards() {
     const btn = node.querySelector("button");
     btn.textContent = board.name || "(unnamed board)";
     if (state.selectedBoard?.id === board.id) btn.classList.add("active");
-    btn.addEventListener("click", () => {
-      state.selectedBoard = board;
-      state.cards = [];
-      state.selectedCard = null;
-      state.tokenEstimate = null;
-      state.currentPacket = null;
-      state.currentMarkdown = "";
-      state.workspace = null;
-      state.indexCache.clear();
-      state.runResult = null;
-      renderBoards();
-      renderCards();
-      renderPacketViews();
-      renderTokenEstimate();
-      renderWorkspace();
-      renderResults();
-      els.loadCardsBtn.disabled = false;
-      els.selectedBoardMeta.textContent = `ID: ${board.id} • Activity: ${fmtDate(board.dateLastActivity)}`;
-      els.cardBadge.textContent = "No Card Selected";
-      setViewerState("Board selected. Load cards.");
-    });
+    btn.addEventListener("click", () => selectBoard(board));
     els.boardsList.appendChild(node);
   }
 
   if (!state.filteredBoards.length) els.boardsList.innerHTML = `<li class="meta-text" style="padding:0 24px;">No boards match.</li>`;
+}
+
+function selectBoard(board, { statusMessage = "Board selected. Load cards." } = {}) {
+  state.selectedBoard = board;
+  state.cards = [];
+  state.selectedCard = null;
+  state.workspaceStatus = null;
+  state.tokenEstimate = null;
+  state.currentPacket = null;
+  state.currentMarkdown = "";
+  state.workspace = null;
+  state.indexCache.clear();
+  state.runResult = null;
+  renderBoards();
+  renderCards();
+  renderPacketViews();
+  renderTokenEstimate();
+  renderWorkspace();
+  renderResults();
+  els.loadCardsBtn.disabled = false;
+  els.selectedBoardMeta.textContent = `ID: ${board.id} • Activity: ${fmtDate(board.dateLastActivity)}`;
+  els.cardBadge.textContent = "No Card Selected";
+  setViewerState(statusMessage);
 }
 
 function renderCards() {
@@ -274,21 +285,78 @@ function renderTokenEstimate() {
   const items = est.payload_stats?.checklist_items ?? 0;
   
   if (Number.isFinite(total)) {
-    els.tokenEstimate.innerHTML = `<strong>Total: ${total.toLocaleString()} tokens</strong><br/><br/>Evidence: ${docs} docs (${segs} segs)<br/>Items: ${items}`;
+    const notes = Array.isArray(est.notes) && est.notes.length
+      ? `<br/><br/><span class="meta-text">${escapeHtml(est.notes[0])}</span>`
+      : "";
+    els.tokenEstimate.innerHTML = `<strong>Total: ${total.toLocaleString()} tokens</strong><br/><br/>Evidence: ${docs} docs (${segs} segs)<br/>Items: ${items}${notes}`;
   } else {
     els.tokenEstimate.textContent = est.error ? `Error: ${est.error}` : "Unavailable";
   }
 }
 
+function indexStatusLabel(status) {
+  return ({
+    indexed: "Indexed",
+    not_indexed: "Needs indexing",
+    changed: "Changed",
+    missing: "Stale",
+  })[status] || "Unknown";
+}
+
+function indexStatusTone(status) {
+  if (status === "indexed") return "ready";
+  if (status === "missing") return "stale";
+  return "pending";
+}
+
+function renderWorkspaceItem(item, kind) {
+  const name = item.relativePath || item.name || item.fileName || item.attachmentId || "?";
+  const primaryMeta = kind === "local" ? bytesLabel(item.size) : (item.mimeType || "unknown");
+  const indexedAt = item.lastIndexedAt ? ` • ${fmtDate(item.lastIndexedAt)}` : "";
+  const warnings = Array.isArray(item.indexWarnings) && item.indexWarnings.length
+    ? `<div class="data-item-note">${escapeHtml(item.indexWarnings[0])}</div>`
+    : "";
+  return `<li class="data-item">
+    <div class="data-item-head">
+      <div class="data-item-title">${escapeHtml(name)}</div>
+      <span class="data-item-status ${indexStatusTone(item.indexStatus)}">${escapeHtml(indexStatusLabel(item.indexStatus))}</span>
+    </div>
+    <div class="data-item-meta">${escapeHtml(primaryMeta)}${indexedAt}</div>
+    ${warnings}
+  </li>`;
+}
+
+function renderPrepSummary(ws, prep) {
+  const counts = prep?.counts || {};
+  const tone = prep?.readyForRun ? "ready" : (prep?.state === "empty" ? "pending" : "stale");
+  const actions = Array.isArray(prep?.actions) && prep.actions.length
+    ? `<div class="workspace-next"><strong>Next:</strong> ${escapeHtml(prep.actions.join(" "))}</div>`
+    : "";
+  const folder = ws?.attachmentsPath
+    ? `<div><strong>Folder:</strong> ${escapeHtml(ws.attachmentsPath)}</div>`
+    : "";
+  return `
+    <div class="workspace-status-line">
+      <span class="data-item-status ${tone}">${escapeHtml(prep?.readyForRun ? "Ready" : "Needs Prep")}</span>
+      <strong>${escapeHtml(prep?.summary || "Status unavailable.")}</strong>
+    </div>
+    <div>Evidence: ${counts.evidenceDocs ?? 0} indexed source(s)</div>
+    <div>Local: ${counts.localIndexed ?? 0}/${counts.localTotal ?? 0} ready • Trello: ${counts.remoteIndexed ?? 0}/${counts.remoteTotal ?? 0} ready</div>
+    ${folder}
+    ${actions}
+  `;
+}
+
 function renderWorkspace() {
   const hasCard = !!state.selectedCard;
+  els.prepareReviewBtn.disabled = !hasCard;
   els.createWorkspaceBtn.disabled = !hasCard;
   els.refreshWorkspaceBtn.disabled = !hasCard;
   
   const hasWorkspace = !!state.workspace?.exists;
   els.indexLocalBtn.disabled = !hasWorkspace;
   els.indexTrelloBtn.disabled = !hasWorkspace || !state.currentPacket;
-  els.runChecklistBtn.disabled = !hasWorkspace;
+  els.runChecklistBtn.disabled = !state.workspaceStatus?.readyForRun;
 
   if (!hasCard) {
     els.workspaceMeta.textContent = "No card selected.";
@@ -297,33 +365,37 @@ function renderWorkspace() {
     return;
   }
 
-  if (!hasWorkspace) {
-    els.workspaceMeta.textContent = "Not initialized.";
-    els.localFilesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">No workspace.</span></li>`;
-    els.indexesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">No indexes.</span></li>`;
+  if (!state.workspaceStatus) {
+    els.workspaceMeta.textContent = "Loading status...";
+    els.localFilesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Loading...</span></li>`;
+    els.indexesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Loading...</span></li>`;
     return;
   }
 
   const ws = state.workspace;
-  els.workspaceMeta.innerHTML = `<strong>ID:</strong> ${ws.workspaceFolder}<br/><strong>Path:</strong> ${ws.workspacePath}<br/><strong>Runs:</strong> ${ws.runs?.length || 0}`;
+  const prep = state.workspaceStatus;
+  els.workspaceMeta.innerHTML = renderPrepSummary(ws, prep);
 
-  const localFiles = ws.localFiles || [];
+  const localFiles = prep.local?.items || [];
+  const staleLocal = prep.local?.stale || [];
   if (!localFiles.length) {
-    els.localFilesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Empty.</span></li>`;
+    const emptyLabel = hasWorkspace
+      ? `No local files found${ws?.attachmentsPath ? ` in ${escapeHtml(ws.attachmentsPath)}` : ""}.`
+      : "Prepare review to create the local folder.";
+    els.localFilesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">${emptyLabel}</span></li>`;
   } else {
-    els.localFilesList.innerHTML = localFiles.map(f => 
-      `<li class="data-item"><div class="data-item-title">${escapeHtml(f.relativePath)}</div><div class="data-item-meta">${bytesLabel(f.size)} • ${escapeHtml(f.indexStatus || 'unindexed')}</div></li>`
-    ).join("");
+    els.localFilesList.innerHTML = localFiles.map((row) => renderWorkspaceItem(row, "local")).join("");
   }
+  if (staleLocal.length) els.localFilesList.innerHTML += staleLocal.map((row) => renderWorkspaceItem(row, "local")).join("");
 
-  const idxs = Object.entries(ws.manifest?.indexes || {});
-  if (!idxs.length) {
-    els.indexesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">No sources indexed.</span></li>`;
+  const remoteItems = prep.remote?.items || [];
+  const staleRemote = prep.remote?.stale || [];
+  if (!remoteItems.length) {
+    els.indexesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">No Trello attachments on this card.</span></li>`;
   } else {
-    els.indexesList.innerHTML = idxs.map(([key, row]) => 
-      `<li class="data-item"><div class="data-item-title">${escapeHtml(row.display_name || key)}</div><div class="data-item-meta">${escapeHtml(row.file_kind || '?')} • ${row.segment_count ?? '?'} segs • ${escapeHtml(row.source)}</div></li>`
-    ).join("");
+    els.indexesList.innerHTML = remoteItems.map((row) => renderWorkspaceItem(row, "remote")).join("");
   }
+  if (staleRemote.length) els.indexesList.innerHTML += staleRemote.map((row) => renderWorkspaceItem(row, "remote")).join("");
 
   renderRunHistorySelect();
 }
@@ -414,6 +486,18 @@ function renderChecklistBuilder() {
 }
 
 function slugify(text) { return String(text||"").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48); }
+
+function downloadTextFile(filename, text) {
+  const blob = new Blob([text], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
 
 function buildChecklistPayload() {
   const draft = ensureChecklistDraft();
@@ -559,7 +643,23 @@ async function loadBoards() {
     state.boards = data.boards || [];
     els.identity.textContent = data.me?.fullName || data.me?.username || "Unknown";
     renderBoards();
-    setViewerState("Boards loaded.");
+    const selectedStillExists = !!state.selectedBoard && state.boards.some((board) => board.id === state.selectedBoard.id);
+    if (!selectedStillExists) {
+      const preferredBoard = state.boards.find((board) => (board.name || "").trim() === PREFERRED_BOARD_NAME);
+      if (preferredBoard) {
+        selectBoard(preferredBoard, { statusMessage: `Defaulted to ${PREFERRED_BOARD_NAME}. Loading cards...` });
+        await loadCards();
+      } else {
+        state.selectedBoard = null;
+        state.cards = [];
+        renderBoards();
+        renderCards();
+        els.selectedBoardMeta.textContent = "No board selected.";
+        setViewerState("Preferred board not found.");
+      }
+    } else {
+      setViewerState("Boards loaded.");
+    }
   } catch (err) {
     setViewerState(`Board fetch error: ${err.message}`);
   } finally {
@@ -587,24 +687,24 @@ async function loadCards() {
 
 async function loadCard(card) {
   state.selectedCard = card;
+  state.workspaceStatus = null;
   state.tokenEstimate = { loading: true };
   renderCards();
   renderTokenEstimate();
   els.cardBadge.textContent = card.name || card.id;
-  setViewerState("Fetching packet & workspace...");
+  setViewerState("Fetching packet and review status...");
   try {
-    const [packet, ws] = await Promise.all([
-      apiGet(`/api/cards/${card.id}/packet`),
-      apiGet(`/api/cards/${card.id}/workspace`)
-    ]);
+    const packet = await apiGet(`/api/cards/${card.id}/packet`);
     state.currentPacket = packet.packet;
     state.currentMarkdown = packet.markdown || "";
-    state.workspace = ws;
+    const status = await apiPost(`/api/cards/${card.id}/workspace/status`, { cardPacket: state.currentPacket });
+    state.workspace = status.workspace || null;
+    state.workspaceStatus = status.prep || null;
     state.runResult = null;
     renderPacketViews();
     renderWorkspace();
     renderResults();
-    setViewerState("Card contextualized.");
+    setViewerState(state.workspaceStatus?.summary || "Card contextualized.");
     refreshTokenEstimate();
   } catch (err) {
     setViewerState(`Context error: ${err.message}`);
@@ -646,13 +746,77 @@ async function saveChecklist() {
   }
 }
 
+async function resetChecklistToAppDefault() {
+  els.resetChecklistBtn.disabled = true;
+  try {
+    const data = await apiPost("/api/checklist/reset", {});
+    state.checklistParsed = data.parsed || null;
+    state.checklistDraft = newChecklistDraft(state.checklistParsed);
+    renderChecklistBuilder();
+    renderChecklistEditorStatus("Replaced with the app default checklist.");
+    refreshTokenEstimate();
+  } catch (err) {
+    renderChecklistEditorStatus(`Reset failed: ${err.message}`);
+  } finally {
+    els.resetChecklistBtn.disabled = false;
+  }
+}
+
+async function exportChecklist() {
+  els.exportChecklistBtn.disabled = true;
+  try {
+    const data = await apiGet("/api/checklist");
+    const name = slugify(data.parsed?.name || "checklist") || "checklist";
+    downloadTextFile(`${name}.json`, data.text || JSON.stringify(data.parsed || {}, null, 2));
+    renderChecklistEditorStatus("Checklist exported.");
+  } catch (err) {
+    renderChecklistEditorStatus(`Export failed: ${err.message}`);
+  } finally {
+    els.exportChecklistBtn.disabled = false;
+  }
+}
+
+function promptChecklistImport() {
+  if (!els.importChecklistInput) return;
+  els.importChecklistInput.value = "";
+  els.importChecklistInput.click();
+}
+
+async function importChecklistFile(file) {
+  if (!file) return;
+  els.importChecklistBtn.disabled = true;
+  try {
+    const text = await file.text();
+    const data = await apiPost("/api/checklist", { text });
+    state.checklistParsed = data.parsed || null;
+    state.checklistDraft = newChecklistDraft(state.checklistParsed);
+    renderChecklistBuilder();
+    renderChecklistEditorStatus(`Imported ${file.name}.`);
+    refreshTokenEstimate();
+  } catch (err) {
+    renderChecklistEditorStatus(`Import failed: ${err.message}`);
+  } finally {
+    els.importChecklistBtn.disabled = false;
+    if (els.importChecklistInput) els.importChecklistInput.value = "";
+  }
+}
+
+async function loadWorkspaceStatus(cardPacket = state.currentPacket) {
+  if (!state.selectedCard) return null;
+  const status = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/status`, { cardPacket });
+  state.workspace = status.workspace || null;
+  state.workspaceStatus = status.prep || null;
+  renderWorkspace();
+  return status;
+}
+
 async function createWorkspace() {
   if (!state.selectedCard) return;
   els.createWorkspaceBtn.disabled = true;
   try {
     state.workspace = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/create`);
-    renderWorkspace();
-    setViewerState("Workspace initialized.");
+    await loadWorkspaceStatus();
+    setViewerState("Review folder initialized.");
   } catch (err) { setViewerState(`Init failed: ${err.message}`); }
   finally { els.createWorkspaceBtn.disabled = false; }
 }
@@ -660,9 +824,14 @@ async function createWorkspace() {
 async function refreshWorkspace() {
   if (!state.selectedCard) return;
   try {
-    state.workspace = await apiGet(`/api/cards/${state.selectedCard.id}/workspace`);
-    renderWorkspace();
-  } catch (err) { setViewerState(`Sync failed: ${err.message}`); }
+    const packet = await apiGet(`/api/cards/${state.selectedCard.id}/packet`);
+    state.currentPacket = packet.packet;
+    state.currentMarkdown = packet.markdown || "";
+    renderPacketViews();
+    await loadWorkspaceStatus(state.currentPacket);
+    refreshTokenEstimate();
+    setViewerState(state.workspaceStatus?.summary || "Status refreshed.");
+  } catch (err) { setViewerState(`Refresh failed: ${err.message}`); }
 }
 
 function getExt(name) {
@@ -1027,13 +1196,13 @@ function localContentUrl(cardId, relativePath) {
   return `/api/cards/${encodeURIComponent(cardId)}/workspace/files/content?path=${encodeURIComponent(relativePath)}`;
 }
 
-async function indexLocalAttachments() {
+async function indexLocalAttachments(filesOverride = null) {
   if (!state.selectedCard) return;
   if (!state.workspace?.exists) {
     setViewerState("Create the workspace folder first.");
     return;
   }
-  const files = state.workspace.localFiles || [];
+  const files = filesOverride || state.workspaceStatus?.local?.items || state.workspace.localFiles || [];
   if (!files.length) {
     setViewerState("No local files found in attachments/. Copy files there first.");
     return;
@@ -1061,7 +1230,8 @@ async function indexLocalAttachments() {
       batch.push(record);
     }
     await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: batch });
-    await refreshWorkspace();
+    await loadWorkspaceStatus(state.currentPacket);
+    refreshTokenEstimate();
     setViewerState(`Indexed ${batch.length} local attachment(s).`);
   } catch (err) {
     setViewerState(`Local indexing failed: ${err.message}`);
@@ -1070,9 +1240,9 @@ async function indexLocalAttachments() {
   }
 }
 
-async function indexTrelloAttachments() {
+async function indexTrelloAttachments(attachmentsOverride = null) {
   if (!state.selectedCard || !state.currentPacket) return;
-  const attachments = state.currentPacket.attachments || [];
+  const attachments = attachmentsOverride || state.workspaceStatus?.remote?.items || state.currentPacket.attachments || [];
   if (!attachments.length) {
     setViewerState("Card has no Trello attachments to index.");
     return;
@@ -1087,9 +1257,10 @@ async function indexTrelloAttachments() {
     const batch = [];
     for (let i = 0; i < attachments.length; i += 1) {
       const att = attachments[i];
+      const attachmentId = att.id || att.attachmentId;
       const proxyUrl = att.proxyUrl;
       if (!proxyUrl) continue;
-      const fileName = att.fileName || att.name || `attachment_${att.id}`;
+      const fileName = att.fileName || att.name || `attachment_${attachmentId}`;
       setViewerState(`Indexing Trello ${i + 1}/${attachments.length}: ${fileName}`);
       const { buffer, contentType } = await fetchArrayBuffer(proxyUrl);
       const record = await buildIndexRecord({
@@ -1099,19 +1270,20 @@ async function indexTrelloAttachments() {
         fileName,
         mimeType: (att.mimeType || contentType || "").split(";")[0],
         arrayBuffer: buffer,
-        sourceLocator: { type: "trello_attachment", proxyUrl, sourceUrl: att.url || null },
+        sourceLocator: { type: "trello_attachment", proxyUrl, sourceUrl: att.sourceUrl || att.url || null },
         trelloAttachment: {
-          attachmentId: att.id,
+          attachmentId,
           name: att.name || fileName,
           mimeType: att.mimeType || contentType,
           proxyUrl,
-          sourceUrl: att.url || null,
+          sourceUrl: att.sourceUrl || att.url || null,
         },
       });
       batch.push(record);
     }
     await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: batch });
-    await refreshWorkspace();
+    await loadWorkspaceStatus(state.currentPacket);
+    refreshTokenEstimate();
     setViewerState(`Indexed ${batch.length} Trello attachment(s).`);
   } catch (err) {
     setViewerState(`Trello indexing failed: ${err.message}`);
@@ -1120,10 +1292,63 @@ async function indexTrelloAttachments() {
   }
 }
 
+async function prepareReview() {
+  if (!state.selectedCard) return;
+  els.prepareReviewBtn.disabled = true;
+  setViewerState("Preparing review...");
+  try {
+    const packet = await apiGet(`/api/cards/${state.selectedCard.id}/packet`);
+    state.currentPacket = packet.packet;
+    state.currentMarkdown = packet.markdown || "";
+    renderPacketViews();
+
+    await loadWorkspaceStatus(state.currentPacket);
+    if (!state.workspace?.exists) {
+      state.workspace = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/create`);
+      await loadWorkspaceStatus(state.currentPacket);
+    }
+
+    const staleSourceKeys = [
+      ...(state.workspaceStatus?.local?.stale || []).map((row) => row.sourceKey),
+      ...(state.workspaceStatus?.remote?.stale || []).map((row) => row.sourceKey),
+    ].filter(Boolean);
+    if (staleSourceKeys.length) {
+      await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes/prune`, { sourceKeys: staleSourceKeys });
+      await loadWorkspaceStatus(state.currentPacket);
+    }
+
+    const pendingLocal = (state.workspaceStatus?.local?.items || []).filter((row) =>
+      ["not_indexed", "changed"].includes(row.indexStatus)
+    );
+    if (pendingLocal.length) {
+      await indexLocalAttachments(pendingLocal);
+    }
+
+    const pendingRemote = (state.workspaceStatus?.remote?.items || []).filter((row) =>
+      row.indexStatus === "not_indexed"
+    );
+    if (pendingRemote.length) {
+      await indexTrelloAttachments(pendingRemote);
+    }
+
+    await loadWorkspaceStatus(state.currentPacket);
+    refreshTokenEstimate();
+    if (state.workspaceStatus?.readyForRun) {
+      setViewerState("Review is prepared and ready to run.");
+    } else {
+      setViewerState(state.workspaceStatus?.blockingMessage || state.workspaceStatus?.summary || "Preparation updated.");
+    }
+  } catch (err) {
+    setViewerState(`Prepare failed: ${err.message}`);
+  } finally {
+    els.prepareReviewBtn.disabled = false;
+  }
+}
+
 async function runChecklist() {
-  if (!state.selectedCard || !state.workspace?.exists) return;
+  if (!state.selectedCard || !state.workspaceStatus?.readyForRun) return;
   els.runChecklistBtn.disabled = true;
-  setViewerState("Executing reasoning engine...");
+  setViewerState("Running review...");
   try {
     const data = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/run`, {
       model: els.modelInput.value,
@@ -1609,12 +1834,19 @@ function bindEvents() {
   els.loadCardsBtn.onclick = loadCards;
   els.cardSearch.onkeydown = (e) => { if (e.key === "Enter") loadCards(); };
   
+  els.prepareReviewBtn.onclick = prepareReview;
   els.createWorkspaceBtn.onclick = createWorkspace;
   els.refreshWorkspaceBtn.onclick = refreshWorkspace;
+  els.indexLocalBtn.onclick = () => indexLocalAttachments();
+  els.indexTrelloBtn.onclick = () => indexTrelloAttachments();
   els.runChecklistBtn.onclick = runChecklist;
   els.loadRunBtn.onclick = loadSelectedRun;
   
   els.loadChecklistBtn.onclick = loadChecklist;
+  els.resetChecklistBtn.onclick = resetChecklistToAppDefault;
+  els.importChecklistBtn.onclick = promptChecklistImport;
+  els.exportChecklistBtn.onclick = exportChecklist;
+  els.importChecklistInput.onchange = (e) => importChecklistFile(e.target.files?.[0]);
   els.saveChecklistBtn.onclick = saveChecklist;
   els.addChecklistItemBtn.onclick = () => { ensureChecklistDraft().items.push(newChecklistItemDraft()); renderChecklistBuilder(); };
   
