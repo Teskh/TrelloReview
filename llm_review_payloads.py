@@ -106,7 +106,7 @@ def build_review_user_payload(
 
 def _get_tiktoken_encoder(model_name: str) -> Tuple[Any, str, bool]:
     if tiktoken is None:
-        raise RuntimeError("tiktoken is not installed. Install it with: pip install tiktoken")
+        raise RuntimeError("tiktoken no está instalado. Instálalo con: pip install tiktoken")
     try:
         return tiktoken.encoding_for_model(model_name), model_name, True
     except Exception:
@@ -116,7 +116,7 @@ def _get_tiktoken_encoder(model_name: str) -> Tuple[Any, str, bool]:
             return tiktoken.get_encoding(enc_name), enc_name, False
         except Exception:
             continue
-    raise RuntimeError("Unable to initialize a tiktoken encoder")
+    raise RuntimeError("No se pudo inicializar un codificador de tiktoken")
 
 
 def estimate_review_input_tokens(
@@ -179,10 +179,10 @@ def estimate_review_input_tokens(
     }
     if not workspace_exists:
         response["notes"].append(
-            "Workspace not created; indexed evidence is unavailable, so attachment-derived tokens are not included yet."
+            "El espacio de trabajo no está creado; la evidencia indexada no está disponible, así que todavía no se incluyen los tokens derivados de adjuntos."
         )
     elif not evidence:
-        response["notes"].append("No indexed evidence found; attachment-derived tokens are not included yet.")
+        response["notes"].append("No se encontró evidencia indexada; todavía no se incluyen los tokens derivados de adjuntos.")
 
     try:
         encoder, encoding_name, exact_model_encoding = _get_tiktoken_encoder(model_name)
@@ -203,6 +203,6 @@ def estimate_review_input_tokens(
         "total_input_tokens": system_tokens + user_tokens,
     }
     response["notes"].append(
-        "Estimate counts the system prompt and JSON user payload content sent to the LLM. It excludes HTTP/API envelope overhead and output tokens."
+        "La estimación cuenta el system prompt y el contenido JSON del payload de usuario enviado al LLM. Excluye la sobrecarga del envoltorio HTTP/API y los tokens de salida."
     )
     return response

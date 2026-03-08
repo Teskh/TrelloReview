@@ -97,15 +97,15 @@ def init_workbench_paths(
 def _built_in_default_checklist() -> Dict[str, Any]:
     return {
         "version": 1,
-        "name": "Review Checklist",
-        "instructions": "Edit this checklist in the UI. Keep item ids stable once citations/runs exist.",
+        "name": "Checklist de revisión",
+        "instructions": "Edita este Checklist en la interfaz. Mantén estables los IDs de los criterios una vez que existan citas o ejecuciones.",
         "items": [
             {
                 "id": "item_001",
-                "title": "Required document is present",
-                "description": "Confirm the required supporting document exists and appears complete.",
-                "pass_criteria": "Document exists and contains the expected content/sections.",
-                "fail_criteria": "Document missing, incomplete, or clearly inconsistent.",
+                "title": "El documento requerido está presente",
+                "description": "Confirma que el documento de respaldo requerido exista y parezca completo.",
+                "pass_criteria": "El documento existe y contiene el contenido o las secciones esperadas.",
+                "fail_criteria": "El documento no existe, está incompleto o es claramente inconsistente.",
             }
         ],
     }
@@ -171,23 +171,23 @@ def _auto_item_id(idx: int, title: str, seen: set[str]) -> str:
 
 def validate_and_normalize_checklist(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
-        raise ValueError("Checklist must be a JSON object")
+        raise ValueError("El Checklist debe ser un objeto JSON")
     items = payload.get("items")
     if not isinstance(items, list) or not items:
-        raise ValueError("Checklist must contain a non-empty items array")
+        raise ValueError("El Checklist debe contener un arreglo `items` no vacío")
     seen: set[str] = set()
     out_items: List[Dict[str, Any]] = []
     for idx, item in enumerate(items, start=1):
         if not isinstance(item, dict):
-            raise ValueError(f"Checklist item #{idx} must be an object")
+            raise ValueError(f"El criterio #{idx} del Checklist debe ser un objeto")
         title = str(item.get("title") or "").strip()
         if not title:
-            raise ValueError(f"Checklist item #{idx} missing title")
+            raise ValueError(f"Al criterio #{idx} del Checklist le falta el título")
         item_id = str(item.get("id") or "").strip()
         if not item_id:
             item_id = _auto_item_id(idx, title, seen)
         if item_id in seen:
-            raise ValueError(f"Duplicate checklist item id: {item_id}")
+            raise ValueError(f"ID duplicado de criterio del Checklist: {item_id}")
         seen.add(item_id)
         out_items.append(
             {
@@ -201,7 +201,7 @@ def validate_and_normalize_checklist(payload: Dict[str, Any]) -> Dict[str, Any]:
         )
     return {
         "version": int(payload.get("version") or 1),
-        "name": str(payload.get("name") or "Review Checklist").strip() or "Review Checklist",
+        "name": str(payload.get("name") or "Checklist de revisión").strip() or "Checklist de revisión",
         "instructions": str(payload.get("instructions") or "").strip(),
         "items": out_items,
     }
@@ -523,45 +523,45 @@ def _summarize_preparation_state(
 
     actions: List[str] = []
     if not workspace_exists:
-        actions.append("Create the review folder.")
+        actions.append("Crea la carpeta de revisión.")
     if pending_local:
         changed_count = sum(1 for row in pending_local if row.get("indexStatus") == "changed")
         new_count = len(pending_local) - changed_count
         if new_count:
-            actions.append(f"Index {new_count} local file(s).")
+            actions.append(f"Indexa {new_count} archivo(s) local(es).")
         if changed_count:
-            actions.append(f"Re-index {changed_count} changed local file(s).")
+            actions.append(f"Vuelve a indexar {changed_count} archivo(s) local(es) modificados.")
     if pending_remote:
-        actions.append(f"Index {len(pending_remote)} Trello attachment(s).")
+        actions.append(f"Indexa {len(pending_remote)} adjunto(s) de Trello.")
     if stale_local:
-        actions.append(f"Remove {len(stale_local)} stale local index reference(s).")
+        actions.append(f"Elimina {len(stale_local)} referencia(s) obsoleta(s) de índices locales.")
     if stale_remote:
-        actions.append(f"Remove {len(stale_remote)} stale Trello index reference(s).")
+        actions.append(f"Elimina {len(stale_remote)} referencia(s) obsoleta(s) de índices de Trello.")
     if workspace_exists and evidence_docs == 0 and not pending_local and not pending_remote:
-        actions.append("Add local files to /attachments or attach files in Trello.")
+        actions.append("Agrega archivos locales a /attachments o adjunta archivos en Trello.")
 
     if not workspace_exists:
         state = "needs_prepare"
-        summary = "Prepare review to create the workspace and index evidence."
+        summary = "Prepara la revisión para crear el espacio de trabajo e indexar la evidencia."
     elif actions:
         state = "needs_prepare"
-        summary = "Preparation required before the review is current."
+        summary = "Se requiere preparación antes de que la revisión esté al día."
     elif evidence_docs:
         state = "ready"
-        summary = "Ready to run."
+        summary = "Lista para ejecutar."
     else:
         state = "empty"
-        summary = "No evidence found yet."
+        summary = "Todavía no se encontró evidencia."
 
     ready_for_run = state == "ready" and evidence_docs > 0
     blocking_message = ""
     if not ready_for_run:
         if actions:
-            blocking_message = "Preparation required: " + " ".join(actions)
+            blocking_message = "Se requiere preparación: " + " ".join(actions)
         elif evidence_docs == 0:
-            blocking_message = "No evidence found. Add local files or Trello attachments, then prepare the review."
+            blocking_message = "No se encontró evidencia. Agrega archivos locales o adjuntos de Trello y luego prepara la revisión."
         else:
-            blocking_message = "Preparation required before running the review."
+            blocking_message = "Se requiere preparación antes de ejecutar la revisión."
 
     return {
         "state": state,
@@ -633,7 +633,7 @@ def get_card_workspace_status(
 
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
-        raise FileNotFoundError("Workspace not found")
+        raise FileNotFoundError("No se encontró el espacio de trabajo")
     manifest = _load_manifest(ws_dir, card_id)
     local_items, stale_local = _scan_local_workspace_sources(ws_dir, manifest)
     remote_items, stale_remote = _scan_remote_workspace_sources(ws_dir, manifest, packet)
@@ -658,13 +658,13 @@ def get_card_workspace_status(
 def get_local_file_path(paths: WorkbenchPaths, card_id: str, rel_path: str) -> Path:
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
-        raise FileNotFoundError("Workspace does not exist")
+        raise FileNotFoundError("El espacio de trabajo no existe")
     attachments_dir = _attachments_dir(ws_dir).resolve()
     candidate = (attachments_dir / rel_path).resolve()
     if attachments_dir not in [candidate, *candidate.parents]:
-        raise ValueError("Invalid relative path")
+        raise ValueError("Ruta relativa no válida")
     if not candidate.is_file():
-        raise FileNotFoundError("File not found")
+        raise FileNotFoundError("No se encontró el archivo")
     return candidate
 
 
@@ -679,30 +679,30 @@ def import_local_files_for_card(
     ensure_card_workspace(paths, card_id=card_id, card_name=card_name, card_url=card_url)
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
-        raise RuntimeError("Workspace create/load failed")
+        raise RuntimeError("Falló la creación o carga del espacio de trabajo")
     attachments_dir = _attachments_dir(ws_dir).resolve()
     saved: List[Dict[str, Any]] = []
 
     for idx, payload in enumerate(files, start=1):
         if not isinstance(payload, dict):
-            raise ValueError(f"File payload #{idx} must be an object")
+            raise ValueError(f"La carga útil del archivo #{idx} debe ser un objeto")
         raw_name = str(payload.get("name") or "").strip()
         if not raw_name:
-            raise ValueError(f"File payload #{idx} missing name")
+            raise ValueError(f"A la carga útil del archivo #{idx} le falta el nombre")
         safe_name = Path(raw_name.replace("\\", "/")).name.strip()
         if not safe_name:
-            raise ValueError(f"File payload #{idx} has invalid name")
+            raise ValueError(f"La carga útil del archivo #{idx} tiene un nombre no válido")
         raw_content = payload.get("contentBase64")
         if not isinstance(raw_content, str) or not raw_content.strip():
-            raise ValueError(f"File payload #{idx} missing contentBase64")
+            raise ValueError(f"A la carga útil del archivo #{idx} le falta `contentBase64`")
         try:
             body = base64.b64decode(raw_content.encode("ascii"), validate=True)
         except (ValueError, binascii.Error) as exc:
-            raise ValueError(f"File payload #{idx} has invalid base64 content") from exc
+            raise ValueError(f"La carga útil del archivo #{idx} tiene contenido base64 no válido") from exc
 
         target = (attachments_dir / safe_name).resolve()
         if attachments_dir not in [target, *target.parents]:
-            raise ValueError(f"Invalid target path for file payload #{idx}")
+            raise ValueError(f"Ruta de destino no válida para la carga útil del archivo #{idx}")
         target.write_bytes(body)
         saved.append({"name": safe_name, "size": len(body)})
 
@@ -725,7 +725,7 @@ def save_indexes_for_card(
     info = ensure_card_workspace(paths, card_id=card_id, card_name=card_name, card_url=card_url)
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
-        raise RuntimeError("Workspace create/load failed")
+        raise RuntimeError("Falló la creación o carga del espacio de trabajo")
     manifest = _load_manifest(ws_dir, card_id)
     indexes_dir = _indexes_dir(ws_dir)
     saved: List[Dict[str, Any]] = []
@@ -737,14 +737,14 @@ def save_indexes_for_card(
         source_key = str(payload.get("sourceKey") or "").strip()
         card_ref = str(payload.get("cardId") or card_id)
         if card_ref != card_id:
-            raise ValueError(f"Index source {source_key} references mismatched card id")
+            raise ValueError(f"La fuente de índice {source_key} hace referencia a un ID de tarjeta distinto")
         if source not in ("local", "trello"):
-            raise ValueError(f"Invalid source for index {source_key}")
+            raise ValueError(f"Fuente no válida para el índice {source_key}")
         if not source_key:
-            raise ValueError("Index payload missing sourceKey")
+            raise ValueError("A la carga útil del índice le falta `sourceKey`")
         index_data = payload.get("index")
         if not isinstance(index_data, dict):
-            raise ValueError(f"Index payload {source_key} missing index object")
+            raise ValueError(f"A la carga útil del índice {source_key} le falta el objeto `index`")
 
         file_kind = str(index_data.get("file_kind") or payload.get("fileKind") or "unknown").lower()
         idx_name = _index_filename(source_key, file_kind)
@@ -817,7 +817,7 @@ def remove_index_sources_for_card(
 ) -> Dict[str, Any]:
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
-        raise FileNotFoundError("Workspace not found")
+        raise FileNotFoundError("No se encontró el espacio de trabajo")
     manifest = _load_manifest(ws_dir, card_id)
     remove_set = {str(key).strip() for key in source_keys if str(key).strip()}
     if not remove_set:
@@ -850,23 +850,23 @@ def remove_index_sources_for_card(
 def _load_index_by_source_key(ws_dir: Path, manifest: Dict[str, Any], source_key: str) -> Dict[str, Any]:
     entry = (manifest.get("indexes") or {}).get(source_key)
     if not entry:
-        raise FileNotFoundError(f"Index not found for sourceKey={source_key}")
+        raise FileNotFoundError(f"No se encontró un índice para sourceKey={source_key}")
     idx_rel = entry.get("index_file")
     if not idx_rel:
-        raise FileNotFoundError(f"Index file missing for sourceKey={source_key}")
+        raise FileNotFoundError(f"Falta el archivo de índice para sourceKey={source_key}")
     idx_path = (ws_dir / idx_rel).resolve()
     if ws_dir.resolve() not in [idx_path, *idx_path.parents]:
-        raise ValueError("Invalid index path")
+        raise ValueError("Ruta de índice no válida")
     data = _json_load(idx_path, {})
     if not isinstance(data, dict):
-        raise ValueError("Index file invalid")
+        raise ValueError("Archivo de índice no válido")
     return data
 
 
 def get_index_for_card(paths: WorkbenchPaths, card_id: str, source_key: str) -> Dict[str, Any]:
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
-        raise FileNotFoundError("Workspace not found")
+        raise FileNotFoundError("No se encontró el espacio de trabajo")
     manifest = _load_manifest(ws_dir, card_id)
     index_data = _load_index_by_source_key(ws_dir, manifest, source_key)
     entry = manifest.get("indexes", {}).get(source_key, {})
@@ -898,7 +898,7 @@ def _collect_evidence_segments(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
-        raise FileNotFoundError("Workspace not found")
+        raise FileNotFoundError("No se encontró el espacio de trabajo")
     manifest = _load_manifest(ws_dir, card_id)
     idx_entries = manifest.get("indexes") or {}
     evidence: List[Dict[str, Any]] = []
@@ -1095,19 +1095,19 @@ def _openai_request(
                 return json.loads(resp.read().decode("utf-8"))
         except HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
-            last_err = RuntimeError(f"OpenAI Responses API error {e.code} (attempt {attempt_idx}): {detail}")
+            last_err = RuntimeError(f"Error de OpenAI Responses API {e.code} (intento {attempt_idx}): {detail}")
             # If structured format is rejected, try plain JSON-prompt fallback once.
             if attempt_idx == 1:
                 continue
             raise last_err from e
         except URLError as e:
             raise RuntimeError(
-                f"OpenAI Responses API network error for model={model} reasoning={reasoning_effort} "
+                f"Error de red de OpenAI Responses API para model={model} reasoning={reasoning_effort} "
                 f"(timeout={timeout_seconds}s): {e}"
             ) from e
     if last_err:
         raise last_err
-    raise RuntimeError("OpenAI Responses API request failed")
+    raise RuntimeError("La solicitud a OpenAI Responses API falló")
 
 
 def _validate_citations(result: Dict[str, Any], index_lookup: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -1194,12 +1194,12 @@ def _align_run_items_to_checklist(result: Dict[str, Any], checklist: Dict[str, A
                 "item_id": expected_id,
                 "status": row.get("status") if row.get("status") in {"pass", "fail", "needs_review"} else "needs_review",
                 "confidence": confidence,
-                "rationale": str(row.get("rationale") or "No model answer returned for this checklist item.").strip(),
+                "rationale": str(row.get("rationale") or "El modelo no devolvió una respuesta para este criterio del Checklist.").strip(),
                 "citations": row.get("citations") if isinstance(row.get("citations"), list) else [],
                 "missing_evidence": (
                     row.get("missing_evidence")
                     if isinstance(row.get("missing_evidence"), list)
-                    else ["Model omitted this checklist item in the response."]
+                    else ["El modelo omitió este criterio del Checklist en la respuesta."]
                 ),
             }
         )
@@ -1209,7 +1209,7 @@ def _align_run_items_to_checklist(result: Dict[str, Any], checklist: Dict[str, A
         notes = result.get("global_notes")
         if not isinstance(notes, list):
             notes = []
-        notes.append(f"Ignored {len(extras)} extra checklist item result(s) not matching the current checklist.")
+        notes.append(f"Se ignoraron {len(extras)} resultado(s) extra de criterios del Checklist que no coinciden con el Checklist actual.")
         result["global_notes"] = notes
     return result
 
@@ -1240,18 +1240,18 @@ def run_checklist_for_card(
 ) -> Dict[str, Any]:
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
-        raise FileNotFoundError("Workspace not found for card. Create it first.")
+        raise FileNotFoundError("No se encontró el espacio de trabajo de la tarjeta. Créalo primero.")
     prep = get_card_workspace_status(paths, card_id=card_id, card_packet=card_packet).get("prep") or {}
     if not prep.get("readyForRun"):
-        raise ValueError(str(prep.get("blockingMessage") or "Preparation required before running the review."))
+        raise ValueError(str(prep.get("blockingMessage") or "Se requiere preparación antes de ejecutar la revisión."))
     checklist = load_checklist(paths)
     evidence, index_lookup = _collect_evidence_segments(paths, card_id, allowed_source_keys=prep.get("validSourceKeys"))
     if not evidence:
-        raise ValueError("No indexed evidence found after reconciliation. Prepare the review first.")
+        raise ValueError("No se encontró evidencia indexada después de la conciliación. Prepara la revisión primero.")
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY in environment")
+        raise RuntimeError("Falta OPENAI_API_KEY en el entorno")
     model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.4").strip()
     user_payload = build_review_user_payload(
         checklist=checklist,
@@ -1271,11 +1271,11 @@ def run_checklist_for_card(
     )
     text = _response_text_from_responses_api(raw_api)
     if not text:
-        raise RuntimeError("OpenAI response did not contain output text")
+        raise RuntimeError("La respuesta de OpenAI no contenía texto de salida")
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"Model output was not valid JSON: {e}\n{text[:1000]}") from e
+        raise RuntimeError(f"La salida del modelo no era JSON válido: {e}\n{text[:1000]}") from e
 
     parsed = _align_run_items_to_checklist(parsed, checklist)
     parsed = _validate_citations(parsed, index_lookup)
@@ -1322,13 +1322,13 @@ def run_checklist_for_card(
 def get_run_result(paths: WorkbenchPaths, card_id: str, run_id: str) -> Dict[str, Any]:
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
-        raise FileNotFoundError("Workspace not found")
+        raise FileNotFoundError("No se encontró el espacio de trabajo")
     run_dir = _runs_dir(ws_dir) / run_id
     if not run_dir.exists():
-        raise FileNotFoundError("Run not found")
+        raise FileNotFoundError("No se encontró la ejecución")
     result = _json_load(run_dir / "run_result.json", None)
     if not isinstance(result, dict):
-        raise FileNotFoundError("Run result missing")
+        raise FileNotFoundError("Falta el resultado de la ejecución")
     return result
 
 

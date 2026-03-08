@@ -86,9 +86,9 @@ def load_config() -> AppConfig:
     api_key = env.get("API_KEY") or os.getenv("API_KEY") or ""
     token = env.get("TOKEN") or os.getenv("TOKEN") or ""
     if not api_key or not token:
-        raise RuntimeError("Missing API_KEY/TOKEN in .env or environment")
+        raise RuntimeError("Faltan API_KEY/TOKEN en .env o en las variables de entorno")
     if any(ch in api_key for ch in "[]") or any(ch in token for ch in "[]"):
-        raise RuntimeError("Replace placeholder values in .env with real API_KEY/TOKEN")
+        raise RuntimeError("Reemplaza los valores de ejemplo en .env por API_KEY/TOKEN reales")
     return AppConfig(api_key=api_key, token=token)
 
 
@@ -206,10 +206,10 @@ def run_with_tray(
     open_browser: bool,
 ) -> None:
     if pystray is None:
-        raise RuntimeError("pystray is not installed")
+        raise RuntimeError("pystray no está instalado")
     tray_image = create_tray_icon_image()
     if tray_image is None:
-        raise RuntimeError("Pillow is not installed")
+        raise RuntimeError("Pillow no está instalado")
 
     def on_open(_: Any, __: Any) -> None:
         open_browser_soon(app_url)
@@ -228,9 +228,9 @@ def run_with_tray(
         threading.Thread(target=_shutdown, daemon=True).start()
 
     menu = pystray.Menu(
-        pystray.MenuItem("Open Trello Review", on_open, default=True),
-        pystray.MenuItem("Open Data Folder", on_open_data),
-        pystray.MenuItem("Quit", on_quit),
+        pystray.MenuItem("Abrir Trello Review", on_open, default=True),
+        pystray.MenuItem("Abrir carpeta de datos", on_open_data),
+        pystray.MenuItem("Salir", on_quit),
     )
     icon = pystray.Icon("trello_review", tray_image, "Trello Review", menu)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -253,7 +253,7 @@ def parse_reasoning_effort(raw: Any) -> str:
         return "high"
     if value not in VALID_REASONING_EFFORTS:
         raise ValueError(
-            f"Invalid reasoning_effort '{value}'. Expected one of: {', '.join(sorted(VALID_REASONING_EFFORTS))}"
+            f"reasoning_effort no válido: '{value}'. Se esperaba uno de: {', '.join(sorted(VALID_REASONING_EFFORTS))}"
         )
     return value
 
@@ -341,7 +341,7 @@ def build_timeline(
         author = (
             (action.get("memberCreator") or {}).get("fullName")
             or (action.get("memberCreator") or {}).get("username")
-            or "Unknown"
+            or "Desconocido"
         )
         ts = action.get("date") or ""
         if event_type == "commentCard":
@@ -442,31 +442,31 @@ def render_markdown_transcript(packet: Dict[str, Any]) -> str:
     member_names = ", ".join(
         f"{m.get('fullName') or m.get('username')}" for m in members if (m.get("fullName") or m.get("username"))
     )
-    labels = ", ".join(l.get("name") or l.get("color") or "label" for l in card.get("labels", []))
+    labels = ", ".join(l.get("name") or l.get("color") or "etiqueta" for l in card.get("labels", []))
 
     lines: List[str] = []
-    lines.append(f"# Trello Card Review Packet: {card.get('name', '(unnamed)')}")
+    lines.append(f"# Paquete de revisión de tarjeta de Trello: {card.get('name', '(sin nombre)')}")
     lines.append("")
-    lines.append("## Card Metadata")
-    lines.append(f"- Card ID: `{card.get('id', '')}`")
+    lines.append("## Metadatos de la tarjeta")
+    lines.append(f"- ID de la tarjeta: `{card.get('id', '')}`")
     lines.append(f"- URL: {card.get('url', '')}")
-    lines.append(f"- Last Activity: {card.get('dateLastActivity', '')}")
+    lines.append(f"- Última actividad: {card.get('dateLastActivity', '')}")
     if card.get("due"):
-        lines.append(f"- Due: {card.get('due')}")
+        lines.append(f"- Vence: {card.get('due')}")
     if labels:
-        lines.append(f"- Labels: {labels}")
+        lines.append(f"- Etiquetas: {labels}")
     if member_names:
-        lines.append(f"- Members: {member_names}")
+        lines.append(f"- Miembros: {member_names}")
 
     desc = (card.get("desc") or "").strip()
     lines.append("")
-    lines.append("## Card Description")
-    lines.append(desc if desc else "_No description_")
+    lines.append("## Descripción de la tarjeta")
+    lines.append(desc if desc else "_No hay descripción_")
 
     lines.append("")
     lines.append("## Checklists")
     if not checklists:
-        lines.append("_No checklists_")
+        lines.append("_No hay checklists_")
     else:
         for checklist in checklists:
             lines.append(f"### {checklist.get('name', 'Checklist')}")
@@ -475,55 +475,55 @@ def render_markdown_transcript(packet: Dict[str, Any]) -> str:
                 lines.append(f"- [{mark}] {item.get('name', '')}")
             lines.append("")
 
-    lines.append("## Conversation Timeline (chronological)")
+    lines.append("## Línea de tiempo de la conversación (cronológica)")
     if not timeline:
-        lines.append("_No comments or attachment events_")
+        lines.append("_No hay comentarios ni eventos de adjuntos_")
     else:
         for event in timeline:
             ts = event.get("date") or ""
-            author = event.get("author") or "Unknown"
+            author = event.get("author") or "Desconocido"
             if event.get("kind") == "comment":
                 text = (event.get("text") or "").strip()
                 lines.append(f"[{ts}] {author}: {text}")
                 continue
 
             attachment = event.get("attachment") or {}
-            name = attachment.get("name") or attachment.get("fileName") or "attachment"
-            mime = attachment.get("mimeType") or "unknown"
-            lines.append(f"[{ts}] {author} attached `{name}` ({mime})")
+            name = attachment.get("name") or attachment.get("fileName") or "adjunto"
+            mime = attachment.get("mimeType") or "desconocido"
+            lines.append(f"[{ts}] {author} adjuntó `{name}` ({mime})")
             if attachment.get("isImage") and attachment.get("proxyUrl"):
                 lines.append(f"![{name}]({attachment.get('proxyUrl')})")
             if event.get("text"):
-                lines.append(f"Note: {event.get('text')}")
+                lines.append(f"Nota: {event.get('text')}")
 
     lines.append("")
-    lines.append("## Attachments")
+    lines.append("## Adjuntos")
     if not attachments:
-        lines.append("_No attachments_")
+        lines.append("_No hay adjuntos_")
     else:
         for a in attachments:
             size = a.get("bytes")
-            size_text = f"{size} bytes" if isinstance(size, int) else "size unknown"
-            mime = a.get("mimeType") or "unknown"
+            size_text = f"{size} bytes" if isinstance(size, int) else "tamaño desconocido"
+            mime = a.get("mimeType") or "desconocido"
             lines.append(
-                f"- `{a.get('name', '')}` ({mime}, {size_text}) | {a.get('date', '')} | source={a.get('url', '')} | proxy={a.get('proxyUrl', '')}"
+                f"- `{a.get('name', '')}` ({mime}, {size_text}) | {a.get('date', '')} | origen={a.get('url', '')} | proxy={a.get('proxyUrl', '')}"
             )
 
     lines.append("")
-    lines.append("## LLM Multimodal Assets")
+    lines.append("## Recursos multimodales del LLM")
     image_assets = [a for a in packet.get("llm_assets", []) if a.get("isImage")]
     if not image_assets:
-        lines.append("_No image assets_")
+        lines.append("_No hay recursos de imagen_")
     else:
-        lines.append("Use these image URLs/files as separate multimodal inputs (not text-only markdown).")
+        lines.append("Usa estas URL o archivos de imagen como entradas multimodales separadas (no como markdown solo de texto).")
         for a in image_assets:
             lines.append(f"- `{a.get('name', '')}` | {a.get('mimeType', '')} | {a.get('proxyUrl', '')}")
 
     lines.append("")
-    lines.append("## Suggested LLM Checklist Input Notes")
-    lines.append("- Use the conversation transcript as authoritative chronology.")
-    lines.append("- Validate checklist status against comments and attachments.")
-    lines.append("- Flag missing evidence if a checklist item implies a document/photo but none is attached.")
+    lines.append("## Notas sugeridas para la entrada del Checklist del LLM")
+    lines.append("- Usa la transcripción de la conversación como cronología autoritativa.")
+    lines.append("- Valida el estado del Checklist contra los comentarios y los adjuntos.")
+    lines.append("- Marca evidencia faltante si un criterio del Checklist implica un documento o una foto y no hay nada adjunto.")
 
     return "\n".join(lines).strip() + "\n"
 
@@ -569,7 +569,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0") or "0")
         except ValueError as e:
-            raise ValueError("Invalid Content-Length") from e
+            raise ValueError("Content-Length no válido") from e
         if length <= 0:
             return {}
         raw = self.rfile.read(length)
@@ -578,9 +578,9 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
         try:
             payload = json.loads(raw.decode("utf-8"))
         except Exception as e:
-            raise ValueError("Invalid JSON body") from e
+            raise ValueError("Cuerpo JSON no válido") from e
         if not isinstance(payload, dict):
-            raise ValueError("JSON body must be an object")
+            raise ValueError("El cuerpo JSON debe ser un objeto")
         return payload
 
     def _send_binary(self, body: bytes, content_type: str, filename: str | None = None) -> None:
@@ -601,7 +601,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
         )
         source_url = attachment.get("url")
         if not source_url:
-            self._send_error_json(HTTPStatus.NOT_FOUND, "Attachment URL not available")
+            self._send_error_json(HTTPStatus.NOT_FOUND, "La URL del adjunto no está disponible")
             return
         oauth_header = (
             f'OAuth oauth_consumer_key="{self.app_config.api_key}", '
@@ -624,10 +624,10 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 detail = e.read().decode("utf-8", errors="replace")
             except Exception:
                 detail = str(e)
-            self._send_error_json(e.code or HTTPStatus.BAD_GATEWAY, f"Attachment fetch failed: {detail}")
+            self._send_error_json(e.code or HTTPStatus.BAD_GATEWAY, f"Falló la descarga del adjunto: {detail}")
             return
         except URLError as e:
-            self._send_error_json(HTTPStatus.BAD_GATEWAY, f"Attachment fetch network error: {e}")
+            self._send_error_json(HTTPStatus.BAD_GATEWAY, f"Error de red al descargar el adjunto: {e}")
             return
 
         filename = attachment.get("fileName") or attachment.get("name")
@@ -652,7 +652,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if not parsed.path.startswith("/api/"):
-            self._send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
+            self._send_error_json(HTTPStatus.NOT_FOUND, "Ruta no encontrada")
             return
         self._handle_api_post(parsed)
 
@@ -681,7 +681,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/boards/") and path.endswith("/cards"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 4:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid board cards route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de tarjetas de tablero no válida")
                     return
                 board_id = parts[2]
                 limit = int(qs.get("limit", ["200"])[0])
@@ -692,7 +692,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/packet"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 4:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid card packet route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de paquete de tarjeta no válida")
                     return
                 card_id = parts[2]
                 packet = get_card_packet(client, card_id=card_id)
@@ -703,7 +703,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/workspace"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 4:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de espacio de trabajo no válida")
                     return
                 card_id = parts[2]
                 self._send_json(get_card_workspace_info(self.workbench_paths, card_id))
@@ -712,7 +712,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/workspace/indexes"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 5:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace indexes route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de índices del espacio de trabajo no válida")
                     return
                 card_id = parts[2]
                 self._send_json(list_index_summaries(self.workbench_paths, card_id))
@@ -721,12 +721,12 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/workspace/index"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 5:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace index route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de índice del espacio de trabajo no válida")
                     return
                 card_id = parts[2]
                 source_key = (qs.get("sourceKey", [""])[0] or "").strip()
                 if not source_key:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Missing sourceKey")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Falta sourceKey")
                     return
                 self._send_json(get_index_for_card(self.workbench_paths, card_id, source_key))
                 return
@@ -734,12 +734,12 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/workspace/files/content"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 6:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid local file content route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de contenido de archivo local no válida")
                     return
                 card_id = parts[2]
                 rel_path = (qs.get("path", [""])[0] or "").strip()
                 if not rel_path:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Missing path query parameter")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Falta el parámetro de consulta `path`")
                     return
                 self._send_local_file(card_id, rel_path)
                 return
@@ -747,7 +747,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if "/workspace/runs/" in path:
                 parts = path.strip("/").split("/")
                 if len(parts) != 6 or parts[3] != "workspace" or parts[4] != "runs":
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace run route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de ejecución del espacio de trabajo no válida")
                     return
                 card_id = parts[2]
                 run_id = parts[5]
@@ -757,14 +757,14 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and "/attachments/" in path and path.endswith("/content"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 6 or parts[3] != "attachments":
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid attachment content route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de contenido de adjunto no válida")
                     return
                 card_id = parts[2]
                 attachment_id = parts[4]
                 self._proxy_attachment_content(client, card_id=card_id, attachment_id=attachment_id)
                 return
 
-            self._send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
+            self._send_error_json(HTTPStatus.NOT_FOUND, "Ruta no encontrada")
         except ValueError as e:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(e))
         except FileNotFoundError as e:
@@ -795,7 +795,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/workspace/token-estimate"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 5:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace token estimate route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de estimación de tokens del espacio de trabajo no válida")
                     return
                 card_id = parts[2]
                 model = (payload.get("model") or "").strip() if isinstance(payload.get("model"), str) else None
@@ -819,7 +819,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/workspace/status"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 5:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace status route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de estado del espacio de trabajo no válida")
                     return
                 card_id = parts[2]
                 card_packet = payload.get("cardPacket")
@@ -831,7 +831,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/workspace/create"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 5:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace create route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de creación del espacio de trabajo no válida")
                     return
                 card_id = parts[2]
                 card = client.get("/cards/" + card_id, fields="id,name,url")
@@ -847,12 +847,12 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/workspace/indexes"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 5:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace indexes save route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta para guardar índices del espacio de trabajo no válida")
                     return
                 card_id = parts[2]
                 indexes = payload.get("indexes")
                 if not isinstance(indexes, list):
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Body must contain indexes array")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "El cuerpo debe contener un arreglo `indexes`")
                     return
                 card = client.get("/cards/" + card_id, fields="id,name,url")
                 result = save_indexes_for_card(
@@ -868,12 +868,12 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/workspace/files/import"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 6:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace file import route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de importación de archivos del espacio de trabajo no válida")
                     return
                 card_id = parts[2]
                 files = payload.get("files")
                 if not isinstance(files, list) or not files:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Body must contain a non-empty files array")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "El cuerpo debe contener un arreglo `files` no vacío")
                     return
                 card = client.get("/cards/" + card_id, fields="id,name,url")
                 result = import_local_files_for_card(
@@ -889,12 +889,12 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/workspace/indexes/prune"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 6:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace prune route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de depuración del espacio de trabajo no válida")
                     return
                 card_id = parts[2]
                 source_keys = payload.get("sourceKeys")
                 if not isinstance(source_keys, list):
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Body must contain sourceKeys array")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "El cuerpo debe contener un arreglo `sourceKeys`")
                     return
                 result = remove_index_sources_for_card(
                     self.workbench_paths,
@@ -907,7 +907,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/cards/") and path.endswith("/workspace/run"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 5:
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid workspace run route")
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de ejecución del espacio de trabajo no válida")
                     return
                 card_id = parts[2]
                 card_packet = get_card_packet(client, card_id=card_id)
@@ -926,7 +926,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 self._send_json({"ok": True, **result})
                 return
 
-            self._send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
+            self._send_error_json(HTTPStatus.NOT_FOUND, "Ruta no encontrada")
         except ValueError as e:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(e))
         except FileNotFoundError as e:
@@ -963,7 +963,7 @@ def main() -> int:
                 return 0
             maybe_show_error_dialog(
                 "Trello Review",
-                f"Port {args.port} is already in use by another app. Close it or run on a different port.",
+                f"El puerto {args.port} ya está en uso por otra aplicación. Ciérrala o ejecuta Trello Review en otro puerto.",
             )
             return 0
         maybe_show_error_dialog("Trello Review", str(e))

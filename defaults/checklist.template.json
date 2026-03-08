@@ -1,14 +1,14 @@
 {
   "version": 1,
-  "name": "Review Checklist",
-  "instructions": "Edit this checklist in the UI. Keep item ids stable once citations/runs exist.",
+  "name": "Checklist de revisión",
+  "instructions": "Edita este Checklist en la interfaz. Mantén estables los IDs de los criterios una vez que existan citas o ejecuciones.",
   "items": [
     {
       "id": "item_001",
-      "title": "Required document is present",
-      "description": "Confirm the required supporting document exists and appears complete.",
-      "pass_criteria": "Document exists and contains the expected content or sections.",
-      "fail_criteria": "Document is missing, incomplete, or clearly inconsistent."
+      "title": "El documento requerido está presente",
+      "description": "Confirma que el documento de respaldo requerido exista y parezca completo.",
+      "pass_criteria": "El documento existe y contiene el contenido o las secciones esperadas.",
+      "fail_criteria": "El documento no existe, está incompleto o es claramente inconsistente."
     }
   ]
 }

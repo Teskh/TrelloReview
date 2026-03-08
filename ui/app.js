@@ -84,14 +84,14 @@ const els = {
 };
 
 function fmtDate(value) {
-  if (!value) return "n/a";
+  if (!value) return "n/d";
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return value;
   return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
 function bytesLabel(n) {
-  if (!Number.isFinite(n)) return "n/a";
+  if (!Number.isFinite(n)) return "n/d";
   if (n < 1024) return `${n} B`;
   if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 ** 3) return `${(n / (1024 ** 2)).toFixed(1)} MB`;
@@ -101,7 +101,7 @@ function bytesLabel(n) {
 async function apiGet(path) {
   const res = await fetch(path, { cache: "no-store" });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed: ${res.status}`);
+  if (!res.ok) throw new Error(data.error || `La solicitud falló: ${res.status}`);
   return data;
 }
 
@@ -112,7 +112,7 @@ async function apiPost(path, body) {
     body: JSON.stringify(body || {}),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed: ${res.status}`);
+  if (!res.ok) throw new Error(data.error || `La solicitud falló: ${res.status}`);
   return data;
 }
 
@@ -180,7 +180,7 @@ function renderMarkdownPreview(markdown) {
     const imageMatch = trimmed.match(/^!\[(.*?)\]\((.*?)\)$/);
     if (imageMatch) {
       closeList();
-      const alt = escapeHtml(imageMatch[1] || "image");
+      const alt = escapeHtml(imageMatch[1] || "imagen");
       const src = escapeHtml(imageMatch[2] || "");
       html.push(`<figure><img loading="lazy" src="${src}" alt="${alt}" /><figcaption class="muted mono-text">${alt}</figcaption></figure>`);
       continue;
@@ -196,7 +196,7 @@ function renderMarkdownPreview(markdown) {
     }
 
     closeList();
-    if (["_No attachments_", "_No comments_", "_No image assets_", "_No checklists_"].includes(trimmed)) {
+    if (["_No hay adjuntos_", "_No hay comentarios_", "_No hay recursos de imagen_", "_No hay checklists_"].includes(trimmed)) {
       html.push(`<p class="muted mono-text">${escapeHtml(trimmed)}</p>`);
     } else if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
       const safe = escapeHtml(trimmed);
@@ -218,16 +218,16 @@ function renderBoards() {
   for (const board of state.filteredBoards) {
     const node = els.boardItemTpl.content.firstElementChild.cloneNode(true);
     const btn = node.querySelector("button");
-    btn.textContent = board.name || "(unnamed board)";
+    btn.textContent = board.name || "(tablero sin nombre)";
     if (state.selectedBoard?.id === board.id) btn.classList.add("active");
     btn.addEventListener("click", () => selectBoard(board));
     els.boardsList.appendChild(node);
   }
 
-  if (!state.filteredBoards.length) els.boardsList.innerHTML = `<li class="meta-text" style="padding:0 24px;">No boards match.</li>`;
+  if (!state.filteredBoards.length) els.boardsList.innerHTML = `<li class="meta-text" style="padding:0 24px;">No hay tableros que coincidan.</li>`;
 }
 
-function selectBoard(board, { statusMessage = "Board selected. Load cards." } = {}) {
+function selectBoard(board, { statusMessage = "Tablero seleccionado. Carga las tarjetas." } = {}) {
   state.selectedBoard = board;
   state.cards = [];
   state.selectedCard = null;
@@ -245,8 +245,8 @@ function selectBoard(board, { statusMessage = "Board selected. Load cards." } = 
   renderWorkspace();
   renderResults();
   els.loadCardsBtn.disabled = false;
-  els.selectedBoardMeta.textContent = `ID: ${board.id} • Activity: ${fmtDate(board.dateLastActivity)}`;
-  els.cardBadge.textContent = "No Card Selected";
+  els.selectedBoardMeta.textContent = `ID: ${board.id} • Actividad: ${fmtDate(board.dateLastActivity)}`;
+  els.cardBadge.textContent = "Ninguna tarjeta seleccionada";
   setViewerState(statusMessage);
 }
 
@@ -260,19 +260,19 @@ function renderCards() {
   for (const card of visibleCards) {
     const node = els.cardItemTpl.content.firstElementChild.cloneNode(true);
     const btn = node.querySelector("button");
-    btn.querySelector(".title").textContent = card.name || "(unnamed card)";
+    btn.querySelector(".title").textContent = card.name || "(tarjeta sin nombre)";
     const extra = [];
-    if (card.labels?.length) extra.push(`${card.labels.length} lbls`);
-    if (card.due) extra.push(`Due ${fmtDate(card.due)}`);
-    extra.push(`Act ${fmtDate(card.dateLastActivity)}`);
+    if (card.labels?.length) extra.push(`${card.labels.length} etq.`);
+    if (card.due) extra.push(`Vence ${fmtDate(card.due)}`);
+    extra.push(`Act. ${fmtDate(card.dateLastActivity)}`);
     btn.querySelector(".sub").textContent = extra.join(" • ");
     if (state.selectedCard?.id === card.id) btn.classList.add("active");
     btn.addEventListener("click", () => loadCard(card));
     els.cardsList.appendChild(node);
   }
   
-  if (!state.cards.length) els.cardsList.innerHTML = `<li class="meta-text" style="padding:0 24px;">No cards loaded.</li>`;
-  else if (!visibleCards.length) els.cardsList.innerHTML = `<li class="meta-text" style="padding:0 24px;">No matches.</li>`;
+  if (!state.cards.length) els.cardsList.innerHTML = `<li class="meta-text" style="padding:0 24px;">No hay tarjetas cargadas.</li>`;
+  else if (!visibleCards.length) els.cardsList.innerHTML = `<li class="meta-text" style="padding:0 24px;">No hay coincidencias.</li>`;
 }
 
 function renderPacketViews() {
@@ -285,12 +285,12 @@ function renderPacketViews() {
 function renderTokenEstimate() {
   if (!els.tokenEstimate) return;
   if (!state.selectedCard) {
-    els.tokenEstimate.textContent = "No card selected.";
+    els.tokenEstimate.textContent = "No hay ninguna tarjeta seleccionada.";
     return;
   }
   const est = state.tokenEstimate;
-  if (!est) { els.tokenEstimate.textContent = "Not calculated."; return; }
-  if (est.loading) { els.tokenEstimate.textContent = "Calculating..."; return; }
+  if (!est) { els.tokenEstimate.textContent = "Sin calcular."; return; }
+  if (est.loading) { els.tokenEstimate.textContent = "Calculando..."; return; }
   
   const total = est.counts?.total_input_tokens;
   const docs = est.payload_stats?.evidence_documents ?? 0;
@@ -301,19 +301,19 @@ function renderTokenEstimate() {
     const notes = Array.isArray(est.notes) && est.notes.length
       ? `<br/><br/><span class="meta-text">${escapeHtml(est.notes[0])}</span>`
       : "";
-    els.tokenEstimate.innerHTML = `<strong>Total: ${total.toLocaleString()} tokens</strong><br/><br/>Evidence: ${docs} docs (${segs} segs)<br/>Items: ${items}${notes}`;
+    els.tokenEstimate.innerHTML = `<strong>Total: ${total.toLocaleString()} tokens</strong><br/><br/>Evidencia: ${docs} documentos (${segs} segmentos)<br/>Criterios: ${items}${notes}`;
   } else {
-    els.tokenEstimate.textContent = est.error ? `Error: ${est.error}` : "Unavailable";
+    els.tokenEstimate.textContent = est.error ? `Error: ${est.error}` : "No disponible";
   }
 }
 
 function indexStatusLabel(status) {
   return ({
-    indexed: "Indexed",
-    not_indexed: "Needs indexing",
-    changed: "Changed",
-    missing: "Stale",
-  })[status] || "Unknown";
+    indexed: "Indexado",
+    not_indexed: "Requiere indexación",
+    changed: "Cambió",
+    missing: "Obsoleto",
+  })[status] || "Desconocido";
 }
 
 function indexStatusTone(status) {
@@ -324,7 +324,7 @@ function indexStatusTone(status) {
 
 function renderWorkspaceItem(item, kind) {
   const name = item.relativePath || item.name || item.fileName || item.attachmentId || "?";
-  const primaryMeta = kind === "local" ? bytesLabel(item.size) : (item.mimeType || "unknown");
+  const primaryMeta = kind === "local" ? bytesLabel(item.size) : (item.mimeType || "desconocido");
   const indexedAt = item.lastIndexedAt ? ` • ${fmtDate(item.lastIndexedAt)}` : "";
   const warnings = Array.isArray(item.indexWarnings) && item.indexWarnings.length
     ? `<div class="data-item-note">${escapeHtml(item.indexWarnings[0])}</div>`
@@ -343,18 +343,18 @@ function renderPrepSummary(ws, prep) {
   const counts = prep?.counts || {};
   const tone = prep?.readyForRun ? "ready" : (prep?.state === "empty" ? "pending" : "stale");
   const actions = Array.isArray(prep?.actions) && prep.actions.length
-    ? `<div class="workspace-next"><strong>Next:</strong> ${escapeHtml(prep.actions.join(" "))}</div>`
+    ? `<div class="workspace-next"><strong>Siguiente:</strong> ${escapeHtml(prep.actions.join(" "))}</div>`
     : "";
   const folder = ws?.attachmentsPath
-    ? `<div><strong>Folder:</strong> ${escapeHtml(ws.attachmentsPath)}</div>`
+    ? `<div><strong>Carpeta:</strong> ${escapeHtml(ws.attachmentsPath)}</div>`
     : "";
   return `
     <div class="workspace-status-line">
-      <span class="data-item-status ${tone}">${escapeHtml(prep?.readyForRun ? "Ready" : "Needs Prep")}</span>
-      <strong>${escapeHtml(prep?.summary || "Status unavailable.")}</strong>
+      <span class="data-item-status ${tone}">${escapeHtml(prep?.readyForRun ? "Listo" : "Requiere preparación")}</span>
+      <strong>${escapeHtml(prep?.summary || "Estado no disponible.")}</strong>
     </div>
-    <div>Evidence: ${counts.evidenceDocs ?? 0} indexed source(s)</div>
-    <div>Local: ${counts.localIndexed ?? 0}/${counts.localTotal ?? 0} ready • Trello: ${counts.remoteIndexed ?? 0}/${counts.remoteTotal ?? 0} ready</div>
+    <div>Evidencia: ${counts.evidenceDocs ?? 0} fuente(s) indexada(s)</div>
+    <div>Local: ${counts.localIndexed ?? 0}/${counts.localTotal ?? 0} listas • Trello: ${counts.remoteIndexed ?? 0}/${counts.remoteTotal ?? 0} listas</div>
     ${folder}
     ${actions}
   `;
@@ -373,16 +373,16 @@ function renderWorkspace() {
   els.runChecklistBtn.disabled = !state.workspaceStatus?.readyForRun;
 
   if (!hasCard) {
-    els.workspaceMeta.textContent = "No card selected.";
-    els.localFilesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Select a card.</span></li>`;
-    els.indexesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Select a card.</span></li>`;
+    els.workspaceMeta.textContent = "No hay ninguna tarjeta seleccionada.";
+    els.localFilesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Selecciona una tarjeta.</span></li>`;
+    els.indexesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Selecciona una tarjeta.</span></li>`;
     return;
   }
 
   if (!state.workspaceStatus) {
-    els.workspaceMeta.textContent = "Loading status...";
-    els.localFilesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Loading...</span></li>`;
-    els.indexesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Loading...</span></li>`;
+    els.workspaceMeta.textContent = "Cargando estado...";
+    els.localFilesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Cargando...</span></li>`;
+    els.indexesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">Cargando...</span></li>`;
     return;
   }
 
@@ -394,8 +394,8 @@ function renderWorkspace() {
   const staleLocal = prep.local?.stale || [];
   if (!localFiles.length) {
     const emptyLabel = hasWorkspace
-      ? `No local files found${ws?.attachmentsPath ? ` in ${escapeHtml(ws.attachmentsPath)}` : ""}.`
-      : "Prepare review to create the local folder.";
+      ? `No se encontraron archivos locales${ws?.attachmentsPath ? ` en ${escapeHtml(ws.attachmentsPath)}` : ""}.`
+      : "Prepara la revisión para crear la carpeta local.";
     els.localFilesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">${emptyLabel}</span></li>`;
   } else {
     els.localFilesList.innerHTML = localFiles.map((row) => renderWorkspaceItem(row, "local")).join("");
@@ -405,7 +405,7 @@ function renderWorkspace() {
   const remoteItems = prep.remote?.items || [];
   const staleRemote = prep.remote?.stale || [];
   if (!remoteItems.length) {
-    els.indexesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">No Trello attachments on this card.</span></li>`;
+    els.indexesList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">No hay adjuntos de Trello en esta tarjeta.</span></li>`;
   } else {
     els.indexesList.innerHTML = remoteItems.map((row) => renderWorkspaceItem(row, "remote")).join("");
   }
@@ -431,7 +431,7 @@ function newChecklistItemDraft(seed = {}) {
 function newChecklistDraft(seed = {}) {
   const items = Array.isArray(seed.items) && seed.items.length ? seed.items.map(newChecklistItemDraft) : [newChecklistItemDraft()];
   return {
-    name: String(seed.name || "Standard Review"),
+    name: String(seed.name || "Revisión estándar"),
     instructions: String(seed.instructions || ""),
     items,
   };
@@ -457,19 +457,19 @@ function renderChecklistBuilder() {
       <div class="criterion-number">#${(idx + 1).toString().padStart(2, '0')}</div>
       <div class="criterion-fields">
         <div class="field-group full-width">
-          <label>Criterion Title</label>
+          <label>Título del criterio</label>
           <input type="text" data-field="title" value="${escapeHtml(item.title || "")}" />
         </div>
         <div class="field-group full-width">
-          <label>Description</label>
+          <label>Descripción</label>
           <textarea rows="2" data-field="description">${escapeHtml(item.description || "")}</textarea>
         </div>
         <div class="field-group">
-          <label>Pass Criteria</label>
+          <label>Criterios de cumplimiento</label>
           <textarea rows="2" data-field="pass_criteria">${escapeHtml(item.pass_criteria || "")}</textarea>
         </div>
         <div class="field-group">
-          <label>Fail Criteria</label>
+          <label>Criterios de incumplimiento</label>
           <textarea rows="2" data-field="fail_criteria">${escapeHtml(item.fail_criteria || "")}</textarea>
         </div>
         <div class="criterion-actions"></div>
@@ -485,7 +485,7 @@ function renderChecklistBuilder() {
     downBtn.disabled = idx === draft.items.length - 1;
     downBtn.onclick = () => { const a = draft.items[idx+1]; draft.items[idx+1] = draft.items[idx]; draft.items[idx] = a; renderChecklistBuilder(); };
 
-    const delBtn = document.createElement("button"); delBtn.className = "action-btn outline sm btn-danger"; delBtn.textContent = "Remove";
+    const delBtn = document.createElement("button"); delBtn.className = "action-btn outline sm btn-danger"; delBtn.textContent = "Eliminar";
     delBtn.disabled = draft.items.length <= 1;
     delBtn.onclick = () => { draft.items.splice(idx, 1); renderChecklistBuilder(); };
 
@@ -515,11 +515,11 @@ function downloadTextFile(filename, text) {
 
 function buildChecklistPayload() {
   const draft = ensureChecklistDraft();
-  draft.name = els.checklistNameInput.value.trim() || "Standard Review";
+  draft.name = els.checklistNameInput.value.trim() || "Revisión estándar";
   draft.instructions = els.checklistInstructionsInput.value.trim();
   const seen = new Set();
   const items = draft.items.map((item, idx) => {
-    const title = item.title || `Item ${idx+1}`;
+    const title = item.title || `Criterio ${idx+1}`;
     let id = item.id || `item_${slugify(title) || idx+1}`;
     let cand = id; let n = 2;
     while(seen.has(cand)) cand = `${id}_${n++}`;
@@ -535,30 +535,48 @@ function citationEffectClass(effect) {
 
 function citationEffectLabel(effect) {
   return {
-    supports: "Supports",
-    contradicts: "Contradicts",
-    insufficient: "Insufficient",
+    supports: "Respalda",
+    contradicts: "Contradice",
+    insufficient: "Insuficiente",
   }[citationEffectClass(effect)];
+}
+
+function validationStatusLabel(status) {
+  return {
+    ok: "válida",
+    weak_match: "coincidencia débil",
+    missing_anchor: "ancla faltante",
+    unvalidated: "sin validar",
+  }[status] || status;
 }
 
 function citationValidationLabel(citation) {
   const status = citation?.validation?.status || "unvalidated";
   const score = citation?.validation?.score;
-  return Number.isFinite(Number(score)) ? `${status} (${Number(score).toFixed(2)})` : status;
+  const label = validationStatusLabel(status);
+  return Number.isFinite(Number(score)) ? `${label} (${Number(score).toFixed(2)})` : label;
+}
+
+function runItemStatusLabel(status) {
+  return {
+    pass: "cumple",
+    fail: "falla",
+    needs_review: "requiere revisión",
+  }[status] || status;
 }
 
 function renderRunHistorySelect() {
   const runs = state.workspace?.runs || [];
   els.runHistorySelect.innerHTML = "";
   if (!runs.length) {
-    els.runHistorySelect.innerHTML = `<option value="">No history</option>`;
+    els.runHistorySelect.innerHTML = `<option value="">Sin historial</option>`;
     els.loadRunBtn.disabled = true;
     return;
   }
   for (const r of runs) {
     const opt = document.createElement("option");
     opt.value = r.run_id;
-    opt.textContent = `${fmtDate(r.created_at)} • p:${r.counts?.pass||0} f:${r.counts?.fail||0}`;
+    opt.textContent = `${fmtDate(r.created_at)} • cumple:${r.counts?.pass||0} falla:${r.counts?.fail||0}`;
     els.runHistorySelect.appendChild(opt);
   }
   els.loadRunBtn.disabled = false;
@@ -567,15 +585,15 @@ function renderRunHistorySelect() {
 function renderResults() {
   const run = state.runResult;
   if (!run) {
-    els.runSummary.textContent = "No run loaded.";
+    els.runSummary.textContent = "No hay ninguna ejecución cargada.";
     els.resultsList.innerHTML = "";
     return;
   }
 
-  els.runSummary.innerHTML = `Model: ${run.model || "?"} • Pass: ${run.summary?.counts?.pass||0} • Fail: ${run.summary?.counts?.fail||0}`;
+  els.runSummary.innerHTML = `Modelo: ${run.model || "?"} • Cumple: ${run.summary?.counts?.pass||0} • Falla: ${run.summary?.counts?.fail||0}`;
   
   const items = run.result?.items || [];
-  els.resultsList.innerHTML = items.length ? "" : `<div class="meta-text" style="padding:0;">No checklist items in run.</div>`;
+  els.resultsList.innerHTML = items.length ? "" : `<div class="meta-text" style="padding:0;">No hay criterios del Checklist en la ejecución.</div>`;
 
   for (const item of items) {
     const row = document.createElement("div");
@@ -586,10 +604,10 @@ function renderResults() {
     const metaCol = document.createElement("div");
     metaCol.className = "result-meta-col";
     metaCol.innerHTML = `
-      <div class="result-index">Item ${(item.item_number||"?").toString().padStart(2, '0')}</div>
+      <div class="result-index">Criterio ${(item.item_number||"?").toString().padStart(2, '0')}</div>
       <div class="result-title">${escapeHtml(state.checklistParsed?.items?.find(i=>i.id===item.item_id)?.title || item.item_id)}</div>
-      <span class="status-tag ${escapeHtml(status)}">${escapeHtml(status)}</span>
-      <div class="mono-text muted mt-auto">Conf: ${Number.isFinite(Number(item.confidence)) ? Number(item.confidence).toFixed(2) : "n/a"}</div>
+      <span class="status-tag ${escapeHtml(status)}">${escapeHtml(runItemStatusLabel(status))}</span>
+      <div class="mono-text muted mt-auto">Conf.: ${Number.isFinite(Number(item.confidence)) ? Number(item.confidence).toFixed(2) : "n/d"}</div>
     `;
 
     // Right Col
@@ -598,8 +616,8 @@ function renderResults() {
     
     dataCol.innerHTML = `
       <div>
-        <span class="rationale-label">Model Rationale</span>
-        <div class="rationale-block">${escapeHtml(item.rationale || "No rationale provided.")}</div>
+        <span class="rationale-label">Fundamentación del modelo</span>
+        <div class="rationale-block">${escapeHtml(item.rationale || "No se proporcionó fundamentación.")}</div>
       </div>
     `;
 
@@ -607,7 +625,7 @@ function renderResults() {
     const citations = Array.isArray(item.citations) ? item.citations : [];
     if (citations.length > 0) {
       const citSection = document.createElement("div");
-      citSection.innerHTML = `<span class="rationale-label">Evidence Citations</span>`;
+      citSection.innerHTML = `<span class="rationale-label">Citas de evidencia</span>`;
       const grid = document.createElement("div");
       grid.className = "evidence-grid";
       
@@ -618,15 +636,15 @@ function renderResults() {
         card.innerHTML = `
           <div class="evidence-topline">
             <span class="evidence-effect ${effectClass}">${citationEffectLabel(cit.effect)}</span>
-            <span class="evidence-meta">${escapeHtml(cit.source_key || "?")} -> ${escapeHtml(cit.anchor_id || "?")}</span>
+            <span class="evidence-meta">${escapeHtml(cit.source_key || "?")} → ${escapeHtml(cit.anchor_id || "?")}</span>
           </div>
           <div class="evidence-quote">"${escapeHtml(cit.quote || "...")}"</div>
-          <div class="evidence-reason">${escapeHtml(cit.reason || "N/A")}</div>
-          <div class="evidence-meta">Validation: ${escapeHtml(citationValidationLabel(cit))}</div>
+          <div class="evidence-reason">${escapeHtml(cit.reason || "N/D")}</div>
+          <div class="evidence-meta">Validación: ${escapeHtml(citationValidationLabel(cit))}</div>
         `;
         const btn = document.createElement("button");
         btn.className = "action-btn outline sm evidence-action";
-        btn.textContent = `Inspect Source: ${cit.source_key||"?"}`;
+        btn.textContent = `Inspeccionar fuente: ${cit.source_key||"?"}`;
         btn.onclick = () => openCitation(cit);
         card.appendChild(btn);
         grid.appendChild(card);
@@ -639,7 +657,7 @@ function renderResults() {
     const missing = Array.isArray(item.missing_evidence) ? item.missing_evidence : [];
     if (missing.length > 0) {
       const missSection = document.createElement("div");
-      missSection.innerHTML = `<span class="rationale-label">Missing Evidence</span><div style="display:flex;gap:8px;flex-wrap:wrap;">${missing.map(m=>`<span class="badge" style="background:var(--status-warn-bg);color:var(--status-warn-fg);border:none;">${escapeHtml(m)}</span>`).join("")}</div>`;
+      missSection.innerHTML = `<span class="rationale-label">Evidencia faltante</span><div style="display:flex;gap:8px;flex-wrap:wrap;">${missing.map(m=>`<span class="badge" style="background:var(--status-warn-bg);color:var(--status-warn-fg);border:none;">${escapeHtml(m)}</span>`).join("")}</div>`;
       dataCol.appendChild(missSection);
     }
 
@@ -651,31 +669,31 @@ function renderResults() {
 
 async function loadBoards() {
   els.refreshBoardsBtn.disabled = true;
-  setViewerState("Fetching boards...");
+  setViewerState("Cargando tableros...");
   try {
     const data = await apiGet("/api/boards");
     state.boards = data.boards || [];
-    els.identity.textContent = data.me?.fullName || data.me?.username || "Unknown";
+    els.identity.textContent = data.me?.fullName || data.me?.username || "Desconocido";
     renderBoards();
     const selectedStillExists = !!state.selectedBoard && state.boards.some((board) => board.id === state.selectedBoard.id);
     if (!selectedStillExists) {
       const preferredBoard = state.boards.find((board) => (board.name || "").trim() === PREFERRED_BOARD_NAME);
       if (preferredBoard) {
-        selectBoard(preferredBoard, { statusMessage: `Defaulted to ${PREFERRED_BOARD_NAME}. Loading cards...` });
+        selectBoard(preferredBoard, { statusMessage: `Se seleccionó por defecto ${PREFERRED_BOARD_NAME}. Cargando tarjetas...` });
         await loadCards();
       } else {
         state.selectedBoard = null;
         state.cards = [];
         renderBoards();
         renderCards();
-        els.selectedBoardMeta.textContent = "No board selected.";
-        setViewerState("Preferred board not found.");
+        els.selectedBoardMeta.textContent = "No hay ningún tablero seleccionado.";
+        setViewerState("No se encontró el tablero preferido.");
       }
     } else {
-      setViewerState("Boards loaded.");
+      setViewerState("Tableros cargados.");
     }
   } catch (err) {
-    setViewerState(`Board fetch error: ${err.message}`);
+    setViewerState(`Error al cargar tableros: ${err.message}`);
   } finally {
     els.refreshBoardsBtn.disabled = false;
   }
@@ -686,14 +704,14 @@ async function loadCards() {
   els.loadCardsBtn.disabled = true;
   const q = els.cardSearch.value.trim();
   const limit = els.cardLimit.value;
-  setViewerState(`Fetching cards...`);
+  setViewerState("Cargando tarjetas...");
   try {
     const data = await apiGet(`/api/boards/${state.selectedBoard.id}/cards?limit=${limit}&q=${encodeURIComponent(q)}`);
     state.cards = data.cards || [];
     renderCards();
-    setViewerState(`Loaded ${state.cards.length} cards.`);
+    setViewerState(`Se cargaron ${state.cards.length} tarjetas.`);
   } catch (err) {
-    setViewerState(`Card fetch error: ${err.message}`);
+    setViewerState(`Error al cargar tarjetas: ${err.message}`);
   } finally {
     els.loadCardsBtn.disabled = false;
   }
@@ -706,7 +724,7 @@ async function loadCard(card) {
   renderCards();
   renderTokenEstimate();
   els.cardBadge.textContent = card.name || card.id;
-  setViewerState("Fetching packet and review status...");
+  setViewerState("Cargando paquete y estado de la revisión...");
   try {
     const packet = await apiGet(`/api/cards/${card.id}/packet`);
     state.currentPacket = packet.packet;
@@ -718,10 +736,10 @@ async function loadCard(card) {
     renderPacketViews();
     renderWorkspace();
     renderResults();
-    setViewerState(state.workspaceStatus?.summary || "Card contextualized.");
+    setViewerState(state.workspaceStatus?.summary || "Tarjeta contextualizada.");
     refreshTokenEstimate();
   } catch (err) {
-    setViewerState(`Context error: ${err.message}`);
+    setViewerState(`Error de contexto: ${err.message}`);
     state.tokenEstimate = { error: err.message };
     renderTokenEstimate();
   }
@@ -734,10 +752,10 @@ async function loadChecklist() {
     state.checklistParsed = data.parsed || null;
     state.checklistDraft = newChecklistDraft(state.checklistParsed);
     renderChecklistBuilder();
-    renderChecklistEditorStatus(`Loaded ${state.checklistDraft.items.length} criteria.`);
+    renderChecklistEditorStatus(`Se cargaron ${state.checklistDraft.items.length} criterios.`);
     refreshTokenEstimate();
   } catch (err) {
-    renderChecklistEditorStatus(`Load failed: ${err.message}`);
+    renderChecklistEditorStatus(`Falló la carga: ${err.message}`);
   } finally {
     els.loadChecklistBtn.disabled = false;
   }
@@ -751,10 +769,10 @@ async function saveChecklist() {
     state.checklistParsed = data.parsed || null;
     state.checklistDraft = newChecklistDraft(state.checklistParsed);
     renderChecklistBuilder();
-    renderChecklistEditorStatus(`Saved successfully.`);
+    renderChecklistEditorStatus("Guardado correctamente.");
     refreshTokenEstimate();
   } catch (err) {
-    renderChecklistEditorStatus(`Save failed: ${err.message}`);
+    renderChecklistEditorStatus(`Falló el guardado: ${err.message}`);
   } finally {
     els.saveChecklistBtn.disabled = false;
   }
@@ -767,10 +785,10 @@ async function resetChecklistToAppDefault() {
     state.checklistParsed = data.parsed || null;
     state.checklistDraft = newChecklistDraft(state.checklistParsed);
     renderChecklistBuilder();
-    renderChecklistEditorStatus("Replaced with the app default checklist.");
+    renderChecklistEditorStatus("Se reemplazó por el Checklist predeterminado de la app.");
     refreshTokenEstimate();
   } catch (err) {
-    renderChecklistEditorStatus(`Reset failed: ${err.message}`);
+    renderChecklistEditorStatus(`Falló el restablecimiento: ${err.message}`);
   } finally {
     els.resetChecklistBtn.disabled = false;
   }
@@ -782,9 +800,9 @@ async function exportChecklist() {
     const data = await apiGet("/api/checklist");
     const name = slugify(data.parsed?.name || "checklist") || "checklist";
     downloadTextFile(`${name}.json`, data.text || JSON.stringify(data.parsed || {}, null, 2));
-    renderChecklistEditorStatus("Checklist exported.");
+    renderChecklistEditorStatus("Checklist exportado.");
   } catch (err) {
-    renderChecklistEditorStatus(`Export failed: ${err.message}`);
+    renderChecklistEditorStatus(`Falló la exportación: ${err.message}`);
   } finally {
     els.exportChecklistBtn.disabled = false;
   }
@@ -805,10 +823,10 @@ async function importChecklistFile(file) {
     state.checklistParsed = data.parsed || null;
     state.checklistDraft = newChecklistDraft(state.checklistParsed);
     renderChecklistBuilder();
-    renderChecklistEditorStatus(`Imported ${file.name}.`);
+    renderChecklistEditorStatus(`Se importó ${file.name}.`);
     refreshTokenEstimate();
   } catch (err) {
-    renderChecklistEditorStatus(`Import failed: ${err.message}`);
+    renderChecklistEditorStatus(`Falló la importación: ${err.message}`);
   } finally {
     els.importChecklistBtn.disabled = false;
     if (els.importChecklistInput) els.importChecklistInput.value = "";
@@ -830,8 +848,8 @@ async function createWorkspace() {
   try {
     state.workspace = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/create`);
     await loadWorkspaceStatus();
-    setViewerState("Review folder initialized.");
-  } catch (err) { setViewerState(`Init failed: ${err.message}`); }
+    setViewerState("Carpeta de revisión inicializada.");
+  } catch (err) { setViewerState(`Falló la inicialización: ${err.message}`); }
   finally { els.createWorkspaceBtn.disabled = false; }
 }
 
@@ -859,9 +877,9 @@ async function importWorkspaceFiles(fileList) {
     }
     await apiPost(`/api/cards/${state.selectedCard.id}/workspace/files/import`, { files: payloadFiles });
     await loadWorkspaceStatus(state.currentPacket);
-    setViewerState(`Imported ${payloadFiles.length} file(s). Click Prepare Review to index them.`);
+    setViewerState(`Se importaron ${payloadFiles.length} archivo(s). Haz clic en Preparar revisión para indexarlos.`);
   } catch (err) {
-    setViewerState(`Upload failed: ${err.message}`);
+    setViewerState(`Falló la carga: ${err.message}`);
   } finally {
     els.uploadWorkspaceFilesBtn.disabled = false;
     if (els.uploadWorkspaceFilesInput) els.uploadWorkspaceFilesInput.value = "";
@@ -877,8 +895,8 @@ async function refreshWorkspace() {
     renderPacketViews();
     await loadWorkspaceStatus(state.currentPacket);
     refreshTokenEstimate();
-    setViewerState(state.workspaceStatus?.summary || "Status refreshed.");
-  } catch (err) { setViewerState(`Refresh failed: ${err.message}`); }
+    setViewerState(state.workspaceStatus?.summary || "Estado actualizado.");
+  } catch (err) { setViewerState(`Falló la actualización: ${err.message}`); }
 }
 
 function getExt(name) {
@@ -927,7 +945,7 @@ function buildTextSegments(blocks, baseKind) {
 }
 
 async function extractDocxIndex(arrayBuffer, meta) {
-  if (!window.mammoth) throw new Error("Mammoth library not loaded");
+  if (!window.mammoth) throw new Error("La biblioteca Mammoth no se cargó");
   const result = await window.mammoth.convertToHtml({ arrayBuffer });
   const html = result.value || "";
   const parser = new DOMParser();
@@ -974,7 +992,7 @@ function decodeCellValue(cell) {
 }
 
 async function extractXlsxIndex(arrayBuffer, meta) {
-  if (!window.XLSX) throw new Error("SheetJS library not loaded");
+  if (!window.XLSX) throw new Error("La biblioteca SheetJS no se cargó");
   const wb = window.XLSX.read(arrayBuffer, { type: "array", cellFormula: true, cellDates: true });
   const workbookPreview = [];
   const segments = [];
@@ -1007,7 +1025,7 @@ async function extractXlsxIndex(arrayBuffer, meta) {
           segments.push({
             anchor_id: anchor,
             kind: "xlsx_cell",
-            text: `${anchor} = ${display}${formula ? ` (formula: ${formula})` : ""}`,
+            text: `${anchor} = ${display}${formula ? ` (fórmula: ${formula})` : ""}`,
             page: null,
             sheet: sheetName,
             meta: { cell: addr, formula },
@@ -1055,7 +1073,7 @@ function groupPdfItemsToPageText(items) {
 }
 
 async function extractPdfIndex(arrayBuffer, meta) {
-  if (!window.pdfjsLib) throw new Error("pdf.js library not loaded");
+  if (!window.pdfjsLib) throw new Error("La biblioteca pdf.js no se cargó");
   const pdf = await window.pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
   const segments = [];
   const pages = [];
@@ -1095,7 +1113,7 @@ async function extractPdfIndex(arrayBuffer, meta) {
     mime_type: meta.mimeType,
     content_hash: meta.contentHash,
     extracted_at: new Date().toISOString(),
-    warnings: segments.some((s) => !s.text) ? ["Some pages appear scanned/image-only (no extractable text)."] : [],
+    warnings: segments.some((s) => !s.text) ? ["Algunas páginas parecen escaneadas o solo de imagen (sin texto extraíble)."] : [],
     render: {
       type: "pdf",
       page_count: pdf.numPages,
@@ -1175,7 +1193,7 @@ async function extractImageIndex(arrayBuffer, meta) {
     mime_type: meta.mimeType,
     content_hash: meta.contentHash,
     extracted_at: new Date().toISOString(),
-    warnings: ["Image indexing is metadata-only in MVP; add OCR/region anchors later for precise evidence."],
+    warnings: ["La indexación de imágenes en este MVP solo usa metadatos; agrega OCR o anclas por región después para evidencia precisa."],
     render: { type: "image", ...dims },
     segments: [
       {
@@ -1199,7 +1217,7 @@ async function extractUnknownIndex(meta) {
     mime_type: meta.mimeType,
     content_hash: meta.contentHash,
     extracted_at: new Date().toISOString(),
-    warnings: ["Unsupported file type for structured extraction in MVP."],
+    warnings: ["Tipo de archivo no compatible para extracción estructurada en este MVP."],
     render: { type: "none" },
     segments: [],
   };
@@ -1234,7 +1252,7 @@ async function buildIndexRecord({ source, cardId, displayName, fileName, mimeTyp
 
 async function fetchArrayBuffer(url) {
   const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status} para ${url}`);
   const buf = await res.arrayBuffer();
   return { buffer: buf, contentType: res.headers.get("Content-Type") || "application/octet-stream" };
 }
@@ -1246,21 +1264,21 @@ function localContentUrl(cardId, relativePath) {
 async function indexLocalAttachments(filesOverride = null) {
   if (!state.selectedCard) return;
   if (!state.workspace?.exists) {
-    setViewerState("Create the workspace folder first.");
+    setViewerState("Primero crea la carpeta del espacio de trabajo.");
     return;
   }
   const files = filesOverride || state.workspaceStatus?.local?.items || state.workspace.localFiles || [];
   if (!files.length) {
-    setViewerState("No local files found in attachments/. Copy files there first.");
+    setViewerState("No se encontraron archivos locales en attachments/. Cópialos allí primero.");
     return;
   }
   els.indexLocalBtn.disabled = true;
-  setViewerState(`Indexing ${files.length} local attachment(s)...`);
+  setViewerState(`Indexando ${files.length} archivo(s) local(es)...`);
   try {
     const batch = [];
     for (let i = 0; i < files.length; i += 1) {
       const f = files[i];
-      setViewerState(`Indexing local ${i + 1}/${files.length}: ${f.relativePath}`);
+      setViewerState(`Indexando local ${i + 1}/${files.length}: ${f.relativePath}`);
       const url = localContentUrl(state.selectedCard.id, f.relativePath);
       const { buffer, contentType } = await fetchArrayBuffer(url);
       const fileName = f.relativePath.split("/").pop() || f.relativePath;
@@ -1279,9 +1297,9 @@ async function indexLocalAttachments(filesOverride = null) {
     await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: batch });
     await loadWorkspaceStatus(state.currentPacket);
     refreshTokenEstimate();
-    setViewerState(`Indexed ${batch.length} local attachment(s).`);
+    setViewerState(`Se indexaron ${batch.length} archivo(s) local(es).`);
   } catch (err) {
-    setViewerState(`Local indexing failed: ${err.message}`);
+    setViewerState(`Falló la indexación local: ${err.message}`);
   } finally {
     els.indexLocalBtn.disabled = false;
   }
@@ -1291,15 +1309,15 @@ async function indexTrelloAttachments(attachmentsOverride = null) {
   if (!state.selectedCard || !state.currentPacket) return;
   const attachments = attachmentsOverride || state.workspaceStatus?.remote?.items || state.currentPacket.attachments || [];
   if (!attachments.length) {
-    setViewerState("Card has no Trello attachments to index.");
+    setViewerState("La tarjeta no tiene adjuntos de Trello para indexar.");
     return;
   }
   if (!state.workspace?.exists) {
-    setViewerState("Create the workspace folder first.");
+    setViewerState("Primero crea la carpeta del espacio de trabajo.");
     return;
   }
   els.indexTrelloBtn.disabled = true;
-  setViewerState(`Indexing ${attachments.length} Trello attachment(s)...`);
+  setViewerState(`Indexando ${attachments.length} adjunto(s) de Trello...`);
   try {
     const batch = [];
     for (let i = 0; i < attachments.length; i += 1) {
@@ -1308,7 +1326,7 @@ async function indexTrelloAttachments(attachmentsOverride = null) {
       const proxyUrl = att.proxyUrl;
       if (!proxyUrl) continue;
       const fileName = att.fileName || att.name || `attachment_${attachmentId}`;
-      setViewerState(`Indexing Trello ${i + 1}/${attachments.length}: ${fileName}`);
+      setViewerState(`Indexando Trello ${i + 1}/${attachments.length}: ${fileName}`);
       const { buffer, contentType } = await fetchArrayBuffer(proxyUrl);
       const record = await buildIndexRecord({
         source: "trello",
@@ -1331,9 +1349,9 @@ async function indexTrelloAttachments(attachmentsOverride = null) {
     await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: batch });
     await loadWorkspaceStatus(state.currentPacket);
     refreshTokenEstimate();
-    setViewerState(`Indexed ${batch.length} Trello attachment(s).`);
+    setViewerState(`Se indexaron ${batch.length} adjunto(s) de Trello.`);
   } catch (err) {
-    setViewerState(`Trello indexing failed: ${err.message}`);
+    setViewerState(`Falló la indexación de Trello: ${err.message}`);
   } finally {
     els.indexTrelloBtn.disabled = false;
   }
@@ -1342,7 +1360,7 @@ async function indexTrelloAttachments(attachmentsOverride = null) {
 async function prepareReview() {
   if (!state.selectedCard) return;
   els.prepareReviewBtn.disabled = true;
-  setViewerState("Preparing review...");
+  setViewerState("Preparando revisión...");
   try {
     const packet = await apiGet(`/api/cards/${state.selectedCard.id}/packet`);
     state.currentPacket = packet.packet;
@@ -1381,12 +1399,12 @@ async function prepareReview() {
     await loadWorkspaceStatus(state.currentPacket);
     refreshTokenEstimate();
     if (state.workspaceStatus?.readyForRun) {
-      setViewerState("Review is prepared and ready to run.");
+      setViewerState("La revisión está preparada y lista para ejecutarse.");
     } else {
-      setViewerState(state.workspaceStatus?.blockingMessage || state.workspaceStatus?.summary || "Preparation updated.");
+      setViewerState(state.workspaceStatus?.blockingMessage || state.workspaceStatus?.summary || "Se actualizó la preparación.");
     }
   } catch (err) {
-    setViewerState(`Prepare failed: ${err.message}`);
+    setViewerState(`Falló la preparación: ${err.message}`);
   } finally {
     els.prepareReviewBtn.disabled = false;
   }
@@ -1395,7 +1413,7 @@ async function prepareReview() {
 async function runChecklist() {
   if (!state.selectedCard || !state.workspaceStatus?.readyForRun) return;
   els.runChecklistBtn.disabled = true;
-  setViewerState("Running review...");
+  setViewerState("Ejecutando revisión...");
   try {
     const data = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/run`, {
       model: els.modelInput.value,
@@ -1406,9 +1424,9 @@ async function runChecklist() {
     renderWorkspace();
     renderResults();
     if (state.runResult) setMainTab("results");
-    setViewerState("Execution complete.");
+    setViewerState("Ejecución completada.");
   } catch (err) {
-    setViewerState(`Execution failed: ${err.message}`);
+    setViewerState(`Falló la ejecución: ${err.message}`);
   } finally {
     els.runChecklistBtn.disabled = false;
   }
@@ -1423,7 +1441,7 @@ async function refreshTokenEstimate() {
       model: els.modelInput.value,
       cardPacket: state.currentPacket,
     });
-    state.tokenEstimate = data.estimate || { error: "Unknown error" };
+    state.tokenEstimate = data.estimate || { error: "Error desconocido" };
     renderTokenEstimate();
   } catch (err) {
     state.tokenEstimate = { error: err.message };
@@ -1436,8 +1454,8 @@ async function loadSelectedRun() {
   try {
     state.runResult = await apiGet(`/api/cards/${state.selectedCard.id}/workspace/runs/${encodeURIComponent(els.runHistorySelect.value)}`);
     renderResults();
-    setViewerState("History loaded.");
-  } catch (err) { setViewerState(`History load failed: ${err.message}`); }
+    setViewerState("Historial cargado.");
+  } catch (err) { setViewerState(`Falló la carga del historial: ${err.message}`); }
 }
 
 /* Modals & Citations */
@@ -1590,21 +1608,21 @@ function renderPdfHighlightRects(layer, rects) {
 
 async function openCitation(citation) {
   try {
-    if (!citation?.source_key) throw new Error("Citation missing source_key");
-    setViewerState(`Opening evidence ${citation.source_key} -> ${citation.anchor_id}...`);
+    if (!citation?.source_key) throw new Error("La cita no incluye source_key");
+    setViewerState(`Abriendo evidencia ${citation.source_key} → ${citation.anchor_id}...`);
     const indexResp = await getIndexBySourceKey(citation.source_key);
     els.modalCitationTitle.textContent = `${citation.source_key} → ${citation.anchor_id}`;
     els.modalCitationMeta.textContent = [
       `${citationEffectLabel(citation.effect)}`,
-      `validation=${citationValidationLabel(citation)}`,
-      citation.page ? `page=${citation.page}` : null,
-      citation.sheet ? `sheet=${citation.sheet}` : null,
+      `validación=${citationValidationLabel(citation)}`,
+      citation.page ? `página=${citation.page}` : null,
+      citation.sheet ? `hoja=${citation.sheet}` : null,
     ].filter(Boolean).join(" • ");
     await renderCitationDocument(indexResp, citation);
     els.citationModal.setAttribute("aria-hidden", "false");
-    setViewerState(`Evidence opened (${citationValidationLabel(citation)}).`);
+    setViewerState(`Evidencia abierta (${citationValidationLabel(citation)}).`);
   } catch (err) {
-    setViewerState(`Failed to open evidence: ${err.message}`);
+    setViewerState(`No se pudo abrir la evidencia: ${err.message}`);
   }
 }
 
@@ -1646,14 +1664,14 @@ async function renderCitationDocument(indexResp, citation) {
     renderTextCitation(index, citation);
     return;
   }
-  els.citationDocView.innerHTML = `<div class="json-box">Unsupported viewer for <code>${escapeHtml(fileKind)}</code>.</div>`;
+  els.citationDocView.innerHTML = `<div class="json-box">No hay visor compatible para <code>${escapeHtml(fileKind)}</code>.</div>`;
 }
 
 function renderDocxCitation(index, citation) {
   const html = index?.render?.html || "";
   const box = document.createElement("div");
   box.className = "docx-html-box";
-  box.innerHTML = html || "<p class='inline-meta'>No DOCX HTML preview stored.</p>";
+  box.innerHTML = html || "<p class='inline-meta'>No hay una vista previa HTML de DOCX almacenada.</p>";
   els.citationDocView.appendChild(box);
   const target = box.querySelector(`[data-anchor-id="${CSS.escape(citation.anchor_id || "")}"]`);
   if (target) {
@@ -1679,7 +1697,7 @@ function renderXlsxCitation(index, citation) {
   wrapper.className = "xlsx-box";
   const wb = index?.render?.workbook || [];
   if (!wb.length) {
-    wrapper.textContent = "No workbook preview stored.";
+    wrapper.textContent = "No hay una vista previa del libro almacenada.";
     els.citationDocView.appendChild(wrapper);
     return;
   }
@@ -1691,7 +1709,7 @@ function renderXlsxCitation(index, citation) {
   const sheetPicker = document.createElement("div");
   sheetPicker.className = "pdf-toolbar";
   const label = document.createElement("span");
-  label.textContent = `Sheet: ${activeSheet.sheet}`;
+  label.textContent = `Hoja: ${activeSheet.sheet}`;
   sheetPicker.appendChild(label);
   wrapper.appendChild(sheetPicker);
 
@@ -1711,7 +1729,7 @@ function renderXlsxCitation(index, citation) {
 
   const headTr = document.createElement("tr");
   const rowHead = document.createElement("th");
-  rowHead.textContent = "Row";
+  rowHead.textContent = "Fila";
   headTr.appendChild(rowHead);
   for (const c of cols) {
     const th = document.createElement("th");
@@ -1732,7 +1750,7 @@ function renderXlsxCitation(index, citation) {
       if (cell) {
         td.setAttribute("data-cell-anchor", `${activeSheet.sheet}!${cell.addr}`);
         td.textContent = cell.display || "";
-        if (cell.formula) td.title = `formula: ${cell.formula}`;
+        if (cell.formula) td.title = `fórmula: ${cell.formula}`;
       }
       tr.appendChild(td);
     }
@@ -1754,7 +1772,7 @@ function renderTextCitation(index, citation) {
   wrap.className = "json-box";
   const pre = document.createElement("pre");
   pre.style.margin = "0";
-  pre.textContent = index?.render?.text || "No text preview.";
+  pre.textContent = index?.render?.text || "No hay vista previa de texto.";
   wrap.appendChild(pre);
   els.citationDocView.appendChild(wrap);
 
@@ -1762,7 +1780,7 @@ function renderTextCitation(index, citation) {
   if (seg) {
     const note = document.createElement("div");
     note.className = "inline-meta";
-    note.textContent = `Anchor: ${seg.anchor_id} • Quote: ${citation.quote || ""}`;
+    note.textContent = `Ancla: ${seg.anchor_id} • Cita: ${citation.quote || ""}`;
     els.citationDocView.prepend(note);
   }
 }
@@ -1773,14 +1791,14 @@ function renderImageCitation(indexResp, citation) {
   const wrap = document.createElement("div");
   wrap.className = "docx-html-box";
   if (!fetchUrl) {
-    wrap.textContent = "Image source unavailable.";
+    wrap.textContent = "La fuente de la imagen no está disponible.";
     els.citationDocView.appendChild(wrap);
     return;
   }
   wrap.innerHTML = `
-    <div class="inline-meta">Image citations are image-level in MVP (no OCR/region anchors yet).</div>
-    <img src="${escapeHtml(fetchUrl)}" alt="cited image" style="max-width:100%; height:auto; margin-top:8px; border-radius:8px; border:1px solid rgba(33,31,28,0.08);" />
-    <div class="inline-meta" style="margin-top:8px;">Reason: ${escapeHtml(citation.reason || "")}</div>
+    <div class="inline-meta">Las citas de imagen son a nivel de imagen en este MVP (todavía sin OCR ni anclas por región).</div>
+    <img src="${escapeHtml(fetchUrl)}" alt="imagen citada" style="max-width:100%; height:auto; margin-top:8px; border-radius:8px; border:1px solid rgba(33,31,28,0.08);" />
+    <div class="inline-meta" style="margin-top:8px;">Motivo: ${escapeHtml(citation.reason || "")}</div>
   `;
   els.citationDocView.appendChild(wrap);
 }
@@ -1790,7 +1808,7 @@ async function getPdfDocForSource(indexResp) {
   const sourceKey = indexResp.sourceKey;
   if (state.pdfCache.has(sourceKey)) return state.pdfCache.get(sourceKey);
   const fetchUrl = sourceLocatorToFetchUrl(summary);
-  if (!fetchUrl) throw new Error("PDF binary source unavailable");
+  if (!fetchUrl) throw new Error("La fuente binaria del PDF no está disponible");
   const { buffer } = await fetchArrayBuffer(fetchUrl);
   const pdf = await window.pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
   state.pdfCache.set(sourceKey, { pdf, buffer });
@@ -1798,7 +1816,7 @@ async function getPdfDocForSource(indexResp) {
 }
 
 async function renderPdfCitation(indexResp, citation) {
-  if (!window.pdfjsLib) throw new Error("pdf.js library not loaded");
+  if (!window.pdfjsLib) throw new Error("La biblioteca pdf.js no se cargó");
   const index = indexResp.index || {};
   const pageFromAnchor = Number(String(citation.anchor_id || "").replace("page_", ""));
   const pageNum = Number.isFinite(pageFromAnchor) && pageFromAnchor > 0 ? pageFromAnchor : Math.max(1, Number(citation.page) || 1);
@@ -1808,7 +1826,7 @@ async function renderPdfCitation(indexResp, citation) {
   const toolbar = document.createElement("div");
   toolbar.className = "pdf-toolbar";
   const pageLabel = document.createElement("span");
-  pageLabel.textContent = `Page ${pageNum}`;
+  pageLabel.textContent = `Página ${pageNum}`;
   toolbar.appendChild(pageLabel);
   wrap.appendChild(toolbar);
 
@@ -1829,7 +1847,7 @@ async function renderPdfCitation(indexResp, citation) {
   textBox.className = "pdf-text-box";
   const pageSeg = (index.segments || []).find((s) => s.anchor_id === (citation.anchor_id || `page_${pageNum}`));
   const pageText = pageSeg?.text || "";
-  textBox.innerHTML = `<div data-anchor-id="${escapeHtml(pageSeg?.anchor_id || `page_${pageNum}`)}">${escapeHtml(pageText || "(No extractable text on this page. Possibly scanned/image-only PDF.)")}</div>`;
+  textBox.innerHTML = `<div data-anchor-id="${escapeHtml(pageSeg?.anchor_id || `page_${pageNum}`)}">${escapeHtml(pageText || "(No hay texto extraíble en esta página. Posiblemente es un PDF escaneado o solo de imagen.)")}</div>`;
   wrap.appendChild(textBox);
 
   els.citationDocView.appendChild(wrap);
@@ -1868,9 +1886,9 @@ async function renderPdfCitation(indexResp, citation) {
   const highlightMeta = document.createElement("div");
   highlightMeta.className = "inline-meta";
   if (nativeHighlightCount > 0) {
-    highlightMeta.textContent = `In-document highlight applied on PDF page (${nativeHighlightCount} text region${nativeHighlightCount === 1 ? "" : "s"}).`;
+    highlightMeta.textContent = `Se aplicó resaltado dentro del documento en la página PDF (${nativeHighlightCount} región${nativeHighlightCount === 1 ? "" : "es"} de texto).`;
   } else {
-    highlightMeta.textContent = "In-document highlight unavailable for this citation on the page text layer. Showing extracted-text highlight below.";
+    highlightMeta.textContent = "No hay resaltado dentro del documento disponible para esta cita en la capa de texto de la página. Se muestra abajo el resaltado del texto extraído.";
   }
   toolbar.appendChild(highlightMeta);
 }
@@ -1923,7 +1941,7 @@ function verifyLibraries() {
   if (!window.XLSX) missing.push("xlsx");
   if (!window.pdfjsLib) missing.push("pdf.js");
   if (missing.length) {
-    setViewerState(`Some viewer/indexer libraries failed to load: ${missing.join(", ")}`);
+    setViewerState(`No se pudieron cargar algunas bibliotecas del visor o indexador: ${missing.join(", ")}`);
   }
 }
 

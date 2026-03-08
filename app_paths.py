@@ -69,7 +69,7 @@ def _pick_first_writable_dir(candidates: List[Path]) -> Path:
         except OSError:
             continue
         return candidate
-    raise RuntimeError("Unable to create a writable application data folder")
+    raise RuntimeError("No se pudo crear una carpeta de datos de la aplicación con permiso de escritura")
 
 
 def _default_visible_data_dir() -> Path:
@@ -111,7 +111,7 @@ def _choose_data_dir_interactively(initial_dir: Path) -> Path | None:
         root.withdraw()
         root.attributes("-topmost", True)
         selected = filedialog.askdirectory(
-            title="Choose where Trello App should store its checklist and review files",
+            title="Elige dónde debe guardar Trello Review sus archivos de Checklist y revisión",
             initialdir=str(initial_dir),
             mustexist=False,
         )

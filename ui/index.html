@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="es">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Review Workbench</title>
+    <title>Trello Review</title>
     <link rel="stylesheet" href="/styles.css" />
     <script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js" defer></script>
     <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" defer></script>
@@ -18,22 +18,22 @@
         <div class="sidebar-header">
           <div class="brand">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><rect x="7" y="7" width="3" height="9"></rect><rect x="14" y="7" width="3" height="5"></rect></svg>
-            <h1>Review Workbench</h1>
+            <h1>Trello Review</h1>
           </div>
-          <span id="identity" class="badge">Offline</span>
+          <span id="identity" class="badge">Sin conexión</span>
         </div>
 
         <div class="sidebar-content">
           <div class="section">
             <div class="section-header">
-              <h2>Boards</h2>
-              <button id="refreshBoardsBtn" class="icon-btn" title="Refresh Boards">
+              <h2>Tableros</h2>
+              <button id="refreshBoardsBtn" class="icon-btn" title="Actualizar tableros">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 1 0 2.13-5.87L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 1 0-2.13 5.87L3 16"></path></svg>
               </button>
             </div>
             <div class="input-icon-wrapper">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-              <input id="boardSearch" type="text" placeholder="Filter boards..." />
+              <input id="boardSearch" type="text" placeholder="Filtrar tableros..." />
             </div>
             <div class="list-container">
               <ul id="boardsList" class="nav-list"></ul>
@@ -42,17 +42,17 @@
 
           <div class="section flex-grow">
             <div class="section-header">
-              <h2>Cards</h2>
+              <h2>Tarjetas</h2>
               <div class="controls-row">
-                <input id="cardLimit" type="number" min="1" max="500" value="100" class="mini-input" title="Limit" />
-                <button id="loadCardsBtn" class="action-btn sm" disabled>Load</button>
+                <input id="cardLimit" type="number" min="1" max="500" value="100" class="mini-input" title="Límite" />
+                <button id="loadCardsBtn" class="action-btn sm" disabled>Cargar</button>
               </div>
             </div>
             <div class="input-icon-wrapper">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-              <input id="cardSearch" type="text" placeholder="Search cards..." />
+              <input id="cardSearch" type="text" placeholder="Buscar tarjetas..." />
             </div>
-            <div id="selectedBoardMeta" class="meta-text">No board selected.</div>
+            <div id="selectedBoardMeta" class="meta-text">No hay ningún tablero seleccionado.</div>
             <div class="list-container">
               <ul id="cardsList" class="nav-list card-nav-list"></ul>
             </div>
@@ -64,19 +64,19 @@
       <main class="main-view">
         <header class="top-header glass-panel">
           <div class="header-status">
-            <span id="cardBadge" class="status-pill">No Card Selected</span>
-            <span id="viewerState" class="status-message">Awaiting selection.</span>
+            <span id="cardBadge" class="status-pill">Ninguna tarjeta seleccionada</span>
+            <span id="viewerState" class="status-message">Esperando selección.</span>
           </div>
           <div class="header-actions">
-            <button id="copyMdBtn" class="action-btn outline sm" disabled>Copy Markdown</button>
+            <button id="copyMdBtn" class="action-btn outline sm" disabled>Copiar Markdown</button>
           </div>
         </header>
 
         <nav class="view-tabs">
-          <button class="view-tab active" data-ptab="workspace">Workspace</button>
-          <button class="view-tab" data-ptab="checklist">Checklist Engine</button>
-          <button class="view-tab" data-ptab="results">Analysis Results</button>
-          <button class="view-tab" data-ptab="viewer">Packet Viewer</button>
+          <button class="view-tab active" data-ptab="workspace">Espacio de trabajo</button>
+          <button class="view-tab" data-ptab="checklist">Motor de Checklist</button>
+          <button class="view-tab" data-ptab="results">Resultados del análisis</button>
+          <button class="view-tab" data-ptab="viewer">Visor del paquete</button>
           <div class="tab-indicator"></div>
         </nav>
 
@@ -86,55 +86,55 @@
             <div class="content-wrapper">
               <div class="toolbar glass-panel">
                 <div class="toolbar-group">
-                  <button id="prepareReviewBtn" class="action-btn primary" disabled>Prepare Review</button>
-                  <button id="uploadWorkspaceFilesBtn" class="action-btn outline" disabled>Upload Files</button>
-                  <button id="refreshWorkspaceBtn" class="action-btn outline" disabled>Refresh Status</button>
+                  <button id="prepareReviewBtn" class="action-btn primary" disabled>Preparar revisión</button>
+                  <button id="uploadWorkspaceFilesBtn" class="action-btn outline" disabled>Subir archivos</button>
+                  <button id="refreshWorkspaceBtn" class="action-btn outline" disabled>Actualizar estado</button>
                   <details class="advanced-tools">
-                    <summary>Advanced</summary>
+                    <summary>Avanzado</summary>
                     <div class="advanced-tools-panel">
-                      <button id="createWorkspaceBtn" class="action-btn outline" disabled>Initialize Folder</button>
-                      <button id="indexLocalBtn" class="action-btn outline" disabled>Reindex Local</button>
-                      <button id="indexTrelloBtn" class="action-btn outline" disabled>Reindex Trello</button>
+                      <button id="createWorkspaceBtn" class="action-btn outline" disabled>Inicializar carpeta</button>
+                      <button id="indexLocalBtn" class="action-btn outline" disabled>Reindexar archivos locales</button>
+                      <button id="indexTrelloBtn" class="action-btn outline" disabled>Reindexar Trello</button>
                     </div>
                   </details>
                 </div>
                 <div class="toolbar-divider"></div>
                 <div class="toolbar-group">
                   <div class="field-group row">
-                    <label>Model</label>
+                    <label>Modelo</label>
                     <input id="modelInput" type="text" value="gpt-5.4" class="compact-input" />
                   </div>
                   <div class="field-group row">
-                    <label>Reasoning</label>
+                    <label>Razonamiento</label>
                     <select id="reasoningEffortSelect" class="compact-input">
-                      <option value="minimal">Minimal</option>
-                      <option value="low">Low</option>
-                      <option value="medium">Medium</option>
-                      <option value="high" selected>High</option>
+                      <option value="minimal">Mínimo</option>
+                      <option value="low">Bajo</option>
+                      <option value="medium">Medio</option>
+                      <option value="high" selected>Alto</option>
                     </select>
                   </div>
-                  <button id="runChecklistBtn" class="action-btn outline" disabled>Run Review</button>
+                  <button id="runChecklistBtn" class="action-btn outline" disabled>Ejecutar revisión</button>
                 </div>
               </div>
 
               <div class="info-grid">
                 <div class="info-cell">
-                  <h3>Token Estimation</h3>
-                  <div id="tokenEstimate" class="mono-text muted">No card selected.</div>
+                  <h3>Estimación de tokens</h3>
+                  <div id="tokenEstimate" class="mono-text muted">No hay ninguna tarjeta seleccionada.</div>
                 </div>
                 <div class="info-cell">
-                  <h3>Review Readiness</h3>
-                  <div id="workspaceMeta" class="mono-text muted">Not initialized.</div>
+                  <h3>Estado de la revisión</h3>
+                  <div id="workspaceMeta" class="mono-text muted">Sin inicializar.</div>
                 </div>
               </div>
 
               <div class="data-split">
                 <div class="data-col">
-                  <h3>Local Files <span class="mono-sub">/attachments</span></h3>
+                  <h3>Archivos locales <span class="mono-sub">/attachments</span></h3>
                   <ul id="localFilesList" class="data-list"></ul>
                 </div>
                 <div class="data-col">
-                  <h3>Trello Attachments</h3>
+                  <h3>Adjuntos de Trello</h3>
                   <ul id="indexesList" class="data-list"></ul>
                 </div>
               </div>
@@ -146,33 +146,33 @@
             <div class="content-wrapper">
               <div class="pane-header">
                 <div>
-                  <h2 class="display-title">Checklist Configuration</h2>
-                  <div id="checklistStatus" class="meta-text">Awaiting load...</div>
+                  <h2 class="display-title">Configuración del Checklist</h2>
+                  <div id="checklistStatus" class="meta-text">Esperando carga...</div>
                 </div>
                 <div class="pane-actions">
-                  <button id="loadChecklistBtn" class="action-btn outline">Reload</button>
-                  <button id="resetChecklistBtn" class="action-btn outline">Use App Default</button>
-                  <button id="importChecklistBtn" class="action-btn outline">Import</button>
-                  <button id="exportChecklistBtn" class="action-btn outline">Export</button>
-                  <button id="saveChecklistBtn" class="action-btn primary">Commit Changes</button>
+                  <button id="loadChecklistBtn" class="action-btn outline">Recargar</button>
+                  <button id="resetChecklistBtn" class="action-btn outline">Usar el predeterminado de la app</button>
+                  <button id="importChecklistBtn" class="action-btn outline">Importar</button>
+                  <button id="exportChecklistBtn" class="action-btn outline">Exportar</button>
+                  <button id="saveChecklistBtn" class="action-btn primary">Guardar cambios</button>
                 </div>
               </div>
               
               <div class="form-layout">
                 <div class="form-row split">
                   <div class="field-group">
-                    <label>Checklist Name</label>
-                    <input id="checklistNameInput" type="text" placeholder="e.g. Standard Review" />
+                    <label>Nombre del Checklist</label>
+                    <input id="checklistNameInput" type="text" placeholder="p. ej. Revisión estándar" />
                   </div>
                   <div class="field-group">
-                    <label>Global Instructions</label>
-                    <textarea id="checklistInstructionsInput" rows="1" placeholder="Directives for the LLM..."></textarea>
+                    <label>Instrucciones globales</label>
+                    <textarea id="checklistInstructionsInput" rows="1" placeholder="Indicaciones para el LLM..."></textarea>
                   </div>
                 </div>
 
                 <div class="items-header">
-                  <h3>Evaluation Criteria</h3>
-                  <button id="addChecklistItemBtn" class="action-btn outline sm">Add Criterion</button>
+                  <h3>Criterios de evaluación</h3>
+                  <button id="addChecklistItemBtn" class="action-btn outline sm">Agregar criterio</button>
                 </div>
                 
                 <div id="checklistItemsList" class="items-stack"></div>
@@ -185,12 +185,12 @@
             <div class="content-wrapper">
               <div class="pane-header">
                 <div>
-                  <h2 class="display-title">Analysis Results</h2>
-                  <div id="runSummary" class="meta-text">No run loaded.</div>
+                  <h2 class="display-title">Resultados del análisis</h2>
+                  <div id="runSummary" class="meta-text">No hay ninguna ejecución cargada.</div>
                 </div>
                 <div class="pane-actions row">
                   <select id="runHistorySelect" class="compact-input"></select>
-                  <button id="loadRunBtn" class="action-btn outline" disabled>Load History</button>
+                  <button id="loadRunBtn" class="action-btn outline" disabled>Cargar historial</button>
                 </div>
               </div>
               
@@ -202,9 +202,9 @@
           <div class="pane" id="ptab-viewer">
             <div class="content-wrapper no-pad">
               <div class="inner-tabs">
-                <button class="inner-tab active" data-tab="packet-rendered">Rendered</button>
+                <button class="inner-tab active" data-tab="packet-rendered">Renderizado</button>
                 <button class="inner-tab" data-tab="packet-markdown">Markdown</button>
-                <button class="inner-tab" data-tab="packet-json">JSON payload</button>
+                <button class="inner-tab" data-tab="packet-json">Payload JSON</button>
               </div>
               <div class="viewer-container">
                 <div id="packetRenderedView" class="doc-render tab-pane active"></div>
@@ -222,7 +222,7 @@
       <div class="modal-window">
         <div class="modal-header glass-panel">
           <div class="modal-title-group">
-            <h3 class="modal-title">Evidence Viewer</h3>
+            <h3 class="modal-title">Visor de evidencia</h3>
             <div id="modalCitationTitle" class="mono-text">source_id -> anchor</div>
             <div id="modalCitationMeta" class="mono-text muted"></div>
           </div>
