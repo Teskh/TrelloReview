@@ -239,6 +239,10 @@ def _attachments_dir(ws_dir: Path) -> Path:
     return ws_dir / "attachments"
 
 
+def _trello_cache_dir(ws_dir: Path) -> Path:
+    return ws_dir / "trello_attachments"
+
+
 def _default_manifest(card_id: str) -> Dict[str, Any]:
     return {
         "version": 1,
@@ -288,6 +292,7 @@ def ensure_card_workspace(
     ws_dir = existing or _card_workspace_dir(paths, card_id, card_name)
     ws_dir.mkdir(parents=True, exist_ok=True)
     _attachments_dir(ws_dir).mkdir(parents=True, exist_ok=True)
+    _trello_cache_dir(ws_dir).mkdir(parents=True, exist_ok=True)
     _indexes_dir(ws_dir).mkdir(parents=True, exist_ok=True)
     _runs_dir(ws_dir).mkdir(parents=True, exist_ok=True)
     meta = {
@@ -714,6 +719,34 @@ def _index_filename(source_key: str, file_kind: str) -> str:
     return f"{file_kind}__{_sha1_text(source_key)[:16]}{ext}"
 
 
+def _safe_filename(name: str, fallback: str) -> str:
+    base = Path((name or "").replace("\\", "/")).name.strip()
+    if not base:
+        base = fallback
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._")
+    return cleaned[:180] or fallback
+
+
+def _store_trello_attachment_cache(
+    *,
+    ws_dir: Path,
+    attachment_id: str,
+    display_name: str,
+    content_base64: str,
+) -> str:
+    try:
+        body = base64.b64decode(content_base64.encode("ascii"), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError(f"El adjunto de Trello {attachment_id} tiene contenido base64 no válido") from exc
+    cache_dir = _trello_cache_dir(ws_dir)
+    filename = f"{attachment_id}__{_safe_filename(display_name, attachment_id)}"
+    target = (cache_dir / filename).resolve()
+    if cache_dir.resolve() not in [target, *target.parents]:
+        raise ValueError(f"Ruta de caché no válida para el adjunto de Trello {attachment_id}")
+    target.write_bytes(body)
+    return target.relative_to(ws_dir).as_posix()
+
+
 def save_indexes_for_card(
     paths: WorkbenchPaths,
     *,
@@ -790,6 +823,20 @@ def save_indexes_for_card(
             trello_meta = payload.get("trelloAttachment") or {}
             attachment_id = str(trello_meta.get("attachmentId") or trello_meta.get("id") or "").strip()
             if attachment_id:
+                cached_file = None
+                raw_content = payload.get("contentBase64")
+                if isinstance(raw_content, str) and raw_content.strip():
+                    cached_file = _store_trello_attachment_cache(
+                        ws_dir=ws_dir,
+                        attachment_id=attachment_id,
+                        display_name=str(trello_meta.get("name") or payload.get("displayName") or attachment_id),
+                        content_base64=raw_content.strip(),
+                    )
+                    locator = index_summary.get("source_locator") or {}
+                    if isinstance(locator, dict):
+                        locator = dict(locator)
+                        locator["cachedRelativePath"] = cached_file
+                        index_summary["source_locator"] = locator
                 manifest["trello_sources"][attachment_id] = {
                     "attachment_id": attachment_id,
                     "source_key": source_key,
@@ -800,6 +847,7 @@ def save_indexes_for_card(
                     "last_indexed_at": utc_now_iso(),
                     "proxy_url": trello_meta.get("proxyUrl"),
                     "source_url": trello_meta.get("sourceUrl"),
+                    "cached_file": cached_file,
                     "warnings": index_summary["warnings"],
                 }
 
@@ -1024,14 +1072,19 @@ def estimate_llm_input_tokens_for_card(
 ) -> Dict[str, Any]:
     checklist = load_checklist(paths)
     try:
-        evidence, _ = _collect_evidence_segments(paths, card_id)
+        prep = get_card_workspace_status(paths, card_id=card_id, card_packet=card_packet).get("prep") or {}
+        valid_source_keys = prep.get("validSourceKeys")
+        evidence, _ = _collect_evidence_segments(paths, card_id, allowed_source_keys=valid_source_keys)
+        multimodal_assets = _collect_multimodal_assets(paths, card_id, allowed_source_keys=valid_source_keys)
         workspace_exists = True
     except FileNotFoundError:
         evidence = []
+        multimodal_assets = []
         workspace_exists = False
     return estimate_review_input_tokens(
         checklist=checklist,
         evidence=evidence,
+        multimodal_assets=multimodal_assets,
         card_id=card_id,
         card_name=card_name,
         card_url=card_url,
@@ -1041,6 +1094,218 @@ def estimate_llm_input_tokens_for_card(
     )
 
 
+MULTIMODAL_MAX_TOTAL_BYTES = max(1, int(float(os.getenv("OPENAI_MULTIMODAL_MAX_BYTES", str(40 * 1024 * 1024)))))
+MULTIMODAL_SUPPORTED_IMAGE_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+}
+
+
+def _resolve_workspace_file(ws_dir: Path, rel_path: str) -> Path:
+    candidate = (ws_dir / rel_path).resolve()
+    if ws_dir.resolve() not in [candidate, *candidate.parents]:
+        raise ValueError("Ruta del espacio de trabajo no válida")
+    return candidate
+
+
+def _source_path_for_multimodal_asset(
+    paths: WorkbenchPaths,
+    *,
+    ws_dir: Path,
+    manifest: Dict[str, Any],
+    source_key: str,
+    entry: Dict[str, Any],
+) -> Optional[Path]:
+    locator = entry.get("source_locator") or {}
+    if isinstance(locator, dict):
+        if locator.get("type") == "local_file":
+            rel = str(locator.get("relativePath") or "").strip()
+            if rel:
+                try:
+                    return get_local_file_path(paths, manifest.get("card_id") or "", rel)
+                except Exception:
+                    return None
+        if locator.get("type") == "trello_attachment":
+            cached_rel = str(locator.get("cachedRelativePath") or "").strip()
+            if cached_rel:
+                try:
+                    path = _resolve_workspace_file(ws_dir, cached_rel)
+                    if path.is_file():
+                        return path
+                except Exception:
+                    return None
+
+    for rel, local_entry in (manifest.get("local_files") or {}).items():
+        if not isinstance(local_entry, dict) or local_entry.get("source_key") != source_key:
+            continue
+        try:
+            return get_local_file_path(paths, manifest.get("card_id") or "", str(rel))
+        except Exception:
+            return None
+
+    for attachment_id, trello_entry in (manifest.get("trello_sources") or {}).items():
+        if not isinstance(trello_entry, dict) or trello_entry.get("source_key") != source_key:
+            continue
+        cached_rel = str(trello_entry.get("cached_file") or "").strip()
+        if not cached_rel:
+            continue
+        try:
+            path = _resolve_workspace_file(ws_dir, cached_rel)
+            if path.is_file():
+                return path
+        except Exception:
+            return None
+    return None
+
+
+def _collect_multimodal_assets(
+    paths: WorkbenchPaths,
+    card_id: str,
+    allowed_source_keys: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        raise FileNotFoundError("No se encontró el espacio de trabajo")
+    manifest = _load_manifest(ws_dir, card_id)
+    idx_entries = manifest.get("indexes") or {}
+    allowed = {str(key).strip() for key in (allowed_source_keys or []) if str(key).strip()} if allowed_source_keys else None
+    assets: List[Dict[str, Any]] = []
+    for source_key, entry in idx_entries.items():
+        if not isinstance(entry, dict):
+            continue
+        if allowed is not None and source_key not in allowed:
+            continue
+        file_kind = str(entry.get("file_kind") or "").lower()
+        mime_type = str(entry.get("mime_type") or detect_mime_from_name(str(entry.get("display_name") or ""))).split(";")[0].lower()
+        if file_kind not in {"image", "pdf"}:
+            continue
+        source_path = _source_path_for_multimodal_asset(
+            paths,
+            ws_dir=ws_dir,
+            manifest=manifest,
+            source_key=source_key,
+            entry=entry,
+        )
+        if not source_path or not source_path.is_file():
+            continue
+        byte_size = source_path.stat().st_size
+        if file_kind == "image" and mime_type not in MULTIMODAL_SUPPORTED_IMAGE_MIME_TYPES:
+            continue
+        assets.append(
+            {
+                "source_key": source_key,
+                "display_name": entry.get("display_name") or source_path.name,
+                "file_kind": file_kind,
+                "mime_type": mime_type,
+                "byte_size": byte_size,
+                "source_path": str(source_path),
+                "anchor_hint": "image_full" if file_kind == "image" else "page_<n>",
+                "warnings": entry.get("warnings") or [],
+            }
+        )
+    assets.sort(key=lambda row: (str(row.get("source_key") or ""), str(row.get("display_name") or "")))
+    return assets
+
+
+def _multimodal_summary_payload(assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "source_key": asset.get("source_key"),
+            "display_name": asset.get("display_name"),
+            "file_kind": asset.get("file_kind"),
+            "mime_type": asset.get("mime_type"),
+            "byte_size": asset.get("byte_size"),
+            "anchor_hint": asset.get("anchor_hint"),
+            "warnings": asset.get("warnings") or [],
+        }
+        for asset in assets
+    ]
+
+
+def _build_multimodal_user_content(
+    *,
+    user_payload: Dict[str, Any],
+    multimodal_assets: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    content: List[Dict[str, Any]] = []
+    if multimodal_assets:
+        content.append(
+            {
+                "type": "input_text",
+                "text": (
+                    "Multimodal evidence assets are attached below. "
+                    "Use them together with the indexed evidence_documents. "
+                    "For image files, cite anchor_id=image_full. "
+                    "For PDFs, cite page anchors like page_1, page_2, etc. "
+                    "If the relevant evidence is visual only, leave quote empty."
+                ),
+            }
+        )
+        total_bytes = 0
+        omitted_assets: List[str] = []
+        for asset in multimodal_assets:
+            byte_size = int(asset.get("byte_size") or 0)
+            if byte_size <= 0:
+                continue
+            if total_bytes + byte_size > MULTIMODAL_MAX_TOTAL_BYTES:
+                omitted_assets.append(str(asset.get("source_key") or "?"))
+                continue
+            source_path = Path(str(asset.get("source_path") or ""))
+            if not source_path.is_file():
+                omitted_assets.append(str(asset.get("source_key") or "?"))
+                continue
+            raw = source_path.read_bytes()
+            if len(raw) != byte_size:
+                byte_size = len(raw)
+            total_bytes += byte_size
+            source_key = str(asset.get("source_key") or "?")
+            file_kind = str(asset.get("file_kind") or "")
+            display_name = str(asset.get("display_name") or source_path.name)
+            anchor_hint = str(asset.get("anchor_hint") or "")
+            content.append(
+                {
+                    "type": "input_text",
+                    "text": (
+                        f"Multimodal asset for source_key={source_key}; "
+                        f"display_name={display_name}; file_kind={file_kind}; anchor_hint={anchor_hint}."
+                    ),
+                }
+            )
+            if file_kind == "pdf":
+                mime_type = str(asset.get("mime_type") or "application/pdf")
+                content.append(
+                    {
+                        "type": "input_file",
+                        "filename": source_path.name,
+                        "file_data": f"data:{mime_type};base64,{base64.b64encode(raw).decode('ascii')}",
+                    }
+                )
+            elif file_kind == "image":
+                mime_type = str(asset.get("mime_type") or "image/png")
+                content.append(
+                    {
+                        "type": "input_image",
+                        "detail": "high",
+                        "image_url": f"data:{mime_type};base64,{base64.b64encode(raw).decode('ascii')}",
+                    }
+                )
+        if omitted_assets:
+            content.append(
+                {
+                    "type": "input_text",
+                    "text": (
+                        "The following multimodal assets were omitted from this request because the inline size limit was reached: "
+                        + ", ".join(omitted_assets)
+                        + ". Use indexed evidence only for them."
+                    ),
+                }
+            )
+    content.append({"type": "input_text", "text": json.dumps(user_payload, ensure_ascii=False)})
+    return content
+
+
 def _openai_request(
     *,
     api_key: str,
@@ -1048,14 +1313,19 @@ def _openai_request(
     reasoning_effort: str = "high",
     system_prompt: str,
     user_payload: Dict[str, Any],
+    multimodal_assets: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     timeout_seconds = max(30, int(float(os.getenv("OPENAI_HTTP_TIMEOUT_SECONDS", "600"))))
+    user_content = _build_multimodal_user_content(
+        user_payload=user_payload,
+        multimodal_assets=multimodal_assets or [],
+    )
     base_body = {
         "model": model,
         "reasoning": {"effort": reasoning_effort},
         "input": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            {"role": "user", "content": user_content},
         ],
     }
     attempts = [
@@ -1074,7 +1344,7 @@ def _openai_request(
             **base_body,
             "input": [
                 {"role": "system", "content": system_prompt + " Return strict JSON matching the requested schema."},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                {"role": "user", "content": user_content},
             ],
         },
     ]
@@ -1245,9 +1515,11 @@ def run_checklist_for_card(
     if not prep.get("readyForRun"):
         raise ValueError(str(prep.get("blockingMessage") or "Se requiere preparación antes de ejecutar la revisión."))
     checklist = load_checklist(paths)
-    evidence, index_lookup = _collect_evidence_segments(paths, card_id, allowed_source_keys=prep.get("validSourceKeys"))
+    valid_source_keys = prep.get("validSourceKeys")
+    evidence, index_lookup = _collect_evidence_segments(paths, card_id, allowed_source_keys=valid_source_keys)
     if not evidence:
         raise ValueError("No se encontró evidencia indexada después de la conciliación. Prepara la revisión primero.")
+    multimodal_assets = _collect_multimodal_assets(paths, card_id, allowed_source_keys=valid_source_keys)
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -1256,6 +1528,7 @@ def run_checklist_for_card(
     user_payload = build_review_user_payload(
         checklist=checklist,
         evidence=evidence,
+        multimodal_assets=_multimodal_summary_payload(multimodal_assets),
         card_id=card_id,
         card_name=card_name,
         card_url=card_url,
@@ -1268,6 +1541,7 @@ def run_checklist_for_card(
         reasoning_effort=reasoning_effort,
         system_prompt=build_system_prompt(),
         user_payload=user_payload,
+        multimodal_assets=multimodal_assets,
     )
     text = _response_text_from_responses_api(raw_api)
     if not text:

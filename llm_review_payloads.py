@@ -13,17 +13,18 @@ except Exception:  # pragma: no cover - optional dependency for local helper
 def build_review_system_prompt() -> str:
     return (
         "You are a meticulous document review assistant. "
-        "Evaluate checklist items using only the provided evidence segments plus the provided Trello card description/comments context. "
+        "Evaluate checklist items using only the provided evidence segments, the provided multimodal file/image assets, "
+        "plus the provided Trello card description/comments context. "
         "Return exactly one result for every checklist item, in the same order, with the same item_number and item_id. "
         "Every conclusion must cite one or more evidence anchors. "
         "Citations must reference source_key and anchor_id exactly as provided. "
         "For each citation, set effect='supports' when it supports the item conclusion, effect='contradicts' when it cuts against the conclusion, "
         "and effect='insufficient' when the cited evidence is relevant but incomplete or ambiguous. "
         "Treat card description and comments as contextual guidance; use indexed attachment evidence as the primary source for documentary claims whenever possible. "
-        "If evidence is insufficient, ambiguous, or the document is image/scanned-only without usable text, "
+        "If evidence is insufficient, ambiguous, or the document is image/scanned-only and the multimodal asset still does not resolve it, "
         "return status='needs_review' and explain what is missing. "
         "Do not invent citations. Use verbatim quotes copied from the cited segment text when available. "
-        "For image-only/scanned pages without text, set quote to an empty string and cite the page anchor."
+        "For image-only/scanned pages or image files without quoted text, set quote to an empty string and cite the mapped anchor."
     )
 
 
@@ -47,6 +48,7 @@ def build_review_user_payload(
     *,
     checklist: Dict[str, Any],
     evidence: List[Dict[str, Any]],
+    multimodal_assets: Optional[List[Dict[str, Any]]] = None,
     card_id: str,
     card_name: str,
     card_url: str,
@@ -98,8 +100,9 @@ def build_review_user_payload(
                 "contradicts": "Evidence cuts against the checklist conclusion.",
                 "insufficient": "Evidence is relevant but not enough to resolve the checklist conclusion.",
             },
-            "for_image_or_scanned_pdf_without_text": "Use page anchor citation and empty quote, then mark needs_review unless other evidence resolves the item.",
+            "for_image_or_scanned_pdf_without_text": "Use page anchor citation and empty quote; only mark needs_review if the visual evidence plus other evidence still does not resolve the item.",
         },
+        "multimodal_assets": multimodal_assets or [],
         "evidence_documents": evidence,
     }
 
@@ -123,6 +126,7 @@ def estimate_review_input_tokens(
     *,
     checklist: Dict[str, Any],
     evidence: List[Dict[str, Any]],
+    multimodal_assets: Optional[List[Dict[str, Any]]] = None,
     card_id: str,
     card_name: str,
     card_url: str,
@@ -135,6 +139,7 @@ def estimate_review_input_tokens(
     user_payload = build_review_user_payload(
         checklist=checklist,
         evidence=evidence,
+        multimodal_assets=multimodal_assets,
         card_id=card_id,
         card_name=card_name,
         card_url=card_url,
@@ -169,6 +174,8 @@ def estimate_review_input_tokens(
             "comments_count": len(comments),
             "comments_text_chars": comments_text_chars,
             "card_description_chars": len(description),
+            "multimodal_assets": len(multimodal_assets or []),
+            "multimodal_bytes": sum(int(a.get("byte_size") or 0) for a in (multimodal_assets or []) if isinstance(a, dict)),
         },
         "components": {
             "system_prompt_chars": len(system_prompt),
@@ -205,4 +212,8 @@ def estimate_review_input_tokens(
     response["notes"].append(
         "La estimación cuenta el system prompt y el contenido JSON del payload de usuario enviado al LLM. Excluye la sobrecarga del envoltorio HTTP/API y los tokens de salida."
     )
+    if multimodal_assets:
+        response["notes"].append(
+            "Los bytes multimodales reportados son el tamaño bruto de imágenes/PDF adjuntos a la solicitud; no se convierten aquí a una estimación de tokens visuales."
+        )
     return response

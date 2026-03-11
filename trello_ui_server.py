@@ -13,6 +13,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
+import ctypes
 import errno
 import json
 import os
@@ -21,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 import webbrowser
 from dataclasses import dataclass
@@ -31,6 +34,9 @@ from typing import Any, Dict, List
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
+
+if os.name == "nt":
+    from ctypes import wintypes
 
 from app_paths import resolve_app_paths
 from trello_smoke_test import TrelloClient, load_dotenv
@@ -65,11 +71,42 @@ except Exception:  # pragma: no cover - optional in local dev, bundled for deskt
     Image = None
     ImageDraw = None
 
+WINDOWS_SINGLE_INSTANCE_MUTEX: Any = None
+
 APP_PATHS = resolve_app_paths()
 ROOT_DIR = APP_PATHS.resource_root
 UI_DIR = APP_PATHS.ui_dir
 VALID_REASONING_EFFORTS = {"low", "medium", "high"}
 FIXED_OPENAI_MODEL = "gpt-5.4"
+STARTUP_LOG_PATH = APP_PATHS.settings_root / "startup.log"
+
+
+def startup_log(message: str) -> None:
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    try:
+        STARTUP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with STARTUP_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    stream = getattr(sys, "stdout", None)
+    if stream is not None:
+        try:
+            stream.write(line + "\n")
+            stream.flush()
+        except Exception:
+            pass
+
+
+def _serve_server(server: ThreadingHTTPServer, *, label: str) -> None:
+    startup_log(f"{label}: server loop starting")
+    try:
+        server.serve_forever()
+    except Exception:
+        startup_log(f"{label}: server loop crashed\n{traceback.format_exc()}")
+        raise
+    finally:
+        startup_log(f"{label}: server loop stopped")
 
 
 @dataclass
@@ -273,6 +310,36 @@ def maybe_show_error_dialog(title: str, message: str) -> None:
                 pass
 
 
+def _single_instance_mutex_name() -> str:
+    return "Local\\TrelloReviewWorkbench"
+
+
+def acquire_single_instance() -> bool:
+    global WINDOWS_SINGLE_INSTANCE_MUTEX
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return True
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.CreateMutexW(None, False, _single_instance_mutex_name())
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return False
+    WINDOWS_SINGLE_INSTANCE_MUTEX = handle
+    return True
+
+
+def release_single_instance() -> None:
+    global WINDOWS_SINGLE_INSTANCE_MUTEX
+    if not WINDOWS_SINGLE_INSTANCE_MUTEX or os.name != "nt":
+        return
+    try:
+        ctypes.windll.kernel32.CloseHandle(WINDOWS_SINGLE_INSTANCE_MUTEX)
+    except Exception:
+        pass
+    WINDOWS_SINGLE_INSTANCE_MUTEX = None
+
+
 def open_browser_soon(url: str) -> None:
     def _open() -> None:
         try:
@@ -313,18 +380,36 @@ def open_browser_when_ready(app_url: str, *, wait_seconds: float = 8.0) -> None:
     status_url = app_url.rstrip("/") + "/api/status"
 
     def _wait_then_open() -> None:
+        startup_log(f"browser: waiting for {status_url}")
         deadline = time.time() + wait_seconds
         while time.time() < deadline:
             if probe_status(status_url, timeout=1.0):
                 try:
                     webbrowser.open(app_url, new=1)
+                    startup_log(f"browser: opened {app_url}")
                 except Exception:
+                    startup_log(f"browser: failed to open {app_url}\n{traceback.format_exc()}")
                     pass
                 return
             time.sleep(0.2)
+        startup_log(f"browser: timeout waiting for {status_url}")
 
     thread = threading.Thread(target=_wait_then_open, daemon=True)
     thread.start()
+
+
+def open_existing_instance(app_url: str, *, wait_seconds: float = 8.0) -> bool:
+    status_url = app_url.rstrip("/") + "/api/status"
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        if probe_status(status_url, timeout=1.0):
+            try:
+                webbrowser.open(app_url, new=1)
+            except Exception:
+                pass
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def create_tray_icon_image() -> Any:
@@ -385,7 +470,8 @@ def run_with_tray(
         pystray.MenuItem("Salir", on_quit),
     )
     icon = pystray.Icon("trello_review", tray_image, "Trello Review", menu)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    startup_log("tray: starting pystray mode")
+    server_thread = threading.Thread(target=_serve_server, kwargs={"server": server, "label": "tray"}, daemon=True)
     server_thread.start()
 
     def setup(_: Any) -> None:
@@ -393,10 +479,226 @@ def run_with_tray(
             open_browser_when_ready(app_url)
 
     try:
+        startup_log("tray: entering icon loop")
         icon.run(setup=setup)
     finally:
+        startup_log("tray: leaving icon loop")
         stop_server(server)
         server_thread.join(timeout=2.0)
+
+
+def run_with_windows_tray(
+    *,
+    server: ThreadingHTTPServer,
+    app_url: str,
+    user_root: Path,
+    open_browser: bool,
+) -> None:
+    if os.name != "nt":
+        raise RuntimeError("La bandeja nativa de Windows solo está disponible en Windows")
+    startup_log("windows_tray: initializing")
+
+    user32 = ctypes.windll.user32
+    shell32 = ctypes.windll.shell32
+    kernel32 = ctypes.windll.kernel32
+
+    WM_APP = 0x8000
+    WM_TRAYICON = WM_APP + 1
+    WM_DESTROY = 0x0002
+    WM_COMMAND = 0x0111
+    WM_CLOSE = 0x0010
+    WM_LBUTTONDBLCLK = 0x0203
+    WM_RBUTTONUP = 0x0205
+    NIM_ADD = 0x00000000
+    NIM_DELETE = 0x00000002
+    NIF_MESSAGE = 0x00000001
+    NIF_ICON = 0x00000002
+    NIF_TIP = 0x00000004
+    CS_VREDRAW = 0x0001
+    CS_HREDRAW = 0x0002
+    IDI_APPLICATION = 32512
+    IDC_ARROW = 32512
+    TPM_LEFTALIGN = 0x0000
+    TPM_BOTTOMALIGN = 0x0020
+    TPM_RIGHTBUTTON = 0x0002
+    MF_STRING = 0x0000
+    MF_SEPARATOR = 0x0800
+    CMD_OPEN = 1001
+    CMD_OPEN_DATA = 1002
+    CMD_EXIT = 1003
+    WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+    class MSG(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("message", wintypes.UINT),
+            ("wParam", wintypes.WPARAM),
+            ("lParam", wintypes.LPARAM),
+            ("time", wintypes.DWORD),
+            ("pt", POINT),
+            ("lPrivate", wintypes.DWORD),
+        ]
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ("style", wintypes.UINT),
+            ("lpfnWndProc", WNDPROC),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", wintypes.HINSTANCE),
+            ("hIcon", wintypes.HICON),
+            ("hCursor", wintypes.HCURSOR),
+            ("hbrBackground", wintypes.HANDLE),
+            ("lpszMenuName", wintypes.LPCWSTR),
+            ("lpszClassName", wintypes.LPCWSTR),
+        ]
+
+    class NOTIFYICONDATAW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("hWnd", wintypes.HWND),
+            ("uID", wintypes.UINT),
+            ("uFlags", wintypes.UINT),
+            ("uCallbackMessage", wintypes.UINT),
+            ("hIcon", wintypes.HICON),
+            ("szTip", wintypes.WCHAR * 128),
+            ("dwState", wintypes.DWORD),
+            ("dwStateMask", wintypes.DWORD),
+            ("szInfo", wintypes.WCHAR * 256),
+            ("uTimeoutOrVersion", wintypes.UINT),
+            ("szInfoTitle", wintypes.WCHAR * 64),
+            ("dwInfoFlags", wintypes.DWORD),
+            ("guidItem", ctypes.c_byte * 16),
+            ("hBalloonIcon", wintypes.HICON),
+        ]
+
+    def loword(value: int) -> int:
+        return value & 0xFFFF
+
+    h_instance = kernel32.GetModuleHandleW(None)
+    class_name = f"TrelloReviewTrayWindow_{os.getpid()}"
+    h_icon = shell32.ExtractIconW(h_instance, str(Path(sys.executable).resolve()), 0)
+    if not h_icon:
+        h_icon = user32.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION))
+    h_cursor = user32.LoadCursorW(None, ctypes.c_void_p(IDC_ARROW))
+    quit_requested = {"value": False}
+
+    def show_menu(hwnd: int) -> None:
+        menu = user32.CreatePopupMenu()
+        if not menu:
+            return
+        try:
+            user32.AppendMenuW(menu, MF_STRING, CMD_OPEN, "Abrir Trello Review")
+            user32.AppendMenuW(menu, MF_STRING, CMD_OPEN_DATA, "Abrir carpeta de datos")
+            user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            user32.AppendMenuW(menu, MF_STRING, CMD_EXIT, "Salir")
+            pt = POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            user32.SetForegroundWindow(hwnd)
+            user32.TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None)
+        finally:
+            user32.DestroyMenu(menu)
+
+    @ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    def window_proc(hwnd: int, msg: int, w_param: int, l_param: int) -> int:
+        if msg == WM_TRAYICON:
+            if l_param == WM_LBUTTONDBLCLK:
+                open_browser_soon(app_url)
+                return 0
+            if l_param == WM_RBUTTONUP:
+                show_menu(hwnd)
+                return 0
+        elif msg == WM_COMMAND:
+            command_id = loword(int(w_param))
+            if command_id == CMD_OPEN:
+                open_browser_soon(app_url)
+                return 0
+            if command_id == CMD_OPEN_DATA:
+                open_path_in_shell(user_root)
+                return 0
+            if command_id == CMD_EXIT:
+                quit_requested["value"] = True
+                threading.Thread(target=stop_server, args=(server,), daemon=True).start()
+                user32.DestroyWindow(hwnd)
+                return 0
+        elif msg == WM_CLOSE:
+            user32.DestroyWindow(hwnd)
+            return 0
+        elif msg == WM_DESTROY:
+            user32.PostQuitMessage(0)
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, w_param, l_param)
+
+    wnd_class = WNDCLASSW()
+    wnd_class.style = CS_HREDRAW | CS_VREDRAW
+    wnd_class.lpfnWndProc = window_proc
+    wnd_class.hInstance = h_instance
+    wnd_class.hIcon = h_icon
+    wnd_class.hCursor = h_cursor
+    wnd_class.lpszClassName = class_name
+
+    atom = user32.RegisterClassW(ctypes.byref(wnd_class))
+    if not atom:
+        startup_log(f"windows_tray: RegisterClassW failed last_error={ctypes.get_last_error()}")
+        raise ctypes.WinError(ctypes.get_last_error())
+    startup_log("windows_tray: window class registered")
+
+    hwnd = user32.CreateWindowExW(
+        0,
+        class_name,
+        "Trello Review",
+        0,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        h_instance,
+        None,
+    )
+    if not hwnd:
+        startup_log(f"windows_tray: CreateWindowExW failed last_error={ctypes.get_last_error()}")
+        raise ctypes.WinError(ctypes.get_last_error())
+    startup_log("windows_tray: hidden window created")
+
+    nid = NOTIFYICONDATAW()
+    nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+    nid.hWnd = hwnd
+    nid.uID = 1
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+    nid.uCallbackMessage = WM_TRAYICON
+    nid.hIcon = h_icon
+    nid.szTip = "Trello Review"
+
+    if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+        startup_log(f"windows_tray: Shell_NotifyIconW failed last_error={ctypes.get_last_error()}")
+        raise ctypes.WinError(ctypes.get_last_error())
+    startup_log("windows_tray: tray icon registered")
+
+    server_thread = threading.Thread(target=_serve_server, kwargs={"server": server, "label": "windows_tray"}, daemon=True)
+    server_thread.start()
+    startup_log("windows_tray: server thread started")
+
+    try:
+        if open_browser:
+            open_browser_when_ready(app_url)
+
+        startup_log("windows_tray: entering message loop")
+        msg = MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+    finally:
+        startup_log("windows_tray: leaving message loop")
+        shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+        if not quit_requested["value"]:
+            stop_server(server)
+        server_thread.join(timeout=2.0)
+        user32.UnregisterClassW(class_name, h_instance)
 
 
 def parse_reasoning_effort(raw: Any) -> str:
@@ -750,15 +1052,14 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _proxy_attachment_content(self, client: TrelloClient, card_id: str, attachment_id: str) -> None:
+    def _download_attachment_content(self, client: TrelloClient, card_id: str, attachment_id: str) -> tuple[bytes, str, str | None]:
         attachment = client.get(
             f"/cards/{card_id}/attachments/{attachment_id}",
             fields="id,name,fileName,url,mimeType",
         )
         source_url = attachment.get("url")
         if not source_url:
-            self._send_error_json(HTTPStatus.NOT_FOUND, "La URL del adjunto no está disponible")
-            return
+            raise FileNotFoundError("La URL del adjunto no está disponible")
         oauth_header = (
             f'OAuth oauth_consumer_key="{self.app_config.api_key}", '
             f'oauth_token="{self.app_config.token}"'
@@ -780,13 +1081,22 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 detail = e.read().decode("utf-8", errors="replace")
             except Exception:
                 detail = str(e)
-            self._send_error_json(e.code or HTTPStatus.BAD_GATEWAY, f"Falló la descarga del adjunto: {detail}")
-            return
+            raise RuntimeError(f"Falló la descarga del adjunto: {detail}") from e
         except URLError as e:
-            self._send_error_json(HTTPStatus.BAD_GATEWAY, f"Error de red al descargar el adjunto: {e}")
-            return
+            raise RuntimeError(f"Error de red al descargar el adjunto: {e}") from e
 
         filename = attachment.get("fileName") or attachment.get("name")
+        return body, content_type, filename
+
+    def _proxy_attachment_content(self, client: TrelloClient, card_id: str, attachment_id: str) -> None:
+        try:
+            body, content_type, filename = self._download_attachment_content(client, card_id, attachment_id)
+        except FileNotFoundError as e:
+            self._send_error_json(HTTPStatus.NOT_FOUND, str(e))
+            return
+        except RuntimeError as e:
+            self._send_error_json(HTTPStatus.BAD_GATEWAY, str(e))
+            return
         self._send_binary(body=body, content_type=content_type, filename=filename)
 
     def _send_local_file(self, card_id: str, rel_path: str) -> None:
@@ -930,6 +1240,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
         except FileNotFoundError as e:
             self._send_error_json(HTTPStatus.NOT_FOUND, str(e))
         except Exception as e:  # pragma: no cover - debug-friendly for local tool
+            traceback.print_exc()
             self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
 
     def _handle_api_post(self, parsed: Any) -> None:
@@ -1013,13 +1324,29 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 if not isinstance(indexes, list):
                     self._send_error_json(HTTPStatus.BAD_REQUEST, "El cuerpo debe contener un arreglo `indexes`")
                     return
+                enriched_indexes: List[Dict[str, Any]] = []
+                for row in indexes:
+                    if not isinstance(row, dict):
+                        continue
+                    enriched = dict(row)
+                    if str(enriched.get("source") or "").strip() == "trello" and not enriched.get("contentBase64"):
+                        index_data = enriched.get("index") or {}
+                        file_kind = str((index_data.get("file_kind") if isinstance(index_data, dict) else "") or enriched.get("fileKind") or "").lower()
+                        trello_attachment = enriched.get("trelloAttachment") or {}
+                        attachment_id = str(
+                            trello_attachment.get("attachmentId") or trello_attachment.get("id") or ""
+                        ).strip()
+                        if attachment_id and file_kind in {"image", "pdf"}:
+                            body, _, _ = self._download_attachment_content(client, card_id=card_id, attachment_id=attachment_id)
+                            enriched["contentBase64"] = base64.b64encode(body).decode("ascii")
+                    enriched_indexes.append(enriched)
                 card = client.get("/cards/" + card_id, fields="id,name,url")
                 result = save_indexes_for_card(
                     self.workbench_paths,
                     card_id=card_id,
                     card_name=card.get("name") or card_id,
                     card_url=card.get("url") or "",
-                    indexes=indexes,
+                    indexes=enriched_indexes,
                 )
                 self._send_json({"ok": True, **result})
                 return
@@ -1114,6 +1441,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
         except FileNotFoundError as e:
             self._send_error_json(HTTPStatus.NOT_FOUND, str(e))
         except Exception as e:  # pragma: no cover - debug-friendly for local tool
+            traceback.print_exc()
             self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
 
 
@@ -1124,14 +1452,25 @@ def main() -> int:
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the browser")
     parser.add_argument("--no-tray", action="store_true", help="Do not show the system tray icon")
     args = parser.parse_args()
+    startup_log("main: process starting")
 
     if not UI_DIR.exists():
+        startup_log(f"main: UI directory missing at {UI_DIR}")
         raise SystemExit(f"UI directory not found: {UI_DIR}")
 
     app_url = f"http://{args.host}:{args.port}"
+    if not acquire_single_instance():
+        startup_log("main: existing instance detected")
+        if not args.no_browser and open_existing_instance(app_url):
+            return 0
+        maybe_show_error_dialog("Trello Review", "Trello Review ya se está ejecutando.")
+        return 0
     try:
+        startup_log(f"main: loading config from {', '.join(str(p) for p in APP_PATHS.env_search_paths)}")
         cfg = load_config()
+        startup_log("main: config loaded")
         server = ThreadingHTTPServer((args.host, args.port), TrelloWorkbenchHandler)
+        startup_log(f"main: HTTP server bound on {app_url}")
         server.app_config = cfg  # type: ignore[attr-defined]
         server.workbench_paths = init_workbench_paths(
             APP_PATHS.review_workspace_dir,
@@ -1142,42 +1481,45 @@ def main() -> int:
     except OSError as e:
         if e.errno == errno.EADDRINUSE:
             if not args.no_browser and probe_status(app_url.rstrip("/") + "/api/status"):
+                release_single_instance()
                 open_browser_soon(app_url)
                 return 0
             maybe_show_error_dialog(
                 "Trello Review",
                 f"El puerto {args.port} ya está en uso por otra aplicación. Ciérrala o ejecuta Trello Review en otro puerto.",
             )
+            release_single_instance()
             return 0
         maybe_show_error_dialog("Trello Review", str(e))
+        release_single_instance()
         raise
     except Exception as e:
-        maybe_show_error_dialog("Trello Review", str(e))
+        startup_log(f"main: startup exception before serve\n{traceback.format_exc()}")
+        maybe_show_error_dialog("Trello Review", f"{e}\n\nRegistro: {STARTUP_LOG_PATH}")
+        release_single_instance()
         raise
 
-    print(f"Trello workbench: {app_url}")
-    print(f"User data: {APP_PATHS.user_root}")
-    print("Endpoints:")
-    print("  GET /api/boards")
-    print("  GET /api/boards/<boardId>/cards?limit=200")
-    print("  GET /api/cards/<cardId>/packet")
-    print("  GET /api/cards/<cardId>/attachments/<attachmentId>/content")
-    print("  GET /api/checklist")
-    print("  GET /api/review-jobs")
-    print("  POST /api/checklist")
-    print("  POST /api/checklist/reset")
-    print("  GET /api/cards/<cardId>/workspace")
-    print("  POST /api/cards/<cardId>/workspace/token-estimate")
-    print("  POST /api/cards/<cardId>/workspace/status")
-    print("  POST /api/cards/<cardId>/workspace/create")
-    print("  POST /api/cards/<cardId>/workspace/indexes")
-    print("  POST /api/cards/<cardId>/workspace/files/import")
-    print("  POST /api/cards/<cardId>/workspace/indexes/prune")
-    print("  POST /api/cards/<cardId>/workspace/run")
-    print("  POST /api/cards/<cardId>/workspace/run-async")
+    startup_log(f"main: app_url={app_url}")
+    startup_log(f"main: user_data={APP_PATHS.user_root}")
     try:
-        use_tray = pystray is not None and not args.no_tray and getattr(sys, "frozen", False)
-        if use_tray:
+        use_tray = not args.no_tray and getattr(sys, "frozen", False)
+        startup_log(f"main: use_tray={use_tray} os={os.name} frozen={getattr(sys, 'frozen', False)}")
+        if use_tray and os.name == "nt":
+            startup_log("main: entering windows tray mode")
+            try:
+                run_with_windows_tray(
+                    server=server,
+                    app_url=app_url,
+                    user_root=APP_PATHS.user_root,
+                    open_browser=not args.no_browser,
+                )
+            except Exception:
+                startup_log(f"main: windows tray failed, falling back to foreground mode\n{traceback.format_exc()}")
+                if not args.no_browser:
+                    open_browser_when_ready(app_url)
+                _serve_server(server, label="foreground_fallback")
+        elif use_tray and pystray is not None:
+            startup_log("main: entering pystray mode")
             run_with_tray(
                 server=server,
                 app_url=app_url,
@@ -1185,13 +1527,17 @@ def main() -> int:
                 open_browser=not args.no_browser,
             )
         else:
+            if use_tray and os.name != "nt" and pystray is None:
+                maybe_show_error_dialog("Trello Review", "No se pudo cargar el soporte de icono de bandeja para esta compilación.")
             if not args.no_browser:
                 open_browser_when_ready(app_url)
-            server.serve_forever()
+            _serve_server(server, label="foreground")
     except KeyboardInterrupt:
-        print("\nStopping server.")
+        startup_log("main: keyboard interrupt")
     finally:
+        startup_log("main: shutting down")
         stop_server(server)
+        release_single_instance()
     return 0
 
 

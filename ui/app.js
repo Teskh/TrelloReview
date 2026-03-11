@@ -19,12 +19,15 @@ const state = {
   dismissedReviewJobIds: new Set(),
   reviewJobsPollTimer: null,
   cardLoadSeq: 0,
+  collapsedSections: {},
+  completedCardsById: new Map(),
   indexCache: new Map(),
   pdfCache: new Map(),
 };
 
 const PREFERRED_BOARD_NAME = "IG Tramitacion Training";
 const DISMISSED_REVIEW_JOBS_KEY = "trelloReview.dismissedReviewJobs";
+const COLLAPSED_SECTIONS_KEY = "trelloReview.collapsedSections";
 const REVIEW_JOBS_POLL_MS = 3000;
 const FIXED_MODEL = "gpt-5.4";
 
@@ -39,6 +42,8 @@ const els = {
   loadCardsBtn: document.getElementById("loadCardsBtn"),
   selectedBoardMeta: document.getElementById("selectedBoardMeta"),
   cardsList: document.getElementById("cardsList"),
+  completedCardsMeta: document.getElementById("completedCardsMeta"),
+  completedCardsList: document.getElementById("completedCardsList"),
   recentJobsMeta: document.getElementById("recentJobsMeta"),
   recentJobsList: document.getElementById("recentJobsList"),
   cardBadge: document.getElementById("cardBadge"),
@@ -88,6 +93,7 @@ const els = {
 
   innerTabs: Array.from(document.querySelectorAll(".inner-tab")),
   ptabs: Array.from(document.querySelectorAll(".view-tab")),
+  sectionToggles: Array.from(document.querySelectorAll("[data-section-toggle]")),
   boardItemTpl: document.getElementById("boardItemTpl"),
   cardItemTpl: document.getElementById("cardItemTpl"),
 };
@@ -293,6 +299,43 @@ function syncFixedModelUi() {
   els.modelInput.value = FIXED_MODEL;
 }
 
+function loadCollapsedSections() {
+  const defaults = { boards: false, recent: false, completed: false, cards: false };
+  try {
+    const raw = window.localStorage.getItem(COLLAPSED_SECTIONS_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object") return defaults;
+    return { ...defaults, ...parsed };
+  } catch {
+    return defaults;
+  }
+}
+
+function persistCollapsedSections() {
+  try {
+    window.localStorage.setItem(COLLAPSED_SECTIONS_KEY, JSON.stringify(state.collapsedSections));
+  } catch {
+    // Ignore storage failures in desktop/webview environments.
+  }
+}
+
+function renderSidebarSections() {
+  document.querySelectorAll(".section[data-section]").forEach((section) => {
+    const sectionName = section.dataset.section;
+    const collapsed = !!state.collapsedSections[sectionName];
+    section.classList.toggle("collapsed", collapsed);
+    const toggle = section.querySelector("[data-section-toggle]");
+    if (toggle) toggle.setAttribute("aria-expanded", String(!collapsed));
+  });
+}
+
+function toggleSidebarSection(sectionName) {
+  if (!sectionName) return;
+  state.collapsedSections[sectionName] = !state.collapsedSections[sectionName];
+  persistCollapsedSections();
+  renderSidebarSections();
+}
+
 function loadDismissedReviewJobIds() {
   try {
     const raw = window.localStorage.getItem(DISMISSED_REVIEW_JOBS_KEY);
@@ -311,6 +354,63 @@ function persistDismissedReviewJobIds() {
   } catch {
     // Ignore storage failures in desktop/webview environments.
   }
+}
+
+function normalizeCompletedCardEntry(entry) {
+  if (!entry?.card?.id || !entry?.run_id) return null;
+  return {
+    card: {
+      id: entry.card.id,
+      name: entry.card.name || entry.card.id,
+      url: entry.card.url || "",
+    },
+    run_id: entry.run_id,
+    finished_at: entry.finished_at || entry.created_at || null,
+    run_summary: entry.run_summary || null,
+    model: entry.model || FIXED_MODEL,
+  };
+}
+
+function completedCardSortValue(entry) {
+  const value = entry?.finished_at ? new Date(entry.finished_at).getTime() : 0;
+  return Number.isFinite(value) ? value : 0;
+}
+
+function registerCompletedCard(entry) {
+  const normalized = normalizeCompletedCardEntry(entry);
+  if (!normalized) return;
+  const existing = state.completedCardsById.get(normalized.card.id);
+  if (existing && completedCardSortValue(existing) >= completedCardSortValue(normalized)) return;
+  state.completedCardsById.set(normalized.card.id, normalized);
+}
+
+function syncCompletedCardsFromReviewJobs() {
+  for (const job of state.reviewJobs) {
+    if (job?.status !== "succeeded" || !job?.run_id) continue;
+    registerCompletedCard({
+      card: job.card,
+      run_id: job.run_id,
+      finished_at: job.finished_at,
+      run_summary: job.run_summary,
+      model: job.model,
+    });
+  }
+}
+
+function syncCompletedCardFromWorkspace(card = state.selectedCard, workspace = state.workspace) {
+  const latest = workspace?.runs?.[0];
+  if (!card?.id || !latest?.run_id) return;
+  registerCompletedCard({
+    card,
+    run_id: latest.run_id,
+    finished_at: latest.created_at,
+    run_summary: latest.summary,
+    model: latest.model || FIXED_MODEL,
+  });
+}
+
+function completedCards() {
+  return Array.from(state.completedCardsById.values()).sort((a, b) => completedCardSortValue(b) - completedCardSortValue(a));
 }
 
 function visibleReviewJobs() {
@@ -361,6 +461,7 @@ function dismissReviewJob(jobId) {
   state.dismissedReviewJobIds.add(jobId);
   persistDismissedReviewJobIds();
   renderRecentJobs();
+  renderCompletedCards();
 }
 
 async function openReviewJob(job) {
@@ -376,6 +477,43 @@ async function openReviewJob(job) {
   els.runHistorySelect.value = job.run_id;
   await loadRunById(card.id, job.run_id);
   setMainTab("results");
+}
+
+function renderCompletedCards() {
+  const items = completedCards();
+  els.completedCardsMeta.textContent = items.length ? `${items.length} tarjeta(s)` : "Sin ejecuciones.";
+  els.completedCardsList.innerHTML = "";
+
+  if (!items.length) {
+    els.completedCardsList.innerHTML = `<li class="meta-text" style="padding:0 8px;">Las tarjetas con revisiones terminadas aparecerán aquí.</li>`;
+    return;
+  }
+
+  for (const item of items) {
+    const row = document.createElement("li");
+    row.className = "recent-job-item completed-card-item";
+    row.innerHTML = `
+      <div class="recent-job-body">
+        <div class="recent-job-top">
+          <div class="recent-job-title-wrap">
+            <span class="recent-job-title">${escapeHtml(item.card.name || item.card.id)}</span>
+          </div>
+          <span class="data-item-status ready">Lista</span>
+        </div>
+        <div class="recent-job-meta">${escapeHtml(item.model || FIXED_MODEL)} • ${escapeHtml(item.finished_at ? `Term. ${fmtDate(item.finished_at)}` : "Fecha desconocida")}</div>
+        <div class="recent-job-summary">${escapeHtml(reviewJobSummaryText({ status: "succeeded", run_summary: item.run_summary }))}</div>
+      </div>
+    `;
+    const actions = document.createElement("div");
+    actions.className = "recent-job-actions";
+    const openBtn = document.createElement("button");
+    openBtn.className = "action-btn outline sm";
+    openBtn.textContent = "Abrir";
+    openBtn.onclick = () => openReviewJob(item).catch((err) => setViewerState(`No se pudo abrir la ejecución: ${err.message}`));
+    actions.appendChild(openBtn);
+    row.appendChild(actions);
+    els.completedCardsList.appendChild(row);
+  }
 }
 
 function renderRecentJobs() {
@@ -447,6 +585,8 @@ async function syncSelectedCardRunHistory() {
   if (!state.selectedCard?.id) return;
   try {
     state.workspace = await apiGet(`/api/cards/${state.selectedCard.id}/workspace`);
+    syncCompletedCardFromWorkspace(state.selectedCard, state.workspace);
+    renderCompletedCards();
     renderWorkspace();
   } catch {
     // Background sync failures should not interrupt the current task.
@@ -466,6 +606,7 @@ function notifyReviewJobTransition(job) {
 function applyReviewJobs(jobs) {
   const previous = new Map((state.reviewJobs || []).map((job) => [job.job_id, job]));
   state.reviewJobs = Array.isArray(jobs) ? jobs : [];
+  syncCompletedCardsFromReviewJobs();
 
   for (const job of visibleReviewJobs()) {
     const before = previous.get(job.job_id);
@@ -479,6 +620,7 @@ function applyReviewJobs(jobs) {
   }
 
   renderRecentJobs();
+  renderCompletedCards();
   renderWorkspace();
 }
 
@@ -986,7 +1128,9 @@ async function loadCard(card) {
     if (loadSeq !== state.cardLoadSeq || state.selectedCard?.id !== card.id) return;
     state.workspace = status.workspace || null;
     state.workspaceStatus = status.prep || null;
+    syncCompletedCardFromWorkspace(card, state.workspace);
     renderWorkspace();
+    renderCompletedCards();
     renderResults();
     setViewerState(state.workspaceStatus?.summary || "Tarjeta contextualizada.");
   } catch (err) {
@@ -1003,6 +1147,7 @@ async function loadCard(card) {
       actions: [],
     };
     renderWorkspace();
+    renderCompletedCards();
     renderTokenEstimate();
   }
 }
@@ -1455,7 +1600,7 @@ async function extractImageIndex(arrayBuffer, meta) {
     mime_type: meta.mimeType,
     content_hash: meta.contentHash,
     extracted_at: new Date().toISOString(),
-    warnings: ["La indexación de imágenes en este MVP solo usa metadatos; agrega OCR o anclas por región después para evidencia precisa."],
+    warnings: ["Las citas de imagen siguen siendo a nivel de imagen completa; agrega OCR o anclas por región después para evidencia más precisa."],
     render: { type: "image", ...dims },
     segments: [
       {
@@ -1537,30 +1682,36 @@ async function indexLocalAttachments(filesOverride = null) {
   els.indexLocalBtn.disabled = true;
   setViewerState(`Indexando ${files.length} archivo(s) local(es)...`);
   try {
-    const batch = [];
+    let savedCount = 0;
     for (let i = 0; i < files.length; i += 1) {
       const f = files[i];
-      setViewerState(`Indexando local ${i + 1}/${files.length}: ${f.relativePath}`);
-      const url = localContentUrl(state.selectedCard.id, f.relativePath);
-      const { buffer, contentType } = await fetchArrayBuffer(url);
-      const fileName = f.relativePath.split("/").pop() || f.relativePath;
-      const record = await buildIndexRecord({
-        source: "local",
-        cardId: state.selectedCard.id,
-        displayName: fileName,
-        fileName,
-        mimeType: contentType.split(";")[0] || "application/octet-stream",
-        arrayBuffer: buffer,
-        sourceLocator: { type: "local_file", relativePath: f.relativePath, url },
-        localFile: { relativePath: f.relativePath },
-      });
-      batch.push(record);
+      try {
+        setViewerState(`Indexando local ${i + 1}/${files.length}: ${f.relativePath}`);
+        const url = localContentUrl(state.selectedCard.id, f.relativePath);
+        const { buffer, contentType } = await fetchArrayBuffer(url);
+        const fileName = f.relativePath.split("/").pop() || f.relativePath;
+        const record = await buildIndexRecord({
+          source: "local",
+          cardId: state.selectedCard.id,
+          displayName: fileName,
+          fileName,
+          mimeType: contentType.split(";")[0] || "application/octet-stream",
+          arrayBuffer: buffer,
+          sourceLocator: { type: "local_file", relativePath: f.relativePath, url },
+          localFile: { relativePath: f.relativePath },
+        });
+        await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: [record] });
+        savedCount += 1;
+      } catch (err) {
+        throw new Error(`${f.relativePath}: ${err.message}`);
+      }
     }
-    await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: batch });
     await loadWorkspaceStatus(state.currentPacket);
     refreshTokenEstimate();
-    setViewerState(`Se indexaron ${batch.length} archivo(s) local(es).`);
+    setViewerState(`Se indexaron ${savedCount} archivo(s) local(es).`);
   } catch (err) {
+    await loadWorkspaceStatus(state.currentPacket).catch(() => {});
+    refreshTokenEstimate();
     setViewerState(`Falló la indexación local: ${err.message}`);
   } finally {
     els.indexLocalBtn.disabled = false;
@@ -1581,38 +1732,44 @@ async function indexTrelloAttachments(attachmentsOverride = null) {
   els.indexTrelloBtn.disabled = true;
   setViewerState(`Indexando ${attachments.length} adjunto(s) de Trello...`);
   try {
-    const batch = [];
+    let savedCount = 0;
     for (let i = 0; i < attachments.length; i += 1) {
       const att = attachments[i];
       const attachmentId = att.id || att.attachmentId;
       const proxyUrl = att.proxyUrl;
       if (!proxyUrl) continue;
       const fileName = att.fileName || att.name || `attachment_${attachmentId}`;
-      setViewerState(`Indexando Trello ${i + 1}/${attachments.length}: ${fileName}`);
-      const { buffer, contentType } = await fetchArrayBuffer(proxyUrl);
-      const record = await buildIndexRecord({
-        source: "trello",
-        cardId: state.selectedCard.id,
-        displayName: att.name || fileName,
-        fileName,
-        mimeType: (att.mimeType || contentType || "").split(";")[0],
-        arrayBuffer: buffer,
-        sourceLocator: { type: "trello_attachment", proxyUrl, sourceUrl: att.sourceUrl || att.url || null },
-        trelloAttachment: {
-          attachmentId,
-          name: att.name || fileName,
-          mimeType: att.mimeType || contentType,
-          proxyUrl,
-          sourceUrl: att.sourceUrl || att.url || null,
-        },
-      });
-      batch.push(record);
+      try {
+        setViewerState(`Indexando Trello ${i + 1}/${attachments.length}: ${fileName}`);
+        const { buffer, contentType } = await fetchArrayBuffer(proxyUrl);
+        const record = await buildIndexRecord({
+          source: "trello",
+          cardId: state.selectedCard.id,
+          displayName: att.name || fileName,
+          fileName,
+          mimeType: (att.mimeType || contentType || "").split(";")[0],
+          arrayBuffer: buffer,
+          sourceLocator: { type: "trello_attachment", proxyUrl, sourceUrl: att.sourceUrl || att.url || null },
+          trelloAttachment: {
+            attachmentId,
+            name: att.name || fileName,
+            mimeType: att.mimeType || contentType,
+            proxyUrl,
+            sourceUrl: att.sourceUrl || att.url || null,
+          },
+        });
+        await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: [record] });
+        savedCount += 1;
+      } catch (err) {
+        throw new Error(`${fileName}: ${err.message}`);
+      }
     }
-    await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: batch });
     await loadWorkspaceStatus(state.currentPacket);
     refreshTokenEstimate();
-    setViewerState(`Se indexaron ${batch.length} adjunto(s) de Trello.`);
+    setViewerState(`Se indexaron ${savedCount} adjunto(s) de Trello.`);
   } catch (err) {
+    await loadWorkspaceStatus(state.currentPacket).catch(() => {});
+    refreshTokenEstimate();
     setViewerState(`Falló la indexación de Trello: ${err.message}`);
   } finally {
     els.indexTrelloBtn.disabled = false;
@@ -2075,7 +2232,7 @@ function renderImageCitation(indexResp, citation) {
     return;
   }
   wrap.innerHTML = `
-    <div class="inline-meta">Las citas de imagen son a nivel de imagen en este MVP (todavía sin OCR ni anclas por región).</div>
+    <div class="inline-meta">Las citas de imagen son a nivel de imagen completa en este MVP (todavía sin anclas por región).</div>
     <img src="${escapeHtml(fetchUrl)}" alt="imagen citada" style="max-width:100%; height:auto; margin-top:8px; border-radius:8px; border:1px solid rgba(33,31,28,0.08);" />
     <div class="inline-meta" style="margin-top:8px;">Motivo: ${escapeHtml(citation.reason || "")}</div>
   `;
@@ -2177,6 +2334,9 @@ function bindEvents() {
   els.boardSearch.oninput = renderBoards;
   els.loadCardsBtn.onclick = loadCards;
   els.cardSearch.onkeydown = (e) => { if (e.key === "Enter") loadCards(); };
+  els.sectionToggles.forEach((toggle) => {
+    toggle.onclick = () => toggleSidebarSection(toggle.dataset.sectionToggle);
+  });
   
   els.prepareReviewBtn.onclick = prepareReview;
   els.uploadWorkspaceFilesBtn.onclick = promptWorkspaceFilesImport;
@@ -2226,11 +2386,14 @@ function verifyLibraries() {
 
 async function init() {
   state.dismissedReviewJobIds = loadDismissedReviewJobIds();
+  state.collapsedSections = loadCollapsedSections();
   bindEvents();
   syncFixedModelUi();
+  renderSidebarSections();
   configurePdfJs();
   verifyLibraries();
   renderChecklistBuilder();
+  renderCompletedCards();
   renderRecentJobs();
   renderWorkspace();
   renderResults();

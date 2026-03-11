@@ -140,8 +140,11 @@ def _resolve_data_root(settings_file: Path) -> Path:
         return saved
 
     default_dir = _default_visible_data_dir()
-    chosen = _choose_data_dir_interactively(default_dir.parent if default_dir.parent != default_dir else default_dir)
-    data_root = chosen or default_dir
+    if getattr(sys, "frozen", False):
+        data_root = default_dir
+    else:
+        chosen = _choose_data_dir_interactively(default_dir.parent if default_dir.parent != default_dir else default_dir)
+        data_root = chosen or default_dir
     _save_data_dir(settings_file, data_root)
     return data_root
 
