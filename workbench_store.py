@@ -3,15 +3,18 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import io
 import json
 import os
 import re
+import socket
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -20,6 +23,16 @@ from llm_review_payloads import (
     build_review_user_payload,
     estimate_review_input_tokens,
 )
+
+try:
+    import fitz  # type: ignore
+except Exception:  # pragma: no cover - optional at runtime / packaging
+    fitz = None
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover - optional at runtime / packaging
+    Image = None
 
 
 def utc_now_iso() -> str:
@@ -351,6 +364,42 @@ def list_runs_summary(ws_dir: Path) -> List[Dict[str, Any]]:
     return out[:20]
 
 
+def list_completed_run_cards(paths: WorkbenchPaths) -> Dict[str, Any]:
+    cards: List[Dict[str, Any]] = []
+    if not paths.cards_dir.exists():
+        return {"cards": cards}
+
+    for ws_dir in sorted([p for p in paths.cards_dir.iterdir() if p.is_dir()], key=lambda p: p.name):
+        meta = _json_load(_card_meta_path(ws_dir), {})
+        runs = list_runs_summary(ws_dir)
+        if not runs:
+            continue
+        latest = runs[0]
+        card_id = str(meta.get("id") or ws_dir.name.rsplit("__", 1)[-1] or "").strip()
+        if not card_id:
+            continue
+        cards.append(
+            {
+                "card": {
+                    "id": card_id,
+                    "name": str(meta.get("name") or card_id),
+                    "url": str(meta.get("url") or ""),
+                },
+                "run_id": latest.get("run_id"),
+                "finished_at": latest.get("created_at"),
+                "run_summary": {
+                    "status": latest.get("status"),
+                    "counts": latest.get("counts") or {},
+                },
+                "model": latest.get("model"),
+                "workspaceFolder": ws_dir.name,
+            }
+        )
+
+    cards.sort(key=lambda row: str(row.get("finished_at") or ""), reverse=True)
+    return {"cards": cards}
+
+
 def get_card_workspace_info(paths: WorkbenchPaths, card_id: str) -> Dict[str, Any]:
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
@@ -594,6 +643,7 @@ def get_card_workspace_status(
     *,
     card_id: str,
     card_packet: Optional[Dict[str, Any]] = None,
+    multimodal_limit_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     workspace = get_card_workspace_info(paths, card_id)
     packet = card_packet if isinstance(card_packet, dict) else {}
@@ -631,6 +681,16 @@ def get_card_workspace_status(
             "prep": {
                 **prep,
                 "attachmentsPath": None,
+                "multimodal": {
+                    "assetCount": 0,
+                    "totalBytes": 0,
+                    "eligibleAssetCount": 0,
+                    "eligibleTotalBytes": 0,
+                    "omittedCount": 0,
+                    "limitBytes": resolve_multimodal_limit_bytes(multimodal_limit_bytes),
+                    "nearLimit": False,
+                    "overLimit": False,
+                },
                 "local": {"items": [], "stale": []},
                 "remote": {"items": remote_items, "stale": []},
             },
@@ -649,11 +709,18 @@ def get_card_workspace_status(
         remote_items=remote_items,
         stale_remote=stale_remote,
     )
+    multimodal = summarize_multimodal_assets(
+        paths,
+        card_id,
+        allowed_source_keys=prep.get("validSourceKeys"),
+        multimodal_limit_bytes=multimodal_limit_bytes,
+    )
     return {
         "workspace": workspace,
         "prep": {
             **prep,
             "attachmentsPath": workspace.get("attachmentsPath"),
+            "multimodal": multimodal,
             "local": {"items": local_items, "stale": stale_local},
             "remote": {"items": remote_items, "stale": stale_remote},
         },
@@ -727,6 +794,15 @@ def _safe_filename(name: str, fallback: str) -> str:
     return cleaned[:180] or fallback
 
 
+def _safe_extension(name: str) -> str:
+    ext = Path((name or "").replace("\\", "/")).suffix.strip().lower()
+    if not ext:
+        return ""
+    if not re.fullmatch(r"\.[a-z0-9]{1,12}", ext):
+        return ""
+    return ext
+
+
 def _store_trello_attachment_cache(
     *,
     ws_dir: Path,
@@ -739,7 +815,9 @@ def _store_trello_attachment_cache(
     except (ValueError, binascii.Error) as exc:
         raise ValueError(f"El adjunto de Trello {attachment_id} tiene contenido base64 no válido") from exc
     cache_dir = _trello_cache_dir(ws_dir)
-    filename = f"{attachment_id}__{_safe_filename(display_name, attachment_id)}"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Keep cache filenames short to avoid Windows path-length failures in deep workspaces.
+    filename = f"{attachment_id}{_safe_extension(display_name)}"
     target = (cache_dir / filename).resolve()
     if cache_dir.resolve() not in [target, *target.parents]:
         raise ValueError(f"Ruta de caché no válida para el adjunto de Trello {attachment_id}")
@@ -972,7 +1050,7 @@ def _collect_evidence_segments(
                 {
                     "anchor_id": seg.get("anchor_id"),
                     "kind": seg.get("kind"),
-                    "text": str(seg.get("text") or "")[:1200],
+                    "text": _truncate_evidence_text(seg.get("text")),
                     "page": seg.get("page"),
                     "sheet": seg.get("sheet"),
                     "meta": seg.get("meta") or {},
@@ -1069,13 +1147,19 @@ def estimate_llm_input_tokens_for_card(
     card_url: str,
     card_packet: Dict[str, Any],
     model: Optional[str] = None,
+    multimodal_limit_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     checklist = load_checklist(paths)
     try:
-        prep = get_card_workspace_status(paths, card_id=card_id, card_packet=card_packet).get("prep") or {}
+        prep = get_card_workspace_status(
+            paths,
+            card_id=card_id,
+            card_packet=card_packet,
+            multimodal_limit_bytes=multimodal_limit_bytes,
+        ).get("prep") or {}
         valid_source_keys = prep.get("validSourceKeys")
         evidence, _ = _collect_evidence_segments(paths, card_id, allowed_source_keys=valid_source_keys)
-        multimodal_assets = _collect_multimodal_assets(paths, card_id, allowed_source_keys=valid_source_keys)
+        multimodal_assets = []
         workspace_exists = True
     except FileNotFoundError:
         evidence = []
@@ -1091,16 +1175,86 @@ def estimate_llm_input_tokens_for_card(
         card_packet=card_packet,
         model=model,
         workspace_exists=workspace_exists,
+        multimodal_limit_bytes=resolve_multimodal_limit_bytes(multimodal_limit_bytes),
     )
 
 
-MULTIMODAL_MAX_TOTAL_BYTES = max(1, int(float(os.getenv("OPENAI_MULTIMODAL_MAX_BYTES", str(40 * 1024 * 1024)))))
+DEFAULT_MULTIMODAL_MAX_TOTAL_BYTES = 10 * 1024 * 1024
+MULTIMODAL_MAX_TOTAL_BYTES = max(1, int(float(os.getenv("OPENAI_MULTIMODAL_MAX_BYTES", str(DEFAULT_MULTIMODAL_MAX_TOTAL_BYTES)))))
 MULTIMODAL_SUPPORTED_IMAGE_MIME_TYPES = {
     "image/png",
     "image/jpeg",
     "image/webp",
     "image/gif",
 }
+OCR_OPENAI_MODEL = os.getenv("OPENAI_OCR_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
+OCR_REASONING_EFFORT = os.getenv("OPENAI_OCR_REASONING_EFFORT", "medium").strip() or "medium"
+EVIDENCE_SEGMENT_MAX_CHARS = 1200
+OCR_APPEND_THRESHOLD_CHARS = 200
+OCR_BATCH_SPLIT_THRESHOLD_BYTES = max(
+    1,
+    int(float(os.getenv("OPENAI_OCR_BATCH_SPLIT_THRESHOLD_BYTES", str(8 * 1024 * 1024)))),
+)
+OCR_BATCH_TARGET_BYTES = max(
+    1,
+    int(float(os.getenv("OPENAI_OCR_BATCH_TARGET_BYTES", str(5 * 1024 * 1024)))),
+)
+OCR_BATCH_MAX_ASSETS = max(1, int(os.getenv("OPENAI_OCR_BATCH_MAX_ASSETS", "8")))
+OCR_BATCH_MAX_CONCURRENCY = max(1, int(os.getenv("OPENAI_OCR_BATCH_MAX_CONCURRENCY", "2")))
+PDF_VISION_RENDER_DPI = max(72, int(os.getenv("OPENAI_PDF_VISION_RENDER_DPI", "120")))
+PDF_VISION_MAX_PAGES_PER_ASSET = max(1, int(os.getenv("OPENAI_PDF_VISION_MAX_PAGES_PER_ASSET", "20")))
+
+
+def resolve_multimodal_limit_bytes(multimodal_limit_bytes: Optional[int] = None) -> int:
+    try:
+        if multimodal_limit_bytes is not None and int(multimodal_limit_bytes) > 0:
+            return int(multimodal_limit_bytes)
+    except (TypeError, ValueError):
+        pass
+    return MULTIMODAL_MAX_TOTAL_BYTES
+
+
+def _truncate_evidence_text(text: Any) -> str:
+    return str(text or "")[:EVIDENCE_SEGMENT_MAX_CHARS]
+
+
+def _merge_segment_text_with_ocr(existing_text: Any, ocr_text: Any) -> str:
+    existing = str(existing_text or "").strip()
+    ocr = str(ocr_text or "").strip()
+    if not ocr:
+        return _truncate_evidence_text(existing)
+    if not existing:
+        return _truncate_evidence_text(ocr)
+    if normalize_text_loose(existing) == normalize_text_loose(ocr):
+        return _truncate_evidence_text(existing)
+    # OCR is a fallback path; keep substantive indexed text as-is to avoid duplicating
+    # long segments and reintroducing large prompt payloads.
+    if len(existing) >= OCR_APPEND_THRESHOLD_CHARS:
+        return _truncate_evidence_text(existing)
+    return _truncate_evidence_text(f"{existing}\n[OCR]\n{ocr}")
+
+
+def _report_progress(
+    progress_callback: Optional[Callable[..., None]],
+    *,
+    stage: str,
+    message: str,
+    current: Optional[int] = None,
+    total: Optional[int] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not progress_callback:
+        return
+    try:
+        progress_callback(
+            stage=stage,
+            message=message,
+            current=current,
+            total=total,
+            diagnostics=diagnostics or {},
+        )
+    except Exception:
+        pass
 
 
 def _resolve_workspace_file(ws_dir: Path, rel_path: str) -> Path:
@@ -1160,6 +1314,143 @@ def _source_path_for_multimodal_asset(
     return None
 
 
+def _source_origin_for_multimodal_asset(entry: Dict[str, Any], source_key: str) -> str:
+    locator = entry.get("source_locator") or {}
+    if isinstance(locator, dict):
+        locator_type = str(locator.get("type") or "").strip().lower()
+        if locator_type == "local_file":
+            return "local"
+        if locator_type == "trello_attachment":
+            return "trello"
+    source_key = str(source_key or "")
+    if source_key.startswith("local:"):
+        return "local"
+    if source_key.startswith("trello:"):
+        return "trello"
+    return "unknown"
+
+
+def _pdf_visual_anchor_ids(data: Dict[str, Any]) -> List[str]:
+    anchor_ids: List[str] = []
+    for seg in data.get("segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        anchor_id = str(seg.get("anchor_id") or "").strip()
+        if not anchor_id:
+            continue
+        meta = seg.get("meta") or {}
+        ocr_status = str(meta.get("ocr_status") or "").strip().lower() if isinstance(meta, dict) else ""
+        if ocr_status in {"image_only", "low_text"}:
+            anchor_ids.append(anchor_id)
+    if anchor_ids:
+        return anchor_ids[:PDF_VISION_MAX_PAGES_PER_ASSET]
+    fallback_ids = [
+        str(seg.get("anchor_id") or "").strip()
+        for seg in (data.get("segments") or [])
+        if isinstance(seg, dict) and str(seg.get("anchor_id") or "").strip()
+    ]
+    return fallback_ids[:PDF_VISION_MAX_PAGES_PER_ASSET]
+
+
+def _asset_transport_bytes(asset: Dict[str, Any]) -> bytes:
+    raw = asset.get("content_bytes")
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw)
+    source_path = Path(str(asset.get("source_path") or ""))
+    return source_path.read_bytes()
+
+
+def _asset_transport_filename(asset: Dict[str, Any]) -> str:
+    filename = str(asset.get("transport_filename") or "").strip()
+    if filename:
+        return filename
+    source_path = Path(str(asset.get("source_path") or ""))
+    return source_path.name or str(asset.get("display_name") or "asset")
+
+
+def _render_pdf_asset_as_page_images(asset: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if fitz is None or Image is None:
+        raise RuntimeError("No hay soporte de rasterización PDF disponible (PyMuPDF/Pillow).")
+    source_path = Path(str(asset.get("source_path") or ""))
+    if not source_path.is_file():
+        raise FileNotFoundError(f"No se encontró el PDF fuente: {source_path}")
+    page_anchor_ids = [str(a).strip() for a in (asset.get("visual_anchor_ids") or []) if str(a).strip()]
+    if not page_anchor_ids:
+        page_anchor_ids = _asset_anchor_ids(asset)
+    page_anchor_ids = page_anchor_ids[:PDF_VISION_MAX_PAGES_PER_ASSET]
+    if not page_anchor_ids:
+        return []
+    try:
+        doc = fitz.open(str(source_path))
+    except Exception as e:
+        raise RuntimeError(f"No se pudo abrir el PDF para visión: {e}") from e
+    scale = PDF_VISION_RENDER_DPI / 72.0
+    rendered_assets: List[Dict[str, Any]] = []
+    try:
+        for anchor_id in page_anchor_ids:
+            page_num = _anchor_page_from_id(anchor_id)
+            if not page_num or page_num < 1 or page_num > len(doc):
+                continue
+            try:
+                page = doc.load_page(page_num - 1)
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=82, optimize=True)
+                image_bytes = buf.getvalue()
+            except Exception as e:
+                raise RuntimeError(f"No se pudo rasterizar {source_path.name} página {page_num}: {e}") from e
+            rendered_assets.append(
+                {
+                    "source_key": asset.get("source_key"),
+                    "display_name": f"{asset.get('display_name') or source_path.name} [p. {page_num}]",
+                    "file_kind": "image",
+                    "mime_type": "image/jpeg",
+                    "byte_size": len(image_bytes),
+                    "content_bytes": image_bytes,
+                    "transport_filename": f"{source_path.stem}_page_{page_num}.jpg",
+                    "source_path": str(source_path),
+                    "anchor_hint": anchor_id,
+                    "anchor_ids": [anchor_id],
+                    "warnings": asset.get("warnings") or [],
+                    "source_origin": asset.get("source_origin"),
+                    "derived_from_pdf": True,
+                }
+            )
+    finally:
+        doc.close()
+    return rendered_assets
+
+
+def _expand_multimodal_assets_for_transport(
+    assets: List[Dict[str, Any]],
+    *,
+    render_pdfs: bool = True,
+) -> List[Dict[str, Any]]:
+    expanded: List[Dict[str, Any]] = []
+    for asset in assets:
+        if render_pdfs and str(asset.get("file_kind") or "") == "pdf":
+            rendered = _render_pdf_asset_as_page_images(asset)
+            if rendered:
+                expanded.extend(rendered)
+                continue
+        expanded.append(asset)
+    return expanded
+
+
+def _split_multimodal_assets_for_routing(
+    assets: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    review_visual_assets: List[Dict[str, Any]] = []
+    ocr_assets: List[Dict[str, Any]] = []
+    for asset in assets:
+        if str(asset.get("source_origin") or "") == "local":
+            review_visual_assets.append(asset)
+        else:
+            ocr_assets.append(asset)
+    return review_visual_assets, ocr_assets
+
+
 def _collect_multimodal_assets(
     paths: WorkbenchPaths,
     card_id: str,
@@ -1177,9 +1468,23 @@ def _collect_multimodal_assets(
             continue
         if allowed is not None and source_key not in allowed:
             continue
-        file_kind = str(entry.get("file_kind") or "").lower()
-        mime_type = str(entry.get("mime_type") or detect_mime_from_name(str(entry.get("display_name") or ""))).split(";")[0].lower()
+        try:
+            data = _load_index_by_source_key(ws_dir, manifest, source_key)
+        except Exception:
+            data = {}
+        file_kind = str((data.get("file_kind") if isinstance(data, dict) else "") or entry.get("file_kind") or "").lower()
+        mime_type = str((data.get("mime_type") if isinstance(data, dict) else "") or entry.get("mime_type") or detect_mime_from_name(str(entry.get("display_name") or ""))).split(";")[0].lower()
         if file_kind not in {"image", "pdf"}:
+            continue
+        warnings = (data.get("warnings") if isinstance(data, dict) else None) or entry.get("warnings") or []
+        anchor_ids = []
+        if isinstance(data, dict):
+            for seg in data.get("segments") or []:
+                if isinstance(seg, dict) and seg.get("anchor_id"):
+                    anchor_ids.append(str(seg.get("anchor_id")))
+        # Text PDFs already contribute indexed text evidence; reserve multimodal budget
+        # for images and PDFs that look scanned/image-only or otherwise degraded.
+        if file_kind == "pdf" and not warnings:
             continue
         source_path = _source_path_for_multimodal_asset(
             paths,
@@ -1202,11 +1507,61 @@ def _collect_multimodal_assets(
                 "byte_size": byte_size,
                 "source_path": str(source_path),
                 "anchor_hint": "image_full" if file_kind == "image" else "page_<n>",
-                "warnings": entry.get("warnings") or [],
+                "warnings": warnings,
+                "anchor_ids": anchor_ids,
+                "visual_anchor_ids": _pdf_visual_anchor_ids(data) if file_kind == "pdf" else anchor_ids,
+                "source_origin": _source_origin_for_multimodal_asset(entry, source_key),
             }
         )
     assets.sort(key=lambda row: (str(row.get("source_key") or ""), str(row.get("display_name") or "")))
     return assets
+
+
+def _select_multimodal_assets(
+    assets: List[Dict[str, Any]],
+    *,
+    limit_bytes: int,
+) -> Tuple[List[Dict[str, Any]], List[str], int]:
+    selected: List[Dict[str, Any]] = []
+    omitted: List[str] = []
+    selected_bytes = 0
+    for asset in assets:
+        byte_size = int(asset.get("byte_size") or 0)
+        source_key = str(asset.get("source_key") or "?")
+        if byte_size <= 0:
+            omitted.append(source_key)
+            continue
+        if selected_bytes + byte_size > limit_bytes:
+            omitted.append(source_key)
+            continue
+        selected.append(asset)
+        selected_bytes += byte_size
+    return selected, omitted, selected_bytes
+
+
+def summarize_multimodal_assets(
+    paths: WorkbenchPaths,
+    card_id: str,
+    allowed_source_keys: Optional[List[str]] = None,
+    multimodal_limit_bytes: Optional[int] = None,
+) -> Dict[str, Any]:
+    try:
+        assets = _collect_multimodal_assets(paths, card_id, allowed_source_keys=allowed_source_keys)
+    except FileNotFoundError:
+        assets = []
+    eligible_total_bytes = sum(int(a.get("byte_size") or 0) for a in assets if isinstance(a, dict))
+    limit_bytes = resolve_multimodal_limit_bytes(multimodal_limit_bytes)
+    selected, omitted, selected_bytes = _select_multimodal_assets(assets, limit_bytes=limit_bytes)
+    return {
+        "assetCount": len(selected),
+        "totalBytes": selected_bytes,
+        "eligibleAssetCount": len(assets),
+        "eligibleTotalBytes": eligible_total_bytes,
+        "omittedCount": len(omitted),
+        "limitBytes": limit_bytes,
+        "nearLimit": selected_bytes >= int(limit_bytes * 0.8),
+        "overLimit": len(omitted) > 0 or eligible_total_bytes > limit_bytes,
+    }
 
 
 def _multimodal_summary_payload(assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1222,6 +1577,156 @@ def _multimodal_summary_payload(assets: List[Dict[str, Any]]) -> List[Dict[str, 
         }
         for asset in assets
     ]
+
+
+def ocr_transcription_schema() -> Dict[str, Any]:
+    segment = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "anchor_id": {"type": "string"},
+            "text": {"type": "string"},
+        },
+        "required": ["anchor_id", "text"],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "segments": {"type": "array", "items": segment},
+            "notes": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["segments", "notes"],
+    }
+
+
+def ocr_batch_transcription_schema() -> Dict[str, Any]:
+    segment = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "anchor_id": {"type": "string"},
+            "text": {"type": "string"},
+        },
+        "required": ["anchor_id", "text"],
+    }
+    item = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "source_key": {"type": "string"},
+            "segments": {"type": "array", "items": segment},
+            "notes": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["source_key", "segments", "notes"],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "items": {"type": "array", "items": item},
+            "notes": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["items", "notes"],
+    }
+
+
+def _asset_anchor_ids(asset: Dict[str, Any]) -> List[str]:
+    anchor_ids = [str(a).strip() for a in (asset.get("anchor_ids") or []) if str(a).strip()]
+    if anchor_ids:
+        return anchor_ids
+    return [str(asset.get("anchor_hint") or ("image_full" if str(asset.get("file_kind") or "") == "image" else "page_1"))]
+
+
+def _build_ocr_batch_user_content(assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    content: List[Dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": (
+                "Transcribe the visible text from each attached evidence asset. "
+                "Do not summarize, interpret, or infer missing text. "
+                "Return exactly one item per source_key, preserving the same order as the assets below. "
+                "For each asset, return one segment per allowed anchor_id in reading order. "
+                "If an anchor/page has no readable text, return that anchor with an empty text string."
+            ),
+        }
+    ]
+    for asset in assets:
+        raw = _asset_transport_bytes(asset)
+        file_kind = str(asset.get("file_kind") or "")
+        mime_type = str(asset.get("mime_type") or "application/octet-stream")
+        source_key = str(asset.get("source_key") or "?")
+        display_name = str(asset.get("display_name") or _asset_transport_filename(asset))
+        anchor_ids = _asset_anchor_ids(asset)
+        content.append(
+            {
+                "type": "input_text",
+                "text": (
+                    f"ASSET source_key={source_key}; display_name={display_name}; "
+                    f"file_kind={file_kind}; allowed_anchor_ids={', '.join(anchor_ids)}."
+                ),
+            }
+        )
+        content.append(
+            {
+                "type": "input_image",
+                "detail": "high",
+                "image_url": f"data:{mime_type};base64,{base64.b64encode(raw).decode('ascii')}",
+            }
+        )
+    return content
+
+
+def _build_ocr_transcription_result(
+    *,
+    asset: Dict[str, Any],
+    parsed_item: Optional[Dict[str, Any]],
+    raw_response: Any,
+) -> Dict[str, Any]:
+    source_key = str(asset.get("source_key") or "?")
+    segments: List[Dict[str, Any]] = []
+    allowed_anchor_ids = set(_asset_anchor_ids(asset))
+    parsed_segments = parsed_item.get("segments") if isinstance(parsed_item, dict) else []
+    for row in parsed_segments or []:
+        if not isinstance(row, dict):
+            continue
+        anchor_id = str(row.get("anchor_id") or "").strip()
+        if not anchor_id or (allowed_anchor_ids and anchor_id not in allowed_anchor_ids):
+            continue
+        segments.append({"anchor_id": anchor_id, "text": str(row.get("text") or "")})
+    return {
+        "source_key": source_key,
+        "display_name": asset.get("display_name"),
+        "model": OCR_OPENAI_MODEL,
+        "segments": segments,
+        "notes": parsed_item.get("notes") if isinstance(parsed_item, dict) and isinstance(parsed_item.get("notes"), list) else [],
+        "raw_response": raw_response,
+    }
+
+
+def _batch_multimodal_assets(assets: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    if not assets:
+        return []
+    total_bytes = sum(int(asset.get("byte_size") or 0) for asset in assets)
+    if total_bytes <= OCR_BATCH_SPLIT_THRESHOLD_BYTES:
+        return [list(assets)]
+
+    batches: List[List[Dict[str, Any]]] = []
+    current_batch: List[Dict[str, Any]] = []
+    current_bytes = 0
+    for asset in assets:
+        asset_bytes = int(asset.get("byte_size") or 0)
+        would_exceed_bytes = current_batch and current_bytes + asset_bytes > OCR_BATCH_TARGET_BYTES
+        would_exceed_count = current_batch and len(current_batch) >= OCR_BATCH_MAX_ASSETS
+        if would_exceed_bytes or would_exceed_count:
+            batches.append(current_batch)
+            current_batch = []
+            current_bytes = 0
+        current_batch.append(asset)
+        current_bytes += asset_bytes
+    if current_batch:
+        batches.append(current_batch)
+    return batches
 
 
 def _build_multimodal_user_content(
@@ -1256,13 +1761,13 @@ def _build_multimodal_user_content(
             if not source_path.is_file():
                 omitted_assets.append(str(asset.get("source_key") or "?"))
                 continue
-            raw = source_path.read_bytes()
+            raw = _asset_transport_bytes(asset)
             if len(raw) != byte_size:
                 byte_size = len(raw)
             total_bytes += byte_size
             source_key = str(asset.get("source_key") or "?")
             file_kind = str(asset.get("file_kind") or "")
-            display_name = str(asset.get("display_name") or source_path.name)
+            display_name = str(asset.get("display_name") or _asset_transport_filename(asset))
             anchor_hint = str(asset.get("anchor_hint") or "")
             content.append(
                 {
@@ -1278,7 +1783,7 @@ def _build_multimodal_user_content(
                 content.append(
                     {
                         "type": "input_file",
-                        "filename": source_path.name,
+                        "filename": _asset_transport_filename(asset),
                         "file_data": f"data:{mime_type};base64,{base64.b64encode(raw).decode('ascii')}",
                     }
                 )
@@ -1306,20 +1811,20 @@ def _build_multimodal_user_content(
     return content
 
 
-def _openai_request(
+def _openai_structured_json_request(
     *,
     api_key: str,
     model: str,
-    reasoning_effort: str = "high",
+    reasoning_effort: str,
     system_prompt: str,
-    user_payload: Dict[str, Any],
-    multimodal_assets: Optional[List[Dict[str, Any]]] = None,
+    user_content: List[Dict[str, Any]],
+    schema_name: str,
+    schema: Dict[str, Any],
+    timeout_seconds: Optional[int] = None,
+    stream: bool = False,
+    stream_event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
-    timeout_seconds = max(30, int(float(os.getenv("OPENAI_HTTP_TIMEOUT_SECONDS", "600"))))
-    user_content = _build_multimodal_user_content(
-        user_payload=user_payload,
-        multimodal_assets=multimodal_assets or [],
-    )
+    timeout_seconds = max(30, int(timeout_seconds or float(os.getenv("OPENAI_HTTP_TIMEOUT_SECONDS", "600"))))
     base_body = {
         "model": model,
         "reasoning": {"effort": reasoning_effort},
@@ -1334,8 +1839,8 @@ def _openai_request(
             "text": {
                 "format": {
                     "type": "json_schema",
-                    "name": "checklist_review",
-                    "schema": checklist_run_schema(),
+                    "name": schema_name,
+                    "schema": schema,
                     "strict": True,
                 }
             },
@@ -1343,17 +1848,29 @@ def _openai_request(
         {
             **base_body,
             "input": [
-                {"role": "system", "content": system_prompt + " Return strict JSON matching the requested schema."},
-                {"role": "user", "content": user_content},
+                {
+                    "role": "system",
+                    "content": system_prompt + " Return strict JSON matching the requested schema.",
+                },
+                {
+                    "role": "user",
+                    "content": user_content + [
+                        {"type": "input_text", "text": "JSON schema: " + json.dumps(schema, ensure_ascii=False)}
+                    ],
+                },
             ],
         },
     ]
     last_err: Optional[Exception] = None
     for attempt_idx, body in enumerate(attempts, start=1):
+        if stream:
+            body = {**body, "stream": True}
+        encoded_body = json.dumps(body).encode("utf-8")
+        request_bytes = len(encoded_body)
         req = Request(
             "https://api.openai.com/v1/responses",
             method="POST",
-            data=json.dumps(body).encode("utf-8"),
+            data=encoded_body,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -1362,6 +1879,38 @@ def _openai_request(
         )
         try:
             with urlopen(req, timeout=timeout_seconds) as resp:
+                if stream:
+                    sse_data_lines: List[str] = []
+                    completed_response: Optional[Dict[str, Any]] = None
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                        if not line:
+                            if not sse_data_lines:
+                                continue
+                            data = "\n".join(sse_data_lines)
+                            sse_data_lines = []
+                            if data == "[DONE]":
+                                continue
+                            try:
+                                event = json.loads(data)
+                            except json.JSONDecodeError:
+                                continue
+                            if stream_event_callback:
+                                stream_event_callback(event)
+                            event_type = str(event.get("type") or "")
+                            if event_type == "response.completed" and isinstance(event.get("response"), dict):
+                                completed_response = event["response"]
+                            elif event_type in {"response.incomplete", "response.failed"} and isinstance(event.get("response"), dict):
+                                completed_response = event["response"]
+                            continue
+                        if line.startswith("data:"):
+                            sse_data_lines.append(line[5:].lstrip())
+                    if completed_response is not None:
+                        return completed_response
+                    raise RuntimeError(
+                        f"Streaming de OpenAI Responses API finalizó sin response.completed "
+                        f"para model={model} reasoning={reasoning_effort} (request_bytes={request_bytes})."
+                    )
                 return json.loads(resp.read().decode("utf-8"))
         except HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
@@ -1370,6 +1919,13 @@ def _openai_request(
             if attempt_idx == 1:
                 continue
             raise last_err from e
+        except (TimeoutError, socket.timeout) as e:
+            raise RuntimeError(
+                f"OpenAI Responses API excedió el tiempo de espera al leer la respuesta "
+                f"para model={model} reasoning={reasoning_effort} "
+                f"(timeout={timeout_seconds}s, request_bytes={request_bytes}). "
+                f"Prueba aumentando OPENAI_HTTP_TIMEOUT_SECONDS o reduciendo OPENAI_MULTIMODAL_MAX_BYTES."
+            ) from e
         except URLError as e:
             raise RuntimeError(
                 f"Error de red de OpenAI Responses API para model={model} reasoning={reasoning_effort} "
@@ -1378,6 +1934,266 @@ def _openai_request(
     if last_err:
         raise last_err
     raise RuntimeError("La solicitud a OpenAI Responses API falló")
+
+
+def _openai_request(
+    *,
+    api_key: str,
+    model: str,
+    reasoning_effort: str = "high",
+    system_prompt: str,
+    user_payload: Dict[str, Any],
+    multimodal_assets: Optional[List[Dict[str, Any]]] = None,
+    stream: bool = False,
+    stream_event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    user_content = _build_multimodal_user_content(
+        user_payload=user_payload,
+        multimodal_assets=multimodal_assets or [],
+    )
+    return _openai_structured_json_request(
+        api_key=api_key,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        system_prompt=system_prompt,
+        user_content=user_content,
+        schema_name="checklist_review",
+        schema=checklist_run_schema(),
+        stream=stream,
+        stream_event_callback=stream_event_callback,
+    )
+
+
+def _transcribe_multimodal_batch(
+    *,
+    api_key: str,
+    assets: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    content = _build_ocr_batch_user_content(assets)
+    batch_source_keys = [str(asset.get("source_key") or "?") for asset in assets]
+    batch_display_names = [str(asset.get("display_name") or asset.get("source_key") or "?") for asset in assets]
+    started = time.time()
+    raw = _openai_structured_json_request(
+        api_key=api_key,
+        model=OCR_OPENAI_MODEL,
+        reasoning_effort=OCR_REASONING_EFFORT,
+        system_prompt=(
+            "You are an OCR assistant. Extract visible text faithfully. "
+            "Do not summarize or infer. Preserve reading order per anchor_id and keep assets separated by source_key."
+        ),
+        user_content=content,
+        schema_name="ocr_batch_transcription",
+        schema=ocr_batch_transcription_schema(),
+        timeout_seconds=max(30, int(float(os.getenv("OPENAI_OCR_HTTP_TIMEOUT_SECONDS", "300")))),
+    )
+    text = _response_text_from_responses_api(raw)
+    if not text:
+        raise RuntimeError("La transcripción OCR por lote no devolvió texto")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"La salida OCR por lote no era JSON válido: {e}") from e
+
+    item_by_source_key = {}
+    for row in parsed.get("items") or []:
+        if not isinstance(row, dict):
+            continue
+        source_key = str(row.get("source_key") or "").strip()
+        if source_key:
+            item_by_source_key[source_key] = row
+
+    results = [
+        _build_ocr_transcription_result(
+            asset=asset,
+            parsed_item=item_by_source_key.get(str(asset.get("source_key") or "?")),
+            raw_response=raw,
+        )
+        for asset in assets
+    ]
+    diagnostics = {
+        "status": "ok",
+        "source_keys": batch_source_keys,
+        "display_names": batch_display_names,
+        "asset_count": len(assets),
+        "total_bytes": sum(int(asset.get("byte_size") or 0) for asset in assets),
+        "elapsed_seconds": round(time.time() - started, 3),
+    }
+    return results, diagnostics
+
+
+def _transcribe_multimodal_assets(
+    *,
+    api_key: str,
+    assets: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not assets:
+        return [], []
+    batches = _batch_multimodal_assets(assets)
+    results_by_source_key: Dict[str, Dict[str, Any]] = {}
+    batch_diagnostics: List[Dict[str, Any]] = []
+    max_workers = min(len(batches), OCR_BATCH_MAX_CONCURRENCY)
+
+    def run_batch(batch_index: int, batch_assets: List[Dict[str, Any]]) -> Tuple[int, List[Dict[str, Any]], Dict[str, Any]]:
+        batch_results, diag = _transcribe_multimodal_batch(api_key=api_key, assets=batch_assets)
+        diag["batch_index"] = batch_index
+        diag["batch_count"] = len(batches)
+        return batch_index, batch_results, diag
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(run_batch, batch_index, batch_assets): (batch_index, batch_assets)
+            for batch_index, batch_assets in enumerate(batches, start=1)
+        }
+        for future in as_completed(futures):
+            batch_index, batch_assets = futures[future]
+            try:
+                _, batch_results, diag = future.result()
+                batch_diagnostics.append(diag)
+                for row in batch_results:
+                    if isinstance(row, dict):
+                        results_by_source_key[str(row.get("source_key") or "?")] = row
+            except Exception as e:
+                batch_diagnostics.append(
+                    {
+                        "status": "error",
+                        "batch_index": batch_index,
+                        "batch_count": len(batches),
+                        "asset_count": len(batch_assets),
+                        "total_bytes": sum(int(asset.get("byte_size") or 0) for asset in batch_assets),
+                        "source_keys": [str(asset.get("source_key") or "?") for asset in batch_assets],
+                        "display_names": [str(asset.get("display_name") or asset.get("source_key") or "?") for asset in batch_assets],
+                        "error": str(e),
+                    }
+                )
+                for asset in batch_assets:
+                    source_key = str(asset.get("source_key") or "?")
+                    results_by_source_key[source_key] = {
+                        "source_key": source_key,
+                        "display_name": asset.get("display_name"),
+                        "model": OCR_OPENAI_MODEL,
+                        "segments": [],
+                        "notes": [f"OCR omitido por error: {e}"],
+                        "raw_response": None,
+                    }
+
+    ordered_results = [
+        results_by_source_key.get(str(asset.get("source_key") or "?"))
+        or {
+            "source_key": str(asset.get("source_key") or "?"),
+            "display_name": asset.get("display_name"),
+            "model": OCR_OPENAI_MODEL,
+            "segments": [],
+            "notes": ["OCR omitido: no se recibió resultado para este adjunto."],
+            "raw_response": None,
+        }
+        for asset in assets
+    ]
+    batch_diagnostics.sort(key=lambda row: int(row.get("batch_index") or 0))
+    return ordered_results, batch_diagnostics
+
+
+def _anchor_page_from_id(anchor_id: str) -> Optional[int]:
+    m = re.fullmatch(r"page_(\d+)", str(anchor_id or ""))
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _merge_ocr_transcriptions_into_evidence(
+    *,
+    evidence: List[Dict[str, Any]],
+    index_lookup: Dict[str, Dict[str, Any]],
+    transcriptions: List[Dict[str, Any]],
+) -> None:
+    by_source_key = {str(doc.get("source_key") or ""): doc for doc in evidence if isinstance(doc, dict)}
+    for item in transcriptions:
+        source_key = str(item.get("source_key") or "").strip()
+        if not source_key:
+            continue
+        seg_map = {
+            str(seg.get("anchor_id") or ""): str(seg.get("text") or "")
+            for seg in (item.get("segments") or [])
+            if isinstance(seg, dict) and str(seg.get("anchor_id") or "").strip()
+        }
+        if not seg_map:
+            continue
+
+        idx = index_lookup.get(source_key)
+        if idx and isinstance(idx, dict):
+            idx_segments = idx.get("segments") or []
+            seen: set[str] = set()
+            for seg in idx_segments:
+                if not isinstance(seg, dict):
+                    continue
+                anchor_id = str(seg.get("anchor_id") or "").strip()
+                if not anchor_id or anchor_id not in seg_map:
+                    continue
+                ocr_text = seg_map[anchor_id]
+                seg["text"] = _merge_segment_text_with_ocr(seg.get("text"), ocr_text)
+                meta = seg.get("meta") or {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta["ocr_model"] = item.get("model")
+                seg["meta"] = meta
+                seen.add(anchor_id)
+            for anchor_id, ocr_text in seg_map.items():
+                if anchor_id in seen:
+                    continue
+                idx_segments.append(
+                    {
+                        "anchor_id": anchor_id,
+                        "kind": "ocr_text",
+                        "text": _truncate_evidence_text(ocr_text),
+                        "page": _anchor_page_from_id(anchor_id),
+                        "sheet": None,
+                        "meta": {"ocr_model": item.get("model")},
+                    }
+                )
+            idx["segments"] = idx_segments
+
+        doc = by_source_key.get(source_key)
+        if not doc:
+            continue
+        doc_segments = doc.get("segments") or []
+        seen_doc: set[str] = set()
+        for seg in doc_segments:
+            if not isinstance(seg, dict):
+                continue
+            anchor_id = str(seg.get("anchor_id") or "").strip()
+            if not anchor_id or anchor_id not in seg_map:
+                continue
+            ocr_text = seg_map[anchor_id]
+            seg["text"] = _merge_segment_text_with_ocr(seg.get("text"), ocr_text)
+            meta = seg.get("meta") or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["ocr_model"] = item.get("model")
+            seg["meta"] = meta
+            seen_doc.add(anchor_id)
+        for anchor_id, ocr_text in seg_map.items():
+            if anchor_id in seen_doc:
+                continue
+            doc_segments.append(
+                {
+                    "anchor_id": anchor_id,
+                    "kind": "ocr_text",
+                    "text": _truncate_evidence_text(ocr_text),
+                    "page": _anchor_page_from_id(anchor_id),
+                    "sheet": None,
+                    "meta": {"ocr_model": item.get("model")},
+                }
+            )
+        doc["segments"] = doc_segments
+        warnings = doc.get("warnings")
+        if not isinstance(warnings, list):
+            warnings = []
+        note = f"Se añadió transcripción OCR con {item.get('model') or OCR_OPENAI_MODEL}."
+        if note not in warnings:
+            warnings.append(note)
+        doc["warnings"] = warnings
 
 
 def _validate_citations(result: Dict[str, Any], index_lookup: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -1507,65 +2323,384 @@ def run_checklist_for_card(
     card_packet: Dict[str, Any],
     model: Optional[str] = None,
     reasoning_effort: str = "high",
+    multimodal_limit_bytes: Optional[int] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> Dict[str, Any]:
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
         raise FileNotFoundError("No se encontró el espacio de trabajo de la tarjeta. Créalo primero.")
-    prep = get_card_workspace_status(paths, card_id=card_id, card_packet=card_packet).get("prep") or {}
+    diagnostics: Dict[str, Any] = {
+        "card_id": card_id,
+        "started_at": utc_now_iso(),
+        "timings": {},
+        "ocr_assets": [],
+    }
+    stage_started = time.time()
+    _report_progress(
+        progress_callback,
+        stage="preflight",
+        message="Validando estado de la revisión.",
+        diagnostics={"stage_started_at": diagnostics["started_at"]},
+    )
+    prep = get_card_workspace_status(
+        paths,
+        card_id=card_id,
+        card_packet=card_packet,
+        multimodal_limit_bytes=multimodal_limit_bytes,
+    ).get("prep") or {}
+    diagnostics["timings"]["preflight_seconds"] = round(time.time() - stage_started, 3)
     if not prep.get("readyForRun"):
         raise ValueError(str(prep.get("blockingMessage") or "Se requiere preparación antes de ejecutar la revisión."))
     checklist = load_checklist(paths)
     valid_source_keys = prep.get("validSourceKeys")
+    stage_started = time.time()
+    _report_progress(
+        progress_callback,
+        stage="evidence",
+        message="Cargando evidencia indexada.",
+    )
     evidence, index_lookup = _collect_evidence_segments(paths, card_id, allowed_source_keys=valid_source_keys)
+    diagnostics["timings"]["evidence_load_seconds"] = round(time.time() - stage_started, 3)
     if not evidence:
         raise ValueError("No se encontró evidencia indexada después de la conciliación. Prepara la revisión primero.")
+    evidence_segments = sum(len(doc.get("segments") or []) for doc in evidence if isinstance(doc, dict))
+    evidence_chars = sum(
+        len(str(seg.get("text") or ""))
+        for doc in evidence
+        if isinstance(doc, dict)
+        for seg in (doc.get("segments") or [])
+        if isinstance(seg, dict)
+    )
+    diagnostics["evidence"] = {
+        "document_count": len(evidence),
+        "segment_count": evidence_segments,
+        "text_chars": evidence_chars,
+        "checklist_item_count": len(checklist.get("items") or []),
+    }
+    multimodal_limit_bytes = resolve_multimodal_limit_bytes(multimodal_limit_bytes)
     multimodal_assets = _collect_multimodal_assets(paths, card_id, allowed_source_keys=valid_source_keys)
+    selected_multimodal_assets, omitted_multimodal_source_keys, selected_multimodal_bytes = _select_multimodal_assets(
+        multimodal_assets,
+        limit_bytes=multimodal_limit_bytes,
+    )
+    diagnostics["multimodal"] = {
+        "eligible_asset_count": len(multimodal_assets),
+        "selected_asset_count": len(selected_multimodal_assets),
+        "selected_total_bytes": selected_multimodal_bytes,
+        "limit_bytes": multimodal_limit_bytes,
+        "omitted_source_keys": omitted_multimodal_source_keys,
+    }
+    review_visual_assets_raw, ocr_assets_raw = _split_multimodal_assets_for_routing(selected_multimodal_assets)
+    review_visual_assets = _expand_multimodal_assets_for_transport(
+        review_visual_assets_raw,
+        render_pdfs=False,
+    )
+    ocr_assets = _expand_multimodal_assets_for_transport(ocr_assets_raw, render_pdfs=True)
+    diagnostics["multimodal"]["review_visual_asset_count"] = len(review_visual_assets)
+    diagnostics["multimodal"]["review_visual_total_bytes"] = sum(int(asset.get("byte_size") or 0) for asset in review_visual_assets)
+    diagnostics["multimodal"]["ocr_asset_count"] = len(ocr_assets)
+    diagnostics["multimodal"]["ocr_total_bytes"] = sum(int(asset.get("byte_size") or 0) for asset in ocr_assets)
+    _report_progress(
+        progress_callback,
+        stage="evidence",
+        message=(
+            f"Evidencia lista: {len(evidence)} documento(s), {evidence_segments} segmento(s). "
+            f"OCR Trello: {len(ocr_assets)} activo(s). "
+            f"Visión local: {len(review_visual_assets)} activo(s). "
+            f"Selección total: {len(selected_multimodal_assets)}/{len(multimodal_assets)} adjunto(s), "
+            f"{round(selected_multimodal_bytes / (1024 * 1024), 2)} MB brutos."
+        ),
+        diagnostics={
+            "evidence_documents": len(evidence),
+            "evidence_segments": evidence_segments,
+            "evidence_text_chars": evidence_chars,
+            "ocr_selected_assets": len(ocr_assets),
+            "ocr_selected_bytes": diagnostics["multimodal"]["ocr_total_bytes"],
+            "review_visual_assets": len(review_visual_assets),
+            "review_visual_bytes": diagnostics["multimodal"]["review_visual_total_bytes"],
+        },
+    )
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Falta OPENAI_API_KEY en el entorno")
     model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.4").strip()
+    ocr_transcriptions: List[Dict[str, Any]] = []
+    if ocr_assets:
+        ocr_batches = _batch_multimodal_assets(ocr_assets)
+        diagnostics["multimodal"]["ocr_batch_count"] = len(ocr_batches)
+        ocr_started = time.time()
+        _report_progress(
+            progress_callback,
+            stage="ocr_upload",
+            message=(
+                f"Subiendo archivos Trello para transcripción... {len(ocr_assets)} adjunto(s) "
+                f"en {len(ocr_batches)} lote(s)."
+            ),
+            current=0,
+            total=len(ocr_batches),
+            diagnostics={
+                "ocr_batch_count": len(ocr_batches),
+                "ocr_asset_count": len(ocr_assets),
+                "ocr_selected_bytes": diagnostics["multimodal"]["ocr_total_bytes"],
+            },
+        )
+        _report_progress(
+            progress_callback,
+            stage="ocr",
+            message=(
+                f"Esperando transcripción de imágenes... {len(ocr_assets)} adjunto(s), "
+                f"{len(ocr_batches)} lote(s) en paralelo."
+            ),
+            current=0,
+            total=len(ocr_batches),
+        )
+        ocr_transcriptions, batch_diagnostics = _transcribe_multimodal_assets(
+            api_key=api_key,
+            assets=ocr_assets,
+        )
+        diagnostics["ocr_assets"] = batch_diagnostics
+        diagnostics["timings"]["ocr_total_seconds"] = round(time.time() - ocr_started, 3)
+        _report_progress(
+            progress_callback,
+            stage="ocr",
+            message=(
+                f"Transcripción lista: {len(ocr_assets)} adjunto(s) "
+                f"en {diagnostics['timings']['ocr_total_seconds']:.1f}s."
+            ),
+            current=len(ocr_batches),
+            total=len(ocr_batches),
+        )
+    else:
+        diagnostics["timings"]["ocr_total_seconds"] = 0.0
+        diagnostics["multimodal"]["ocr_batch_count"] = 0
+        _report_progress(
+            progress_callback,
+            stage="ocr",
+            message="No se seleccionaron adjuntos de Trello para OCR; continuando con la evidencia indexada.",
+            current=0,
+            total=0,
+        )
+    _merge_ocr_transcriptions_into_evidence(
+        evidence=evidence,
+        index_lookup=index_lookup,
+        transcriptions=ocr_transcriptions,
+    )
     user_payload = build_review_user_payload(
         checklist=checklist,
         evidence=evidence,
-        multimodal_assets=_multimodal_summary_payload(multimodal_assets),
+        multimodal_assets=_multimodal_summary_payload(review_visual_assets),
         card_id=card_id,
         card_name=card_name,
         card_url=card_url,
         card_packet=card_packet,
     )
+    user_payload_json = json.dumps(user_payload, ensure_ascii=False)
+    user_payload_bytes_utf8 = len(user_payload_json.encode("utf-8"))
+    diagnostics["checklist_request"] = {
+        "requested_reasoning_effort": reasoning_effort,
+        "user_payload_chars": len(user_payload_json),
+        "user_payload_bytes_utf8": user_payload_bytes_utf8,
+    }
+    run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
+    run_dir = _runs_dir(ws_dir) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _json_dump(run_dir / "llm_request.json", user_payload)
+    _json_dump(run_dir / "ocr_transcriptions.json", {"items": ocr_transcriptions})
 
-    raw_api = _openai_request(
-        api_key=api_key,
-        model=model_name,
-        reasoning_effort=reasoning_effort,
-        system_prompt=build_system_prompt(),
-        user_payload=user_payload,
-        multimodal_assets=multimodal_assets,
+    def make_stream_capture(attempt_label: str) -> Tuple[Callable[[Dict[str, Any]], None], Dict[str, str]]:
+        stream_path = run_dir / f"llm_response_stream_{attempt_label}.jsonl"
+        partial_path = run_dir / f"llm_response_partial_{attempt_label}.txt"
+        paths = {
+            "stream": str(stream_path),
+            "partial_text": str(partial_path),
+        }
+
+        def on_event(event: Dict[str, Any]) -> None:
+            stream_path.parent.mkdir(parents=True, exist_ok=True)
+            with stream_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            if str(event.get("type") or "") == "response.output_text.delta":
+                delta = str(event.get("delta") or "")
+                if delta:
+                    with partial_path.open("a", encoding="utf-8") as f:
+                        f.write(delta)
+            elif str(event.get("type") or "") == "response.output_text.done":
+                text_value = str(event.get("text") or "")
+                if text_value and not partial_path.exists():
+                    partial_path.write_text(text_value, encoding="utf-8")
+
+        return on_event, paths
+
+    final_started = time.time()
+    _report_progress(
+        progress_callback,
+        stage="checklist",
+        message=(
+            f"Enviando checklist a {model_name}: {len(evidence)} documento(s), "
+            f"{evidence_segments} segmento(s), ~{evidence_chars} caracteres, "
+            f"{len(review_visual_assets)} activo(s) visual(es), "
+            f"{round(user_payload_bytes_utf8 / (1024 * 1024), 2)} MB JSON."
+        ),
+        diagnostics={
+            "model": model_name,
+            "evidence_documents": len(evidence),
+            "evidence_segments": evidence_segments,
+            "evidence_text_chars": evidence_chars,
+            "user_payload_bytes_utf8": user_payload_bytes_utf8,
+            "review_visual_asset_count": len(review_visual_assets),
+            "review_visual_total_bytes": sum(int(asset.get("byte_size") or 0) for asset in review_visual_assets),
+        },
     )
+    actual_reasoning_effort = reasoning_effort
+    stream_attempt_paths: List[Dict[str, str]] = []
+    try:
+        stream_callback, attempt_paths = make_stream_capture("attempt1")
+        stream_attempt_paths.append({"attempt": "attempt1", **attempt_paths})
+        diagnostics["checklist_request"]["stream_attempts"] = stream_attempt_paths
+        raw_api = _openai_request(
+            api_key=api_key,
+            model=model_name,
+            reasoning_effort=actual_reasoning_effort,
+            system_prompt=build_system_prompt(),
+            user_payload=user_payload,
+            multimodal_assets=review_visual_assets,
+            stream=True,
+            stream_event_callback=stream_callback,
+        )
+    except RuntimeError as e:
+        if "excedió el tiempo de espera" in str(e) and reasoning_effort == "high":
+            actual_reasoning_effort = "medium"
+            diagnostics["checklist_request"]["retry_after_timeout"] = True
+            diagnostics["checklist_request"]["retry_reasoning_effort"] = actual_reasoning_effort
+            _report_progress(
+                progress_callback,
+                stage="checklist_retry",
+                message=(
+                    "Revisando checklist tardó demasiado; reintentando con razonamiento medio."
+                ),
+                diagnostics={"retry_reasoning_effort": actual_reasoning_effort},
+            )
+            retry_started = time.time()
+            stream_callback, attempt_paths = make_stream_capture("attempt2")
+            stream_attempt_paths.append({"attempt": "attempt2", **attempt_paths})
+            diagnostics["checklist_request"]["stream_attempts"] = stream_attempt_paths
+            try:
+                raw_api = _openai_request(
+                    api_key=api_key,
+                    model=model_name,
+                    reasoning_effort=actual_reasoning_effort,
+                    system_prompt=build_system_prompt(),
+                    user_payload=user_payload,
+                    multimodal_assets=review_visual_assets,
+                    stream=True,
+                    stream_event_callback=stream_callback,
+                )
+            except Exception as retry_error:
+                diagnostics["finished_at"] = utc_now_iso()
+                _json_dump(
+                    run_dir / "run_failure.json",
+                    {
+                        "run_id": run_id,
+                        "created_at": utc_now_iso(),
+                        "card": {"id": card_id, "name": card_name, "url": card_url},
+                        "model": model_name,
+                        "requested_reasoning_effort": reasoning_effort,
+                        "actual_reasoning_effort": actual_reasoning_effort,
+                        "error": str(retry_error),
+                        "diagnostics": diagnostics,
+                    },
+                )
+                raise
+            diagnostics["timings"]["checklist_retry_seconds"] = round(time.time() - retry_started, 3)
+        else:
+            diagnostics["finished_at"] = utc_now_iso()
+            diagnostics["checklist_request"]["failed_before_completion"] = True
+            _json_dump(
+                run_dir / "run_failure.json",
+                {
+                    "run_id": run_id,
+                    "created_at": utc_now_iso(),
+                    "card": {"id": card_id, "name": card_name, "url": card_url},
+                    "model": model_name,
+                    "requested_reasoning_effort": reasoning_effort,
+                    "actual_reasoning_effort": actual_reasoning_effort,
+                    "error": str(e),
+                    "diagnostics": diagnostics,
+                },
+            )
+            raise
+    diagnostics["timings"]["checklist_request_seconds"] = round(time.time() - final_started, 3)
     text = _response_text_from_responses_api(raw_api)
     if not text:
+        diagnostics["finished_at"] = utc_now_iso()
+        _json_dump(
+            run_dir / "run_failure.json",
+            {
+                "run_id": run_id,
+                "created_at": utc_now_iso(),
+                "card": {"id": card_id, "name": card_name, "url": card_url},
+                "model": model_name,
+                "requested_reasoning_effort": reasoning_effort,
+                "actual_reasoning_effort": actual_reasoning_effort,
+                "error": "La respuesta de OpenAI no contenía texto de salida",
+                "diagnostics": diagnostics,
+            },
+        )
         raise RuntimeError("La respuesta de OpenAI no contenía texto de salida")
+    validate_started = time.time()
+    _report_progress(
+        progress_callback,
+        stage="finalizing",
+        message="Validando y guardando la respuesta.",
+    )
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
+        diagnostics["finished_at"] = utc_now_iso()
+        _json_dump(
+            run_dir / "run_failure.json",
+            {
+                "run_id": run_id,
+                "created_at": utc_now_iso(),
+                "card": {"id": card_id, "name": card_name, "url": card_url},
+                "model": model_name,
+                "requested_reasoning_effort": reasoning_effort,
+                "actual_reasoning_effort": actual_reasoning_effort,
+                "error": f"La salida del modelo no era JSON válido: {e}",
+                "diagnostics": diagnostics,
+                "output_text_preview": text[:5000],
+            },
+        )
         raise RuntimeError(f"La salida del modelo no era JSON válido: {e}\n{text[:1000]}") from e
 
     parsed = _align_run_items_to_checklist(parsed, checklist)
     parsed = _validate_citations(parsed, index_lookup)
     summary = _summarize_run(parsed)
+    diagnostics["timings"]["validation_seconds"] = round(time.time() - validate_started, 3)
+    diagnostics["finished_at"] = utc_now_iso()
+    diagnostics["timings"]["total_seconds"] = round(
+        diagnostics["timings"].get("preflight_seconds", 0.0)
+        + diagnostics["timings"].get("evidence_load_seconds", 0.0)
+        + diagnostics["timings"].get("ocr_total_seconds", 0.0)
+        + diagnostics["timings"].get("checklist_request_seconds", 0.0)
+        + diagnostics["timings"].get("validation_seconds", 0.0),
+        3,
+    )
 
-    run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
-    run_dir = _runs_dir(ws_dir) / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    _json_dump(run_dir / "llm_request.json", user_payload)
     _json_dump(run_dir / "llm_response_raw.json", raw_api)
     run_result = {
         "run_id": run_id,
         "created_at": utc_now_iso(),
         "model": model_name,
-        "reasoning_effort": reasoning_effort,
+        "reasoning_effort": actual_reasoning_effort,
+        "requested_reasoning_effort": reasoning_effort,
+        "ocr_model": OCR_OPENAI_MODEL,
+        "multimodal_limit_bytes": multimodal_limit_bytes,
+        "multimodal_selected_asset_count": len(selected_multimodal_assets),
+        "multimodal_selected_bytes": selected_multimodal_bytes,
+        "multimodal_omitted_source_keys": omitted_multimodal_source_keys,
+        "diagnostics": diagnostics,
         "summary": summary,
         "card": {"id": card_id, "name": card_name, "url": card_url},
         "result": parsed,

@@ -28,8 +28,12 @@ const state = {
 const PREFERRED_BOARD_NAME = "IG Tramitacion Training";
 const DISMISSED_REVIEW_JOBS_KEY = "trelloReview.dismissedReviewJobs";
 const COLLAPSED_SECTIONS_KEY = "trelloReview.collapsedSections";
+const MULTIMODAL_LIMIT_MB_KEY = "trelloReview.multimodalLimitMb";
+const SELECTED_MODEL_KEY = "trelloReview.selectedModel";
 const REVIEW_JOBS_POLL_MS = 3000;
-const FIXED_MODEL = "gpt-5.4";
+const DEFAULT_MODEL = "gpt-5.4";
+const AVAILABLE_MODELS = ["gpt-5.4", "gpt-5.4-mini"];
+const DEFAULT_MULTIMODAL_LIMIT_MB = 10;
 
 const els = {
   refreshBoardsBtn: document.getElementById("refreshBoardsBtn"),
@@ -58,6 +62,7 @@ const els = {
   runChecklistBtn: document.getElementById("runChecklistBtn"),
   modelInput: document.getElementById("modelInput"),
   reasoningEffortSelect: document.getElementById("reasoningEffortSelect"),
+  multimodalLimitInput: document.getElementById("multimodalLimitInput"),
   tokenEstimate: document.getElementById("tokenEstimate"),
   workspaceMeta: document.getElementById("workspaceMeta"),
   localFilesList: document.getElementById("localFilesList"),
@@ -296,7 +301,35 @@ function renderCards() {
 
 function syncFixedModelUi() {
   if (!els.modelInput) return;
-  els.modelInput.value = FIXED_MODEL;
+  els.modelInput.value = loadSelectedModel();
+}
+
+function normalizeSelectedModel(raw) {
+  const value = String(raw || "").trim();
+  return AVAILABLE_MODELS.includes(value) ? value : DEFAULT_MODEL;
+}
+
+function loadSelectedModel() {
+  try {
+    return normalizeSelectedModel(window.localStorage.getItem(SELECTED_MODEL_KEY));
+  } catch {
+    return DEFAULT_MODEL;
+  }
+}
+
+function persistSelectedModel() {
+  const value = normalizeSelectedModel(els.modelInput?.value);
+  if (els.modelInput) els.modelInput.value = value;
+  try {
+    window.localStorage.setItem(SELECTED_MODEL_KEY, value);
+  } catch {
+    // Ignore storage failures in desktop/webview environments.
+  }
+  return value;
+}
+
+function getSelectedModel() {
+  return normalizeSelectedModel(els.modelInput?.value);
 }
 
 function loadCollapsedSections() {
@@ -356,6 +389,50 @@ function persistDismissedReviewJobIds() {
   }
 }
 
+function normalizeMultimodalLimitMb(raw) {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return DEFAULT_MULTIMODAL_LIMIT_MB;
+  return Math.max(1, Math.min(100, Math.round(value)));
+}
+
+function loadMultimodalLimitMb() {
+  try {
+    return normalizeMultimodalLimitMb(window.localStorage.getItem(MULTIMODAL_LIMIT_MB_KEY));
+  } catch {
+    return DEFAULT_MULTIMODAL_LIMIT_MB;
+  }
+}
+
+function persistMultimodalLimitMb() {
+  const value = normalizeMultimodalLimitMb(els.multimodalLimitInput?.value);
+  if (els.multimodalLimitInput) els.multimodalLimitInput.value = String(value);
+  try {
+    window.localStorage.setItem(MULTIMODAL_LIMIT_MB_KEY, String(value));
+  } catch {
+    // Ignore storage failures in desktop/webview environments.
+  }
+  return value;
+}
+
+function getConfiguredMultimodalLimitBytes() {
+  const mb = normalizeMultimodalLimitMb(els.multimodalLimitInput?.value);
+  return mb * 1024 * 1024;
+}
+
+async function handleMultimodalLimitChange() {
+  const value = persistMultimodalLimitMb();
+  if (!state.selectedCard) {
+    if (els.multimodalLimitInput) els.multimodalLimitInput.value = String(value);
+    return;
+  }
+  try {
+    await loadWorkspaceStatus(state.currentPacket).catch(() => {});
+    refreshTokenEstimate();
+  } catch {
+    // Keep the UI responsive even if the status refresh fails.
+  }
+}
+
 function normalizeCompletedCardEntry(entry) {
   if (!entry?.card?.id || !entry?.run_id) return null;
   return {
@@ -367,7 +444,7 @@ function normalizeCompletedCardEntry(entry) {
     run_id: entry.run_id,
     finished_at: entry.finished_at || entry.created_at || null,
     run_summary: entry.run_summary || null,
-    model: entry.model || FIXED_MODEL,
+    model: entry.model || DEFAULT_MODEL,
   };
 }
 
@@ -405,12 +482,24 @@ function syncCompletedCardFromWorkspace(card = state.selectedCard, workspace = s
     run_id: latest.run_id,
     finished_at: latest.created_at,
     run_summary: latest.summary,
-    model: latest.model || FIXED_MODEL,
+    model: latest.model || DEFAULT_MODEL,
   });
 }
 
 function completedCards() {
   return Array.from(state.completedCardsById.values()).sort((a, b) => completedCardSortValue(b) - completedCardSortValue(a));
+}
+
+async function loadCompletedCardsSnapshot() {
+  try {
+    const data = await apiGet("/api/completed-cards");
+    for (const item of data.cards || []) {
+      registerCompletedCard(item);
+    }
+    renderCompletedCards();
+  } catch {
+    // Ignore startup hydration failures; live session updates still populate the list.
+  }
 }
 
 function visibleReviewJobs() {
@@ -443,6 +532,10 @@ function reviewJobStatusTone(status) {
 function reviewJobMeta(job) {
   const parts = [];
   if (job?.model) parts.push(job.model);
+  if (job?.stage && job.status === "running") parts.push(`Etapa: ${job.stage}`);
+  if (Number.isFinite(job?.progress_current) && Number.isFinite(job?.progress_total) && job.progress_total > 0) {
+    parts.push(`${job.progress_current}/${job.progress_total}`);
+  }
   if (job?.finished_at) parts.push(`Term. ${fmtDate(job.finished_at)}`);
   else if (job?.started_at) parts.push(`Inicio ${fmtDate(job.started_at)}`);
   else if (job?.created_at) parts.push(`Creada ${fmtDate(job.created_at)}`);
@@ -452,8 +545,8 @@ function reviewJobMeta(job) {
 function reviewJobSummaryText(job) {
   const counts = job?.run_summary?.counts || {};
   if (job?.status === "succeeded") return `Cumple ${counts.pass || 0} • Falla ${counts.fail || 0} • Revisar ${counts.needs_review || 0}`;
-  if (job?.status === "failed") return job?.error || "La ejecución falló.";
-  return "La revisión sigue ejecutándose en segundo plano.";
+  if (job?.status === "failed") return job?.error || job?.progress_message || "La ejecución falló.";
+  return job?.progress_message || "La revisión sigue ejecutándose en segundo plano.";
 }
 
 function dismissReviewJob(jobId) {
@@ -500,7 +593,7 @@ function renderCompletedCards() {
           </div>
           <span class="data-item-status ready">Lista</span>
         </div>
-        <div class="recent-job-meta">${escapeHtml(item.model || FIXED_MODEL)} • ${escapeHtml(item.finished_at ? `Term. ${fmtDate(item.finished_at)}` : "Fecha desconocida")}</div>
+        <div class="recent-job-meta">${escapeHtml(item.model || DEFAULT_MODEL)} • ${escapeHtml(item.finished_at ? `Term. ${fmtDate(item.finished_at)}` : "Fecha desconocida")}</div>
         <div class="recent-job-summary">${escapeHtml(reviewJobSummaryText({ status: "succeeded", run_summary: item.run_summary }))}</div>
       </div>
     `;
@@ -599,7 +692,7 @@ function notifyReviewJobTransition(job) {
     return;
   }
   if (job.status === "failed") {
-    setViewerState(`Falló la revisión de ${job.card?.name || job.card?.id || "la tarjeta"}: ${job.error || "Error desconocido"}`);
+    setViewerState(`Falló la revisión de ${job.card?.name || job.card?.id || "la tarjeta"}: ${job.error || job.progress_message || "Error desconocido"}`);
   }
 }
 
@@ -607,6 +700,22 @@ function applyReviewJobs(jobs) {
   const previous = new Map((state.reviewJobs || []).map((job) => [job.job_id, job]));
   state.reviewJobs = Array.isArray(jobs) ? jobs : [];
   syncCompletedCardsFromReviewJobs();
+  const activeSelectedJob = state.selectedCard?.id
+    ? state.reviewJobs.find((job) => job?.card?.id === state.selectedCard.id && isReviewJobActive(job))
+    : null;
+
+  if (activeSelectedJob) {
+    const before = previous.get(activeSelectedJob.job_id);
+    if (
+      !before
+      || before.progress_message !== activeSelectedJob.progress_message
+      || before.stage !== activeSelectedJob.stage
+      || before.progress_current !== activeSelectedJob.progress_current
+      || before.progress_total !== activeSelectedJob.progress_total
+    ) {
+      setViewerState(activeSelectedJob.progress_message || "La revisión sigue ejecutándose en segundo plano.");
+    }
+  }
 
   for (const job of visibleReviewJobs()) {
     const before = previous.get(job.job_id);
@@ -711,12 +820,24 @@ function renderWorkspaceItem(item, kind) {
 function renderPrepSummary(ws, prep) {
   const counts = prep?.counts || {};
   const tone = prep?.readyForRun ? "ready" : (prep?.state === "empty" ? "pending" : "stale");
+  const mm = prep?.multimodal || {};
   const actions = Array.isArray(prep?.actions) && prep.actions.length
     ? `<div class="workspace-next"><strong>Siguiente:</strong> ${escapeHtml(prep.actions.join(" "))}</div>`
     : "";
   const folder = ws?.attachmentsPath
     ? `<div><strong>Carpeta:</strong> ${escapeHtml(ws.attachmentsPath)}</div>`
     : "";
+  const multimodal = mm.assetCount
+    ? `<div>OCR multimodal: ${mm.assetCount}/${mm.eligibleAssetCount ?? mm.assetCount} adjunto(s) (${escapeHtml(bytesLabel(mm.totalBytes || 0))}${mm.limitBytes ? ` / límite ${escapeHtml(bytesLabel(mm.limitBytes))}` : ""})</div>`
+    : (Number.isFinite(mm.limitBytes) ? `<div>OCR multimodal: 0 adjuntos (${escapeHtml(bytesLabel(0))} / límite ${escapeHtml(bytesLabel(mm.limitBytes))})</div>` : "");
+  const multimodalEligible = (mm.eligibleTotalBytes && mm.eligibleTotalBytes !== mm.totalBytes)
+    ? `<div class="meta-text">Elegibles: ${escapeHtml(bytesLabel(mm.eligibleTotalBytes))}${mm.omittedCount ? ` • omitidos por límite: ${escapeHtml(String(mm.omittedCount))}` : ""}</div>`
+    : (mm.omittedCount ? `<div class="meta-text">Omitidos por límite: ${escapeHtml(String(mm.omittedCount))}</div>` : "");
+  const multimodalWarn = mm.overLimit
+    ? `<div class="meta-text" style="color:#9a2f2f;">Advertencia: la carga multimodal supera el límite configurado y algunos adjuntos se omitirán.</div>`
+    : (mm.nearLimit
+      ? `<div class="meta-text" style="color:#8a5a00;">Advertencia: la carga multimodal está cerca del límite y la revisión puede volverse lenta.</div>`
+      : "");
   return `
     <div class="workspace-status-line">
       <span class="data-item-status ${tone}">${escapeHtml(prep?.readyForRun ? "Listo" : "Requiere preparación")}</span>
@@ -724,6 +845,9 @@ function renderPrepSummary(ws, prep) {
     </div>
     <div>Evidencia: ${counts.evidenceDocs ?? 0} fuente(s) indexada(s)</div>
     <div>Local: ${counts.localIndexed ?? 0}/${counts.localTotal ?? 0} listas • Trello: ${counts.remoteIndexed ?? 0}/${counts.remoteTotal ?? 0} listas</div>
+    ${multimodal}
+    ${multimodalEligible}
+    ${multimodalWarn}
     ${folder}
     ${actions}
   `;
@@ -973,7 +1097,13 @@ function renderResults() {
     return;
   }
 
-  els.runSummary.innerHTML = `Modelo: ${run.model || "?"} • Cumple: ${run.summary?.counts?.pass||0} • Falla: ${run.summary?.counts?.fail||0}`;
+  const timing = run.diagnostics?.timings || {};
+  const timingBits = [];
+  if (Number.isFinite(timing.ocr_total_seconds)) timingBits.push(`OCR ${Number(timing.ocr_total_seconds).toFixed(1)}s`);
+  if (Number.isFinite(timing.checklist_request_seconds)) timingBits.push(`Checklist ${Number(timing.checklist_request_seconds).toFixed(1)}s`);
+  if (Number.isFinite(timing.total_seconds)) timingBits.push(`Total ${Number(timing.total_seconds).toFixed(1)}s`);
+  const timingSuffix = timingBits.length ? ` • ${timingBits.join(" • ")}` : "";
+  els.runSummary.innerHTML = `Modelo: ${run.model || "?"} • Cumple: ${run.summary?.counts?.pass||0} • Falla: ${run.summary?.counts?.fail||0}${timingSuffix}`;
   
   const items = run.result?.items || [];
   els.resultsList.innerHTML = items.length ? "" : `<div class="meta-text" style="padding:0;">No hay criterios del Checklist en la ejecución.</div>`;
@@ -1122,7 +1252,10 @@ async function loadCard(card) {
     state.currentPacket = packet.packet;
     state.currentMarkdown = packet.markdown || "";
     renderPacketViews();
-    const statusPromise = apiPost(`/api/cards/${card.id}/workspace/status`, { cardPacket: state.currentPacket });
+    const statusPromise = apiPost(`/api/cards/${card.id}/workspace/status`, {
+      cardPacket: state.currentPacket,
+      multimodal_limit_bytes: getConfiguredMultimodalLimitBytes(),
+    });
     refreshTokenEstimate();
     const status = await statusPromise;
     if (loadSeq !== state.cardLoadSeq || state.selectedCard?.id !== card.id) return;
@@ -1242,7 +1375,10 @@ async function importChecklistFile(file) {
 
 async function loadWorkspaceStatus(cardPacket = state.currentPacket) {
   if (!state.selectedCard) return null;
-  const status = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/status`, { cardPacket });
+  const status = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/status`, {
+    cardPacket,
+    multimodal_limit_bytes: getConfiguredMultimodalLimitBytes(),
+  });
   state.workspace = status.workspace || null;
   state.workspaceStatus = status.prep || null;
   renderWorkspace();
@@ -1479,11 +1615,18 @@ function groupPdfItemsToPageText(items) {
     .trim();
 }
 
+const PDF_OCR_MIN_TEXT_CHARS_PER_PAGE = 80;
+const PDF_OCR_MIN_TEXT_ITEMS_PER_PAGE = 20;
+const PDF_OCR_MIN_AVG_TEXT_CHARS_PER_PAGE = 120;
+
 async function extractPdfIndex(arrayBuffer, meta) {
   if (!window.pdfjsLib) throw new Error("La biblioteca pdf.js no se cargó");
   const pdf = await window.pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
   const segments = [];
   const pages = [];
+  let zeroTextPages = 0;
+  let lowTextPages = 0;
+  let totalTextChars = 0;
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum += 1) {
     const page = await pdf.getPage(pageNum);
     const viewport = page.getViewport({ scale: 1 });
@@ -1496,6 +1639,12 @@ async function extractPdfIndex(arrayBuffer, meta) {
     } catch {
       text = "";
     }
+    const textLength = text.length;
+    totalTextChars += textLength;
+    const isZeroTextPage = textLength === 0;
+    const isLowTextPage = textLength < PDF_OCR_MIN_TEXT_CHARS_PER_PAGE || itemCount < PDF_OCR_MIN_TEXT_ITEMS_PER_PAGE;
+    if (isZeroTextPage) zeroTextPages += 1;
+    if (isLowTextPage) lowTextPages += 1;
     const anchor = `page_${pageNum}`;
     segments.push({
       anchor_id: anchor,
@@ -1507,10 +1656,28 @@ async function extractPdfIndex(arrayBuffer, meta) {
         width: viewport.width,
         height: viewport.height,
         text_item_count: itemCount,
-        ocr_status: text ? "text_available" : "image_only",
+        text_length: textLength,
+        ocr_status: isZeroTextPage ? "image_only" : (isLowTextPage ? "low_text" : "text_available"),
       },
     });
-    pages.push({ page: pageNum, width: viewport.width, height: viewport.height, textLength: text.length, anchor_id: anchor });
+    pages.push({ page: pageNum, width: viewport.width, height: viewport.height, textLength, anchor_id: anchor });
+  }
+  const pageCount = Math.max(pdf.numPages, 1);
+  const avgTextCharsPerPage = totalTextChars / pageCount;
+  const mostlyLowText = lowTextPages >= Math.ceil(pageCount / 2);
+  const needsOcr = zeroTextPages > 0 || mostlyLowText || avgTextCharsPerPage < PDF_OCR_MIN_AVG_TEXT_CHARS_PER_PAGE;
+  const warnings = [];
+  if (zeroTextPages > 0) {
+    warnings.push(`Hay ${zeroTextPages} página(s) sin texto extraíble; el PDF parece escaneado o basado en imágenes.`);
+  }
+  if (mostlyLowText && zeroTextPages === 0) {
+    warnings.push(
+      `El PDF tiene texto extraíble muy escaso en ${lowTextPages}/${pageCount} página(s); se tratará como candidato a OCR.`
+    );
+  } else if (avgTextCharsPerPage < PDF_OCR_MIN_AVG_TEXT_CHARS_PER_PAGE && warnings.length === 0) {
+    warnings.push(
+      `El PDF tiene poco texto extraíble en promedio (${Math.round(avgTextCharsPerPage)} caracteres por página); se tratará como candidato a OCR.`
+    );
   }
   return {
     version: 1,
@@ -1520,11 +1687,15 @@ async function extractPdfIndex(arrayBuffer, meta) {
     mime_type: meta.mimeType,
     content_hash: meta.contentHash,
     extracted_at: new Date().toISOString(),
-    warnings: segments.some((s) => !s.text) ? ["Algunas páginas parecen escaneadas o solo de imagen (sin texto extraíble)."] : [],
+    warnings,
     render: {
       type: "pdf",
       page_count: pdf.numPages,
       pages,
+      ocr_candidate: needsOcr,
+      avg_text_chars_per_page: avgTextCharsPerPage,
+      low_text_pages: lowTextPages,
+      zero_text_pages: zeroTextPages,
     },
     segments,
   };
@@ -1634,13 +1805,25 @@ async function buildIndexRecord({ source, cardId, displayName, fileName, mimeTyp
   const contentHash = await sha256Hex(arrayBuffer);
   const fileKind = detectFileKind(fileName, mimeType);
   const meta = { source, cardId, displayName, fileName, mimeType, contentHash };
+  const contentBase64 = source === "trello" && ["image", "pdf"].includes(fileKind)
+    ? arrayBufferToBase64(arrayBuffer.slice(0))
+    : undefined;
   let index;
-  if (fileKind === "docx") index = await extractDocxIndex(arrayBuffer, meta);
-  else if (fileKind === "xlsx") index = await extractXlsxIndex(arrayBuffer, meta);
-  else if (fileKind === "pdf") index = await extractPdfIndex(arrayBuffer, meta);
-  else if (fileKind === "text") index = await extractTextIndex(arrayBuffer, meta);
-  else if (fileKind === "image") index = await extractImageIndex(arrayBuffer, meta);
-  else index = await extractUnknownIndex(meta);
+  try {
+    if (fileKind === "docx") index = await extractDocxIndex(arrayBuffer, meta);
+    else if (fileKind === "xlsx") index = await extractXlsxIndex(arrayBuffer, meta);
+    else if (fileKind === "pdf") index = await extractPdfIndex(arrayBuffer, meta);
+    else if (fileKind === "text") index = await extractTextIndex(arrayBuffer, meta);
+    else if (fileKind === "image") index = await extractImageIndex(arrayBuffer, meta);
+    else index = await extractUnknownIndex(meta);
+  } catch (err) {
+    index = await extractUnknownIndex(meta);
+    const detail = err?.message || String(err || "error desconocido");
+    index.warnings = [
+      ...(Array.isArray(index.warnings) ? index.warnings : []),
+      `No se pudo extraer como ${fileKind}; se guardó como índice genérico. ${detail}`,
+    ];
+  }
 
   return {
     source,
@@ -1653,6 +1836,7 @@ async function buildIndexRecord({ source, cardId, displayName, fileName, mimeTyp
     sourceLocator,
     localFile,
     trelloAttachment,
+    contentBase64,
     index,
   };
 }
@@ -1668,21 +1852,29 @@ function localContentUrl(cardId, relativePath) {
   return `/api/cards/${encodeURIComponent(cardId)}/workspace/files/content?path=${encodeURIComponent(relativePath)}`;
 }
 
+function summarizeIndexFailures(failures) {
+  if (!Array.isArray(failures) || !failures.length) return "";
+  const preview = failures.slice(0, 3).map((item) => item.message).join(" | ");
+  const suffix = failures.length > 3 ? ` | +${failures.length - 3} más` : "";
+  return `${preview}${suffix}`;
+}
+
 async function indexLocalAttachments(filesOverride = null) {
-  if (!state.selectedCard) return;
+  if (!state.selectedCard) return { savedCount: 0, failures: [] };
   if (!state.workspace?.exists) {
     setViewerState("Primero crea la carpeta del espacio de trabajo.");
-    return;
+    return { savedCount: 0, failures: [{ message: "No existe el espacio de trabajo." }] };
   }
   const files = filesOverride || state.workspaceStatus?.local?.items || state.workspace.localFiles || [];
   if (!files.length) {
     setViewerState("No se encontraron archivos locales en attachments/. Cópialos allí primero.");
-    return;
+    return { savedCount: 0, failures: [] };
   }
   els.indexLocalBtn.disabled = true;
   setViewerState(`Indexando ${files.length} archivo(s) local(es)...`);
+  let savedCount = 0;
+  const failures = [];
   try {
-    let savedCount = 0;
     for (let i = 0; i < files.length; i += 1) {
       const f = files[i];
       try {
@@ -1703,42 +1895,52 @@ async function indexLocalAttachments(filesOverride = null) {
         await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: [record] });
         savedCount += 1;
       } catch (err) {
-        throw new Error(`${f.relativePath}: ${err.message}`);
+        failures.push({ message: `${f.relativePath}: ${err.message}` });
       }
     }
     await loadWorkspaceStatus(state.currentPacket);
     refreshTokenEstimate();
-    setViewerState(`Se indexaron ${savedCount} archivo(s) local(es).`);
+    if (failures.length) {
+      setViewerState(`Se indexaron ${savedCount} archivo(s) local(es). Fallaron ${failures.length}: ${summarizeIndexFailures(failures)}`);
+    } else {
+      setViewerState(`Se indexaron ${savedCount} archivo(s) local(es).`);
+    }
   } catch (err) {
     await loadWorkspaceStatus(state.currentPacket).catch(() => {});
     refreshTokenEstimate();
     setViewerState(`Falló la indexación local: ${err.message}`);
+    failures.push({ message: err.message });
   } finally {
     els.indexLocalBtn.disabled = false;
   }
+  return { savedCount, failures };
 }
 
 async function indexTrelloAttachments(attachmentsOverride = null) {
-  if (!state.selectedCard || !state.currentPacket) return;
+  if (!state.selectedCard || !state.currentPacket) return { savedCount: 0, failures: [] };
   const attachments = attachmentsOverride || state.workspaceStatus?.remote?.items || state.currentPacket.attachments || [];
   if (!attachments.length) {
     setViewerState("La tarjeta no tiene adjuntos de Trello para indexar.");
-    return;
+    return { savedCount: 0, failures: [] };
   }
   if (!state.workspace?.exists) {
     setViewerState("Primero crea la carpeta del espacio de trabajo.");
-    return;
+    return { savedCount: 0, failures: [{ message: "No existe el espacio de trabajo." }] };
   }
   els.indexTrelloBtn.disabled = true;
   setViewerState(`Indexando ${attachments.length} adjunto(s) de Trello...`);
+  let savedCount = 0;
+  const failures = [];
   try {
-    let savedCount = 0;
     for (let i = 0; i < attachments.length; i += 1) {
       const att = attachments[i];
       const attachmentId = att.id || att.attachmentId;
       const proxyUrl = att.proxyUrl;
-      if (!proxyUrl) continue;
       const fileName = att.fileName || att.name || `attachment_${attachmentId}`;
+      if (!proxyUrl) {
+        failures.push({ message: `${fileName}: falta proxyUrl` });
+        continue;
+      }
       try {
         setViewerState(`Indexando Trello ${i + 1}/${attachments.length}: ${fileName}`);
         const { buffer, contentType } = await fetchArrayBuffer(proxyUrl);
@@ -1761,19 +1963,25 @@ async function indexTrelloAttachments(attachmentsOverride = null) {
         await apiPost(`/api/cards/${state.selectedCard.id}/workspace/indexes`, { indexes: [record] });
         savedCount += 1;
       } catch (err) {
-        throw new Error(`${fileName}: ${err.message}`);
+        failures.push({ message: `${fileName}: ${err.message}` });
       }
     }
     await loadWorkspaceStatus(state.currentPacket);
     refreshTokenEstimate();
-    setViewerState(`Se indexaron ${savedCount} adjunto(s) de Trello.`);
+    if (failures.length) {
+      setViewerState(`Se indexaron ${savedCount} adjunto(s) de Trello. Fallaron ${failures.length}: ${summarizeIndexFailures(failures)}`);
+    } else {
+      setViewerState(`Se indexaron ${savedCount} adjunto(s) de Trello.`);
+    }
   } catch (err) {
     await loadWorkspaceStatus(state.currentPacket).catch(() => {});
     refreshTokenEstimate();
     setViewerState(`Falló la indexación de Trello: ${err.message}`);
+    failures.push({ message: err.message });
   } finally {
     els.indexTrelloBtn.disabled = false;
   }
+  return { savedCount, failures };
 }
 
 async function prepareReview() {
@@ -1804,19 +2012,27 @@ async function prepareReview() {
     const pendingLocal = (state.workspaceStatus?.local?.items || []).filter((row) =>
       ["not_indexed", "changed"].includes(row.indexStatus)
     );
-    if (pendingLocal.length) {
-      await indexLocalAttachments(pendingLocal);
-    }
+    const localIndexResult = pendingLocal.length
+      ? await indexLocalAttachments(pendingLocal)
+      : { savedCount: 0, failures: [] };
 
     const pendingRemote = (state.workspaceStatus?.remote?.items || []).filter((row) =>
-      row.indexStatus === "not_indexed"
+      ["not_indexed", "changed"].includes(row.indexStatus)
     );
-    if (pendingRemote.length) {
-      await indexTrelloAttachments(pendingRemote);
-    }
+    const remoteIndexResult = pendingRemote.length
+      ? await indexTrelloAttachments(pendingRemote)
+      : { savedCount: 0, failures: [] };
 
     await loadWorkspaceStatus(state.currentPacket);
     refreshTokenEstimate();
+    const prepFailures = [
+      ...(localIndexResult.failures || []),
+      ...(remoteIndexResult.failures || []),
+    ];
+    if (prepFailures.length) {
+      setViewerState(`Preparación incompleta. Fallaron ${prepFailures.length} archivo(s): ${summarizeIndexFailures(prepFailures)}`);
+      return;
+    }
     if (state.workspaceStatus?.readyForRun) {
       setViewerState("La revisión está preparada y lista para ejecutarse.");
     } else {
@@ -1839,9 +2055,10 @@ async function runChecklist() {
   setViewerState("Encolando revisión...");
   try {
     const data = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/run-async`, {
-      model: FIXED_MODEL,
+      model: getSelectedModel(),
       reasoning_effort: els.reasoningEffortSelect.value,
       cardPacket: state.currentPacket,
+      multimodal_limit_bytes: getConfiguredMultimodalLimitBytes(),
     });
     if (data.job?.job_id) {
       state.dismissedReviewJobIds.delete(data.job.job_id);
@@ -1868,8 +2085,9 @@ async function refreshTokenEstimate() {
   renderTokenEstimate();
   try {
     const data = await apiPost(`/api/cards/${selectedCardId}/workspace/token-estimate`, {
-      model: FIXED_MODEL,
+      model: getSelectedModel(),
       cardPacket,
+      multimodal_limit_bytes: getConfiguredMultimodalLimitBytes(),
     });
     if (selectedCardId !== state.selectedCard?.id || cardPacket !== state.currentPacket) return;
     state.tokenEstimate = data.estimate || { error: "Error desconocido" };
@@ -2358,6 +2576,11 @@ function bindEvents() {
   els.addChecklistItemBtn.onclick = () => { ensureChecklistDraft().items.push(newChecklistItemDraft()); renderChecklistBuilder(); };
   
   els.reasoningEffortSelect.onchange = refreshTokenEstimate;
+  els.modelInput.onchange = () => {
+    persistSelectedModel();
+    refreshTokenEstimate();
+  };
+  els.multimodalLimitInput.onchange = handleMultimodalLimitChange;
 
   // Tabs
   els.ptabs.forEach(b => b.onclick = () => setMainTab(b.dataset.ptab));
@@ -2387,6 +2610,9 @@ function verifyLibraries() {
 async function init() {
   state.dismissedReviewJobIds = loadDismissedReviewJobIds();
   state.collapsedSections = loadCollapsedSections();
+  if (els.multimodalLimitInput) {
+    els.multimodalLimitInput.value = String(loadMultimodalLimitMb());
+  }
   bindEvents();
   syncFixedModelUi();
   renderSidebarSections();
@@ -2398,7 +2624,7 @@ async function init() {
   renderWorkspace();
   renderResults();
   startReviewJobsPolling();
-  await Promise.all([loadChecklist(), loadBoards()]);
+  await Promise.all([loadChecklist(), loadBoards(), loadCompletedCardsSnapshot()]);
 }
 
 init();

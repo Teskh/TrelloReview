@@ -13,7 +13,8 @@ except Exception:  # pragma: no cover - optional dependency for local helper
 def build_review_system_prompt() -> str:
     return (
         "You are a meticulous document review assistant. "
-        "Evaluate checklist items using only the provided evidence segments, the provided multimodal file/image assets, "
+        "Evaluate checklist items using only the provided evidence segments, which may include OCR transcriptions derived from attached Trello images/PDFs, "
+        "plus multimodal visual attachments for local uploaded images or scanned PDF pages, "
         "plus the provided Trello card description/comments context. "
         "Return exactly one result for every checklist item, in the same order, with the same item_number and item_id. "
         "Every conclusion must cite one or more evidence anchors. "
@@ -21,10 +22,11 @@ def build_review_system_prompt() -> str:
         "For each citation, set effect='supports' when it supports the item conclusion, effect='contradicts' when it cuts against the conclusion, "
         "and effect='insufficient' when the cited evidence is relevant but incomplete or ambiguous. "
         "Treat card description and comments as contextual guidance; use indexed attachment evidence as the primary source for documentary claims whenever possible. "
-        "If evidence is insufficient, ambiguous, or the document is image/scanned-only and the multimodal asset still does not resolve it, "
+        "If evidence is insufficient, ambiguous, or the document is image/scanned-only and the OCR-derived transcription still does not resolve it, "
         "return status='needs_review' and explain what is missing. "
         "Do not invent citations. Use verbatim quotes copied from the cited segment text when available. "
-        "For image-only/scanned pages or image files without quoted text, set quote to an empty string and cite the mapped anchor."
+        "For image-only/scanned pages or image files without quoted text, set quote to an empty string and cite the mapped anchor. "
+        "When a local uploaded scanned PDF page or image is attached visually, use that visual evidence directly and cite its mapped anchor_id."
     )
 
 
@@ -133,6 +135,7 @@ def estimate_review_input_tokens(
     card_packet: Dict[str, Any],
     model: Optional[str] = None,
     workspace_exists: bool = True,
+    multimodal_limit_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.4").strip()
     system_prompt = build_review_system_prompt()
@@ -161,6 +164,7 @@ def estimate_review_input_tokens(
     for c in comments:
         comments_text_chars += len(str(c.get("text") or ""))
 
+    multimodal_bytes = sum(int(a.get("byte_size") or 0) for a in (multimodal_assets or []) if isinstance(a, dict))
     response: Dict[str, Any] = {
         "available": False,
         "model": model_name,
@@ -175,7 +179,10 @@ def estimate_review_input_tokens(
             "comments_text_chars": comments_text_chars,
             "card_description_chars": len(description),
             "multimodal_assets": len(multimodal_assets or []),
-            "multimodal_bytes": sum(int(a.get("byte_size") or 0) for a in (multimodal_assets or []) if isinstance(a, dict)),
+            "multimodal_bytes": multimodal_bytes,
+        },
+        "limits": {
+            "multimodal_bytes": int(multimodal_limit_bytes or 0),
         },
         "components": {
             "system_prompt_chars": len(system_prompt),
@@ -216,4 +223,13 @@ def estimate_review_input_tokens(
         response["notes"].append(
             "Los bytes multimodales reportados son el tamaño bruto de imágenes/PDF adjuntos a la solicitud; no se convierten aquí a una estimación de tokens visuales."
         )
+    if multimodal_limit_bytes:
+        if multimodal_bytes > multimodal_limit_bytes:
+            response["notes"].append(
+                "Los adjuntos multimodales superan el límite configurado y algunos se omitirán de la solicitud."
+            )
+        elif multimodal_bytes >= int(multimodal_limit_bytes * 0.8):
+            response["notes"].append(
+                "Los adjuntos multimodales están cerca del límite configurado; la revisión puede volverse lenta."
+            )
     return response

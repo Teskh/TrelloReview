@@ -51,6 +51,7 @@ from workbench_store import (
     get_run_result,
     import_local_files_for_card,
     init_workbench_paths,
+    list_completed_run_cards,
     list_index_summaries,
     load_checklist,
     load_checklist_text,
@@ -77,7 +78,8 @@ APP_PATHS = resolve_app_paths()
 ROOT_DIR = APP_PATHS.resource_root
 UI_DIR = APP_PATHS.ui_dir
 VALID_REASONING_EFFORTS = {"low", "medium", "high"}
-FIXED_OPENAI_MODEL = "gpt-5.4"
+VALID_OPENAI_MODELS = {"gpt-5.4", "gpt-5.4-mini"}
+DEFAULT_OPENAI_MODEL = "gpt-5.4"
 STARTUP_LOG_PATH = APP_PATHS.settings_root / "startup.log"
 
 
@@ -123,6 +125,7 @@ class ReviewJob:
     card_url: str
     model: str
     reasoning_effort: str
+    multimodal_limit_bytes: int | None
     status: str
     created_at: str
     updated_at: str
@@ -130,6 +133,11 @@ class ReviewJob:
     finished_at: str | None = None
     run_id: str | None = None
     run_summary: Dict[str, Any] | None = None
+    stage: str | None = None
+    progress_message: str | None = None
+    progress_current: int | None = None
+    progress_total: int | None = None
+    diagnostics: Dict[str, Any] | None = None
     error: str | None = None
 
     def to_payload(self) -> Dict[str, Any]:
@@ -142,6 +150,7 @@ class ReviewJob:
             },
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "multimodal_limit_bytes": self.multimodal_limit_bytes,
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -149,6 +158,11 @@ class ReviewJob:
             "finished_at": self.finished_at,
             "run_id": self.run_id,
             "run_summary": self.run_summary,
+            "stage": self.stage,
+            "progress_message": self.progress_message,
+            "progress_current": self.progress_current,
+            "progress_total": self.progress_total,
+            "diagnostics": self.diagnostics,
             "error": self.error,
         }
 
@@ -174,6 +188,7 @@ class ReviewJobManager:
         card_packet: Dict[str, Any],
         model: str,
         reasoning_effort: str,
+        multimodal_limit_bytes: int | None,
     ) -> tuple[Dict[str, Any], bool]:
         with self._lock:
             for job in self._jobs.values():
@@ -188,6 +203,7 @@ class ReviewJobManager:
                 card_url=card_url,
                 model=model,
                 reasoning_effort=reasoning_effort,
+                multimodal_limit_bytes=multimodal_limit_bytes,
                 status="queued",
                 created_at=now,
                 updated_at=now,
@@ -204,6 +220,7 @@ class ReviewJobManager:
                 "card_packet": card_packet,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
+                "multimodal_limit_bytes": multimodal_limit_bytes,
             },
             daemon=True,
         )
@@ -220,6 +237,7 @@ class ReviewJobManager:
         card_packet: Dict[str, Any],
         model: str,
         reasoning_effort: str,
+        multimodal_limit_bytes: int | None,
     ) -> None:
         started_at = utc_now_iso()
         with self._lock:
@@ -229,6 +247,33 @@ class ReviewJobManager:
             job.status = "running"
             job.started_at = started_at
             job.updated_at = started_at
+            job.stage = "starting"
+            job.progress_message = "Inicializando revisión."
+            job.progress_current = None
+            job.progress_total = None
+            job.diagnostics = {"started_at": started_at}
+
+        def report_progress(
+            *,
+            stage: str,
+            message: str,
+            current: int | None = None,
+            total: int | None = None,
+            diagnostics: Dict[str, Any] | None = None,
+        ) -> None:
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if not job:
+                    return
+                job.stage = stage
+                job.progress_message = message
+                job.progress_current = current
+                job.progress_total = total
+                job.updated_at = utc_now_iso()
+                merged = dict(job.diagnostics or {})
+                if diagnostics:
+                    merged.update(diagnostics)
+                job.diagnostics = merged
 
         try:
             result = run_checklist_for_card(
@@ -239,6 +284,8 @@ class ReviewJobManager:
                 card_packet=card_packet,
                 model=model,
                 reasoning_effort=reasoning_effort,
+                multimodal_limit_bytes=multimodal_limit_bytes,
+                progress_callback=report_progress,
             )
             finished_at = utc_now_iso()
             run = result.get("run") or {}
@@ -251,6 +298,12 @@ class ReviewJobManager:
                 job.finished_at = finished_at
                 job.run_id = run.get("run_id")
                 job.run_summary = run.get("summary") if isinstance(run, dict) else None
+                job.stage = "done"
+                job.progress_message = "Revisión completada."
+                job.progress_current = None
+                job.progress_total = None
+                if isinstance(run, dict) and isinstance(run.get("diagnostics"), dict):
+                    job.diagnostics = run.get("diagnostics")
                 job.error = None
         except Exception as exc:
             finished_at = utc_now_iso()
@@ -261,7 +314,8 @@ class ReviewJobManager:
                 job.status = "failed"
                 job.updated_at = finished_at
                 job.finished_at = finished_at
-                job.error = str(exc)
+                stage = job.stage or "unknown"
+                job.error = f"[{stage}] {exc}"
 
 
 def load_config() -> AppConfig:
@@ -712,6 +766,27 @@ def parse_reasoning_effort(raw: Any) -> str:
     return value
 
 
+def parse_openai_model(raw: Any) -> str:
+    value = str(raw or "").strip() or DEFAULT_OPENAI_MODEL
+    if value not in VALID_OPENAI_MODELS:
+        raise ValueError(
+            f"model no válido: '{value}'. Se esperaba uno de: {', '.join(sorted(VALID_OPENAI_MODELS))}"
+        )
+    return value
+
+
+def parse_multimodal_limit_bytes(raw: Any) -> int | None:
+    if raw in (None, "", 0):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError("multimodal_limit_bytes debe ser un entero positivo") from e
+    if value <= 0:
+        return None
+    return value
+
+
 def get_me_and_boards(client: TrelloClient) -> Dict[str, Any]:
     me = client.get("/members/me", fields="id,fullName,username")
     boards = client.get(
@@ -1144,6 +1219,10 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 )
                 return
 
+            if path == "/api/completed-cards":
+                self._send_json(list_completed_run_cards(self.workbench_paths))
+                return
+
             if path == "/api/review-jobs":
                 self._send_json({"jobs": self.review_job_manager.list_jobs()})
                 return
@@ -1270,6 +1349,8 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     return
                 card_id = parts[2]
                 card_packet = payload.get("cardPacket")
+                multimodal_limit_bytes = parse_multimodal_limit_bytes(payload.get("multimodal_limit_bytes"))
+                model = parse_openai_model(payload.get("model"))
                 if not isinstance(card_packet, dict):
                     card_packet = get_card_packet(client, card_id=card_id)
                 card_obj = card_packet.get("card") if isinstance(card_packet, dict) else {}
@@ -1281,7 +1362,8 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     card_name=card_obj.get("name") or card_id,
                     card_url=card_obj.get("url") or "",
                     card_packet=card_packet if isinstance(card_packet, dict) else {},
-                    model=FIXED_OPENAI_MODEL,
+                    model=model,
+                    multimodal_limit_bytes=multimodal_limit_bytes,
                 )
                 self._send_json({"ok": True, "estimate": estimate})
                 return
@@ -1293,9 +1375,17 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     return
                 card_id = parts[2]
                 card_packet = payload.get("cardPacket")
+                multimodal_limit_bytes = parse_multimodal_limit_bytes(payload.get("multimodal_limit_bytes"))
                 if not isinstance(card_packet, dict):
                     card_packet = get_card_packet(client, card_id=card_id)
-                self._send_json(get_card_workspace_status(self.workbench_paths, card_id=card_id, card_packet=card_packet))
+                self._send_json(
+                    get_card_workspace_status(
+                        self.workbench_paths,
+                        card_id=card_id,
+                        card_packet=card_packet,
+                        multimodal_limit_bytes=multimodal_limit_bytes,
+                    )
+                )
                 return
 
             if path.startswith("/api/cards/") and path.endswith("/workspace/create"):
@@ -1337,8 +1427,19 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                             trello_attachment.get("attachmentId") or trello_attachment.get("id") or ""
                         ).strip()
                         if attachment_id and file_kind in {"image", "pdf"}:
-                            body, _, _ = self._download_attachment_content(client, card_id=card_id, attachment_id=attachment_id)
-                            enriched["contentBase64"] = base64.b64encode(body).decode("ascii")
+                            try:
+                                body, _, _ = self._download_attachment_content(client, card_id=card_id, attachment_id=attachment_id)
+                                enriched["contentBase64"] = base64.b64encode(body).decode("ascii")
+                            except (FileNotFoundError, RuntimeError):
+                                if isinstance(index_data, dict):
+                                    warnings = index_data.get("warnings")
+                                    if not isinstance(warnings, list):
+                                        warnings = []
+                                    warning = "No se pudo cachear el adjunto remoto; el índice se guardó sin copia local."
+                                    if warning not in warnings:
+                                        warnings.append(warning)
+                                    index_data["warnings"] = warnings
+                                    enriched["index"] = index_data
                     enriched_indexes.append(enriched)
                 card = client.get("/cards/" + card_id, fields="id,name,url")
                 result = save_indexes_for_card(
@@ -1398,15 +1499,18 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 card_id = parts[2]
                 card_packet = get_card_packet(client, card_id=card_id)
                 card = card_packet.get("card") or {}
+                model = parse_openai_model(payload.get("model"))
                 reasoning_effort = parse_reasoning_effort(payload.get("reasoning_effort"))
+                multimodal_limit_bytes = parse_multimodal_limit_bytes(payload.get("multimodal_limit_bytes"))
                 result = run_checklist_for_card(
                     self.workbench_paths,
                     card_id=card_id,
                     card_name=card.get("name") or card_id,
                     card_url=card.get("url") or "",
                     card_packet=card_packet,
-                    model=FIXED_OPENAI_MODEL,
+                    model=model,
                     reasoning_effort=reasoning_effort,
+                    multimodal_limit_bytes=multimodal_limit_bytes,
                 )
                 self._send_json({"ok": True, **result})
                 return
@@ -1423,14 +1527,17 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 card = card_packet.get("card") if isinstance(card_packet, dict) else {}
                 if not isinstance(card, dict):
                     card = {}
+                model = parse_openai_model(payload.get("model"))
                 reasoning_effort = parse_reasoning_effort(payload.get("reasoning_effort"))
+                multimodal_limit_bytes = parse_multimodal_limit_bytes(payload.get("multimodal_limit_bytes"))
                 job, existing = self.review_job_manager.start_job(
                     card_id=card_id,
                     card_name=str(card.get("name") or card_id),
                     card_url=str(card.get("url") or ""),
                     card_packet=card_packet,
-                    model=FIXED_OPENAI_MODEL,
+                    model=model,
                     reasoning_effort=reasoning_effort,
+                    multimodal_limit_bytes=multimodal_limit_bytes,
                 )
                 self._send_json({"ok": True, "job": job, "existing": existing})
                 return

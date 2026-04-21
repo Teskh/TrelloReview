@@ -148,7 +148,10 @@
                 <div class="toolbar-group">
                   <div class="field-group row">
                     <label>Modelo</label>
-                    <input id="modelInput" type="text" value="gpt-5.4" class="compact-input" readonly disabled />
+                    <select id="modelInput" class="compact-input">
+                      <option value="gpt-5.4" selected>gpt-5.4</option>
+                      <option value="gpt-5.4-mini">gpt-5.4-mini</option>
+                    </select>
                   </div>
                   <div class="field-group row">
                     <label>Razonamiento</label>
@@ -157,6 +160,10 @@
                       <option value="medium">Medio</option>
                       <option value="high" selected>Alto</option>
                     </select>
+                  </div>
+                  <div class="field-group row">
+                    <label>Límite OCR (MB)</label>
+                    <input id="multimodalLimitInput" type="number" min="1" max="100" step="1" value="10" class="compact-input" />
                   </div>
                   <button id="runChecklistBtn" class="action-btn outline" disabled>Ejecutar revisión</button>
                 </div>
