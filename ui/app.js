@@ -30,9 +30,12 @@ const DISMISSED_REVIEW_JOBS_KEY = "trelloReview.dismissedReviewJobs";
 const COLLAPSED_SECTIONS_KEY = "trelloReview.collapsedSections";
 const MULTIMODAL_LIMIT_MB_KEY = "trelloReview.multimodalLimitMb";
 const SELECTED_MODEL_KEY = "trelloReview.selectedModel";
+const SELECTED_SERVICE_TIER_KEY = "trelloReview.selectedServiceTier";
 const REVIEW_JOBS_POLL_MS = 3000;
-const DEFAULT_MODEL = "gpt-5.4";
-const AVAILABLE_MODELS = ["gpt-5.4", "gpt-5.4-mini"];
+const DEFAULT_MODEL = "gpt-5.5";
+const AVAILABLE_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"];
+const DEFAULT_SERVICE_TIER = "auto";
+const AVAILABLE_SERVICE_TIERS = ["auto", "flex"];
 const DEFAULT_MULTIMODAL_LIMIT_MB = 10;
 
 const els = {
@@ -62,6 +65,7 @@ const els = {
   runChecklistBtn: document.getElementById("runChecklistBtn"),
   modelInput: document.getElementById("modelInput"),
   reasoningEffortSelect: document.getElementById("reasoningEffortSelect"),
+  serviceTierSelect: document.getElementById("serviceTierSelect"),
   multimodalLimitInput: document.getElementById("multimodalLimitInput"),
   tokenEstimate: document.getElementById("tokenEstimate"),
   workspaceMeta: document.getElementById("workspaceMeta"),
@@ -302,6 +306,7 @@ function renderCards() {
 function syncFixedModelUi() {
   if (!els.modelInput) return;
   els.modelInput.value = loadSelectedModel();
+  if (els.serviceTierSelect) els.serviceTierSelect.value = loadSelectedServiceTier();
 }
 
 function normalizeSelectedModel(raw) {
@@ -330,6 +335,52 @@ function persistSelectedModel() {
 
 function getSelectedModel() {
   return normalizeSelectedModel(els.modelInput?.value);
+}
+
+function normalizeSelectedServiceTier(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  return AVAILABLE_SERVICE_TIERS.includes(value) ? value : DEFAULT_SERVICE_TIER;
+}
+
+function loadSelectedServiceTier() {
+  try {
+    return normalizeSelectedServiceTier(window.localStorage.getItem(SELECTED_SERVICE_TIER_KEY));
+  } catch {
+    return DEFAULT_SERVICE_TIER;
+  }
+}
+
+function persistSelectedServiceTier() {
+  const value = normalizeSelectedServiceTier(els.serviceTierSelect?.value);
+  if (els.serviceTierSelect) els.serviceTierSelect.value = value;
+  try {
+    window.localStorage.setItem(SELECTED_SERVICE_TIER_KEY, value);
+  } catch {
+    // Ignore storage failures in desktop/webview environments.
+  }
+  return value;
+}
+
+function getSelectedServiceTier() {
+  return normalizeSelectedServiceTier(els.serviceTierSelect?.value);
+}
+
+function serviceTierLabel(value) {
+  return {
+    auto: "Auto",
+    default: "Estándar",
+    flex: "Flex",
+    priority: "Priority",
+  }[String(value || "").trim().toLowerCase()] || String(value || "").trim() || "Auto";
+}
+
+function summarizeServiceTier(actual, requested = actual) {
+  const actualValue = String(actual || "").trim().toLowerCase();
+  const requestedValue = String(requested || "").trim().toLowerCase();
+  if (actualValue && requestedValue && actualValue !== requestedValue) {
+    return `${serviceTierLabel(actualValue)} (solicitado ${serviceTierLabel(requestedValue)})`;
+  }
+  return serviceTierLabel(actualValue || requestedValue || DEFAULT_SERVICE_TIER);
 }
 
 function loadCollapsedSections() {
@@ -445,6 +496,8 @@ function normalizeCompletedCardEntry(entry) {
     finished_at: entry.finished_at || entry.created_at || null,
     run_summary: entry.run_summary || null,
     model: entry.model || DEFAULT_MODEL,
+    service_tier: entry.service_tier || null,
+    requested_service_tier: entry.requested_service_tier || null,
   };
 }
 
@@ -470,6 +523,8 @@ function syncCompletedCardsFromReviewJobs() {
       finished_at: job.finished_at,
       run_summary: job.run_summary,
       model: job.model,
+      service_tier: job.service_tier,
+      requested_service_tier: job.requested_service_tier,
     });
   }
 }
@@ -483,6 +538,8 @@ function syncCompletedCardFromWorkspace(card = state.selectedCard, workspace = s
     finished_at: latest.created_at,
     run_summary: latest.summary,
     model: latest.model || DEFAULT_MODEL,
+    service_tier: latest.service_tier || null,
+    requested_service_tier: latest.requested_service_tier || null,
   });
 }
 
@@ -532,6 +589,9 @@ function reviewJobStatusTone(status) {
 function reviewJobMeta(job) {
   const parts = [];
   if (job?.model) parts.push(job.model);
+  if (job?.service_tier || job?.requested_service_tier) {
+    parts.push(`Tier: ${summarizeServiceTier(job.service_tier, job.requested_service_tier)}`);
+  }
   if (job?.stage && job.status === "running") parts.push(`Etapa: ${job.stage}`);
   if (Number.isFinite(job?.progress_current) && Number.isFinite(job?.progress_total) && job.progress_total > 0) {
     parts.push(`${job.progress_current}/${job.progress_total}`);
@@ -593,7 +653,7 @@ function renderCompletedCards() {
           </div>
           <span class="data-item-status ready">Lista</span>
         </div>
-        <div class="recent-job-meta">${escapeHtml(item.model || DEFAULT_MODEL)} • ${escapeHtml(item.finished_at ? `Term. ${fmtDate(item.finished_at)}` : "Fecha desconocida")}</div>
+        <div class="recent-job-meta">${escapeHtml(item.model || DEFAULT_MODEL)}${item.service_tier || item.requested_service_tier ? ` • ${escapeHtml(`Tier: ${summarizeServiceTier(item.service_tier, item.requested_service_tier)}`)}` : ""} • ${escapeHtml(item.finished_at ? `Term. ${fmtDate(item.finished_at)}` : "Fecha desconocida")}</div>
         <div class="recent-job-summary">${escapeHtml(reviewJobSummaryText({ status: "succeeded", run_summary: item.run_summary }))}</div>
       </div>
     `;
@@ -1103,7 +1163,8 @@ function renderResults() {
   if (Number.isFinite(timing.checklist_request_seconds)) timingBits.push(`Checklist ${Number(timing.checklist_request_seconds).toFixed(1)}s`);
   if (Number.isFinite(timing.total_seconds)) timingBits.push(`Total ${Number(timing.total_seconds).toFixed(1)}s`);
   const timingSuffix = timingBits.length ? ` • ${timingBits.join(" • ")}` : "";
-  els.runSummary.innerHTML = `Modelo: ${run.model || "?"} • Cumple: ${run.summary?.counts?.pass||0} • Falla: ${run.summary?.counts?.fail||0}${timingSuffix}`;
+  const serviceTierSummary = summarizeServiceTier(run.service_tier, run.requested_service_tier);
+  els.runSummary.innerHTML = `Modelo: ${run.model || "?"} • Tier: ${serviceTierSummary} • Cumple: ${run.summary?.counts?.pass||0} • Falla: ${run.summary?.counts?.fail||0}${timingSuffix}`;
   
   const items = run.result?.items || [];
   els.resultsList.innerHTML = items.length ? "" : `<div class="meta-text" style="padding:0;">No hay criterios del Checklist en la ejecución.</div>`;
@@ -2057,6 +2118,7 @@ async function runChecklist() {
     const data = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/run-async`, {
       model: getSelectedModel(),
       reasoning_effort: els.reasoningEffortSelect.value,
+      service_tier: getSelectedServiceTier(),
       cardPacket: state.currentPacket,
       multimodal_limit_bytes: getConfiguredMultimodalLimitBytes(),
     });
@@ -2580,6 +2642,7 @@ function bindEvents() {
     persistSelectedModel();
     refreshTokenEstimate();
   };
+  els.serviceTierSelect.onchange = persistSelectedServiceTier;
   els.multimodalLimitInput.onchange = handleMultimodalLimitChange;
 
   // Tabs

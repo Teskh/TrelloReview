@@ -357,6 +357,8 @@ def list_runs_summary(ws_dir: Path) -> List[Dict[str, Any]]:
                 "run_id": run_dir.name,
                 "created_at": data.get("created_at"),
                 "model": data.get("model"),
+                "service_tier": data.get("service_tier"),
+                "requested_service_tier": data.get("requested_service_tier"),
                 "counts": summary.get("counts"),
                 "status": summary.get("status"),
             }
@@ -392,6 +394,8 @@ def list_completed_run_cards(paths: WorkbenchPaths) -> Dict[str, Any]:
                     "counts": latest.get("counts") or {},
                 },
                 "model": latest.get("model"),
+                "service_tier": latest.get("service_tier"),
+                "requested_service_tier": latest.get("requested_service_tier"),
                 "workspaceFolder": ws_dir.name,
             }
         )
@@ -1816,6 +1820,7 @@ def _openai_structured_json_request(
     api_key: str,
     model: str,
     reasoning_effort: str,
+    service_tier: str = "auto",
     system_prompt: str,
     user_content: List[Dict[str, Any]],
     schema_name: str,
@@ -1824,10 +1829,15 @@ def _openai_structured_json_request(
     stream: bool = False,
     stream_event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
-    timeout_seconds = max(30, int(timeout_seconds or float(os.getenv("OPENAI_HTTP_TIMEOUT_SECONDS", "600"))))
+    if timeout_seconds is None:
+        env_var = "OPENAI_FLEX_HTTP_TIMEOUT_SECONDS" if service_tier == "flex" else "OPENAI_HTTP_TIMEOUT_SECONDS"
+        default_timeout = "900" if service_tier == "flex" else "600"
+        timeout_seconds = int(float(os.getenv(env_var, default_timeout)))
+    timeout_seconds = max(30, int(timeout_seconds))
     base_body = {
         "model": model,
         "reasoning": {"effort": reasoning_effort},
+        "service_tier": service_tier,
         "input": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -1916,7 +1926,7 @@ def _openai_structured_json_request(
             detail = e.read().decode("utf-8", errors="replace")
             last_err = RuntimeError(f"Error de OpenAI Responses API {e.code} (intento {attempt_idx}): {detail}")
             # If structured format is rejected, try plain JSON-prompt fallback once.
-            if attempt_idx == 1:
+            if attempt_idx == 1 and e.code != 429:
                 continue
             raise last_err from e
         except (TimeoutError, socket.timeout) as e:
@@ -1941,6 +1951,7 @@ def _openai_request(
     api_key: str,
     model: str,
     reasoning_effort: str = "high",
+    service_tier: str = "auto",
     system_prompt: str,
     user_payload: Dict[str, Any],
     multimodal_assets: Optional[List[Dict[str, Any]]] = None,
@@ -1955,6 +1966,7 @@ def _openai_request(
         api_key=api_key,
         model=model,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         system_prompt=system_prompt,
         user_content=user_content,
         schema_name="checklist_review",
@@ -2019,6 +2031,11 @@ def _transcribe_multimodal_batch(
         "elapsed_seconds": round(time.time() - started, 3),
     }
     return results, diagnostics
+
+
+def _is_flex_resource_unavailable_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "429" in text and "resource unavailable" in text
 
 
 def _transcribe_multimodal_assets(
@@ -2323,6 +2340,7 @@ def run_checklist_for_card(
     card_packet: Dict[str, Any],
     model: Optional[str] = None,
     reasoning_effort: str = "high",
+    service_tier: str = "auto",
     multimodal_limit_bytes: Optional[int] = None,
     progress_callback: Optional[Callable[..., None]] = None,
 ) -> Dict[str, Any]:
@@ -2424,7 +2442,7 @@ def run_checklist_for_card(
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Falta OPENAI_API_KEY en el entorno")
-    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.4").strip()
+    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.5").strip()
     ocr_transcriptions: List[Dict[str, Any]] = []
     if ocr_assets:
         ocr_batches = _batch_multimodal_assets(ocr_assets)
@@ -2499,6 +2517,7 @@ def run_checklist_for_card(
     user_payload_bytes_utf8 = len(user_payload_json.encode("utf-8"))
     diagnostics["checklist_request"] = {
         "requested_reasoning_effort": reasoning_effort,
+        "requested_service_tier": service_tier,
         "user_payload_chars": len(user_payload_json),
         "user_payload_bytes_utf8": user_payload_bytes_utf8,
     }
@@ -2540,10 +2559,12 @@ def run_checklist_for_card(
             f"Enviando checklist a {model_name}: {len(evidence)} documento(s), "
             f"{evidence_segments} segmento(s), ~{evidence_chars} caracteres, "
             f"{len(review_visual_assets)} activo(s) visual(es), "
-            f"{round(user_payload_bytes_utf8 / (1024 * 1024), 2)} MB JSON."
+            f"{round(user_payload_bytes_utf8 / (1024 * 1024), 2)} MB JSON, "
+            f"tier={service_tier}."
         ),
         diagnostics={
             "model": model_name,
+            "requested_service_tier": service_tier,
             "evidence_documents": len(evidence),
             "evidence_segments": evidence_segments,
             "evidence_text_chars": evidence_chars,
@@ -2553,6 +2574,7 @@ def run_checklist_for_card(
         },
     )
     actual_reasoning_effort = reasoning_effort
+    actual_service_tier = service_tier
     stream_attempt_paths: List[Dict[str, str]] = []
     try:
         stream_callback, attempt_paths = make_stream_capture("attempt1")
@@ -2562,6 +2584,7 @@ def run_checklist_for_card(
             api_key=api_key,
             model=model_name,
             reasoning_effort=actual_reasoning_effort,
+            service_tier=actual_service_tier,
             system_prompt=build_system_prompt(),
             user_payload=user_payload,
             multimodal_assets=review_visual_assets,
@@ -2569,7 +2592,52 @@ def run_checklist_for_card(
             stream_event_callback=stream_callback,
         )
     except RuntimeError as e:
-        if "excedió el tiempo de espera" in str(e) and reasoning_effort == "high":
+        if actual_service_tier == "flex" and _is_flex_resource_unavailable_error(e):
+            actual_service_tier = "auto"
+            diagnostics["checklist_request"]["retry_after_resource_unavailable"] = True
+            diagnostics["checklist_request"]["retry_service_tier"] = actual_service_tier
+            _report_progress(
+                progress_callback,
+                stage="checklist_retry",
+                message="Flex quedó sin capacidad disponible; reintentando con tier automático.",
+                diagnostics={"retry_service_tier": actual_service_tier},
+            )
+            retry_started = time.time()
+            stream_callback, attempt_paths = make_stream_capture("attempt2")
+            stream_attempt_paths.append({"attempt": "attempt2", **attempt_paths})
+            diagnostics["checklist_request"]["stream_attempts"] = stream_attempt_paths
+            try:
+                raw_api = _openai_request(
+                    api_key=api_key,
+                    model=model_name,
+                    reasoning_effort=actual_reasoning_effort,
+                    service_tier=actual_service_tier,
+                    system_prompt=build_system_prompt(),
+                    user_payload=user_payload,
+                    multimodal_assets=review_visual_assets,
+                    stream=True,
+                    stream_event_callback=stream_callback,
+                )
+            except Exception as retry_error:
+                diagnostics["finished_at"] = utc_now_iso()
+                _json_dump(
+                    run_dir / "run_failure.json",
+                    {
+                        "run_id": run_id,
+                        "created_at": utc_now_iso(),
+                        "card": {"id": card_id, "name": card_name, "url": card_url},
+                        "model": model_name,
+                        "requested_reasoning_effort": reasoning_effort,
+                        "actual_reasoning_effort": actual_reasoning_effort,
+                        "requested_service_tier": service_tier,
+                        "actual_service_tier": actual_service_tier,
+                        "error": str(retry_error),
+                        "diagnostics": diagnostics,
+                    },
+                )
+                raise
+            diagnostics["timings"]["checklist_retry_seconds"] = round(time.time() - retry_started, 3)
+        elif "excedió el tiempo de espera" in str(e) and reasoning_effort == "high":
             actual_reasoning_effort = "medium"
             diagnostics["checklist_request"]["retry_after_timeout"] = True
             diagnostics["checklist_request"]["retry_reasoning_effort"] = actual_reasoning_effort
@@ -2590,6 +2658,7 @@ def run_checklist_for_card(
                     api_key=api_key,
                     model=model_name,
                     reasoning_effort=actual_reasoning_effort,
+                    service_tier=actual_service_tier,
                     system_prompt=build_system_prompt(),
                     user_payload=user_payload,
                     multimodal_assets=review_visual_assets,
@@ -2607,6 +2676,8 @@ def run_checklist_for_card(
                         "model": model_name,
                         "requested_reasoning_effort": reasoning_effort,
                         "actual_reasoning_effort": actual_reasoning_effort,
+                        "requested_service_tier": service_tier,
+                        "actual_service_tier": actual_service_tier,
                         "error": str(retry_error),
                         "diagnostics": diagnostics,
                     },
@@ -2625,12 +2696,15 @@ def run_checklist_for_card(
                     "model": model_name,
                     "requested_reasoning_effort": reasoning_effort,
                     "actual_reasoning_effort": actual_reasoning_effort,
+                    "requested_service_tier": service_tier,
+                    "actual_service_tier": actual_service_tier,
                     "error": str(e),
                     "diagnostics": diagnostics,
                 },
             )
             raise
     diagnostics["timings"]["checklist_request_seconds"] = round(time.time() - final_started, 3)
+    actual_service_tier = str(raw_api.get("service_tier") or actual_service_tier)
     text = _response_text_from_responses_api(raw_api)
     if not text:
         diagnostics["finished_at"] = utc_now_iso()
@@ -2643,6 +2717,8 @@ def run_checklist_for_card(
                 "model": model_name,
                 "requested_reasoning_effort": reasoning_effort,
                 "actual_reasoning_effort": actual_reasoning_effort,
+                "requested_service_tier": service_tier,
+                "actual_service_tier": actual_service_tier,
                 "error": "La respuesta de OpenAI no contenía texto de salida",
                 "diagnostics": diagnostics,
             },
@@ -2667,6 +2743,8 @@ def run_checklist_for_card(
                 "model": model_name,
                 "requested_reasoning_effort": reasoning_effort,
                 "actual_reasoning_effort": actual_reasoning_effort,
+                "requested_service_tier": service_tier,
+                "actual_service_tier": actual_service_tier,
                 "error": f"La salida del modelo no era JSON válido: {e}",
                 "diagnostics": diagnostics,
                 "output_text_preview": text[:5000],
@@ -2693,6 +2771,8 @@ def run_checklist_for_card(
         "run_id": run_id,
         "created_at": utc_now_iso(),
         "model": model_name,
+        "service_tier": actual_service_tier,
+        "requested_service_tier": service_tier,
         "reasoning_effort": actual_reasoning_effort,
         "requested_reasoning_effort": reasoning_effort,
         "ocr_model": OCR_OPENAI_MODEL,
@@ -2718,6 +2798,8 @@ def run_checklist_for_card(
             "run_id": run_id,
             "created_at": run_result["created_at"],
             "model": model_name,
+            "service_tier": actual_service_tier,
+            "requested_service_tier": service_tier,
             "reasoning_effort": reasoning_effort,
             "summary": summary,
         },

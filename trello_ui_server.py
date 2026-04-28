@@ -78,8 +78,10 @@ APP_PATHS = resolve_app_paths()
 ROOT_DIR = APP_PATHS.resource_root
 UI_DIR = APP_PATHS.ui_dir
 VALID_REASONING_EFFORTS = {"low", "medium", "high"}
-VALID_OPENAI_MODELS = {"gpt-5.4", "gpt-5.4-mini"}
-DEFAULT_OPENAI_MODEL = "gpt-5.4"
+VALID_OPENAI_MODELS = {"gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
+VALID_OPENAI_SERVICE_TIERS = {"auto", "flex"}
+DEFAULT_OPENAI_MODEL = "gpt-5.5"
+DEFAULT_OPENAI_SERVICE_TIER = "auto"
 STARTUP_LOG_PATH = APP_PATHS.settings_root / "startup.log"
 
 
@@ -125,6 +127,8 @@ class ReviewJob:
     card_url: str
     model: str
     reasoning_effort: str
+    requested_service_tier: str
+    service_tier: str
     multimodal_limit_bytes: int | None
     status: str
     created_at: str
@@ -150,6 +154,8 @@ class ReviewJob:
             },
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "requested_service_tier": self.requested_service_tier,
+            "service_tier": self.service_tier,
             "multimodal_limit_bytes": self.multimodal_limit_bytes,
             "status": self.status,
             "created_at": self.created_at,
@@ -188,6 +194,7 @@ class ReviewJobManager:
         card_packet: Dict[str, Any],
         model: str,
         reasoning_effort: str,
+        service_tier: str,
         multimodal_limit_bytes: int | None,
     ) -> tuple[Dict[str, Any], bool]:
         with self._lock:
@@ -203,6 +210,8 @@ class ReviewJobManager:
                 card_url=card_url,
                 model=model,
                 reasoning_effort=reasoning_effort,
+                requested_service_tier=service_tier,
+                service_tier=service_tier,
                 multimodal_limit_bytes=multimodal_limit_bytes,
                 status="queued",
                 created_at=now,
@@ -220,6 +229,7 @@ class ReviewJobManager:
                 "card_packet": card_packet,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
+                "service_tier": service_tier,
                 "multimodal_limit_bytes": multimodal_limit_bytes,
             },
             daemon=True,
@@ -237,6 +247,7 @@ class ReviewJobManager:
         card_packet: Dict[str, Any],
         model: str,
         reasoning_effort: str,
+        service_tier: str,
         multimodal_limit_bytes: int | None,
     ) -> None:
         started_at = utc_now_iso()
@@ -284,6 +295,7 @@ class ReviewJobManager:
                 card_packet=card_packet,
                 model=model,
                 reasoning_effort=reasoning_effort,
+                service_tier=service_tier,
                 multimodal_limit_bytes=multimodal_limit_bytes,
                 progress_callback=report_progress,
             )
@@ -298,6 +310,7 @@ class ReviewJobManager:
                 job.finished_at = finished_at
                 job.run_id = run.get("run_id")
                 job.run_summary = run.get("summary") if isinstance(run, dict) else None
+                job.service_tier = str(run.get("service_tier") or job.service_tier)
                 job.stage = "done"
                 job.progress_message = "Revisión completada."
                 job.progress_current = None
@@ -771,6 +784,17 @@ def parse_openai_model(raw: Any) -> str:
     if value not in VALID_OPENAI_MODELS:
         raise ValueError(
             f"model no válido: '{value}'. Se esperaba uno de: {', '.join(sorted(VALID_OPENAI_MODELS))}"
+        )
+    return value
+
+
+def parse_openai_service_tier(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if not value:
+        return DEFAULT_OPENAI_SERVICE_TIER
+    if value not in VALID_OPENAI_SERVICE_TIERS:
+        raise ValueError(
+            f"service_tier no válido: '{value}'. Se esperaba uno de: {', '.join(sorted(VALID_OPENAI_SERVICE_TIERS))}"
         )
     return value
 
@@ -1501,6 +1525,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 card = card_packet.get("card") or {}
                 model = parse_openai_model(payload.get("model"))
                 reasoning_effort = parse_reasoning_effort(payload.get("reasoning_effort"))
+                service_tier = parse_openai_service_tier(payload.get("service_tier"))
                 multimodal_limit_bytes = parse_multimodal_limit_bytes(payload.get("multimodal_limit_bytes"))
                 result = run_checklist_for_card(
                     self.workbench_paths,
@@ -1510,6 +1535,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     card_packet=card_packet,
                     model=model,
                     reasoning_effort=reasoning_effort,
+                    service_tier=service_tier,
                     multimodal_limit_bytes=multimodal_limit_bytes,
                 )
                 self._send_json({"ok": True, **result})
@@ -1529,6 +1555,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     card = {}
                 model = parse_openai_model(payload.get("model"))
                 reasoning_effort = parse_reasoning_effort(payload.get("reasoning_effort"))
+                service_tier = parse_openai_service_tier(payload.get("service_tier"))
                 multimodal_limit_bytes = parse_multimodal_limit_bytes(payload.get("multimodal_limit_bytes"))
                 job, existing = self.review_job_manager.start_job(
                     card_id=card_id,
@@ -1537,6 +1564,7 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                     card_packet=card_packet,
                     model=model,
                     reasoning_effort=reasoning_effort,
+                    service_tier=service_tier,
                     multimodal_limit_bytes=multimodal_limit_bytes,
                 )
                 self._send_json({"ok": True, "job": job, "existing": existing})
