@@ -19,8 +19,7 @@ review_workspace/
 /build
 /dist
 *.spec
-!Trello Review.spec
-!Trello Review Debug.spec
+build-release*.ps1
 
 # misc
 .DS_Store
