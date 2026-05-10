@@ -1961,26 +1961,40 @@ def _collect_open_review_multimodal_assets(paths: WorkbenchPaths) -> List[Dict[s
             data = _load_index_by_source_key(ws_dir, manifest, source_key)
         except Exception:
             continue
-        if not _index_needs_multimodal(data):
+        file_kind = str((data.get("file_kind") if isinstance(data, dict) else "") or entry.get("file_kind") or "").lower()
+        mime_type = str((data.get("mime_type") if isinstance(data, dict) else "") or entry.get("mime_type") or detect_mime_from_name(str(entry.get("display_name") or ""))).split(";")[0].lower()
+        if file_kind not in {"image", "pdf"}:
+            continue
+        warnings = (data.get("warnings") if isinstance(data, dict) else None) or entry.get("warnings") or []
+        if file_kind == "pdf" and not warnings:
+            continue
+        if file_kind == "image" and mime_type not in MULTIMODAL_SUPPORTED_IMAGE_MIME_TYPES:
             continue
         rel = ((entry.get("source_locator") or {}) if isinstance(entry.get("source_locator"), dict) else {}).get("relativePath")
         if not rel:
             rel = str(source_key).replace("open_review:", "", 1)
         try:
             path = get_open_review_file_path(paths, str(rel))
-            content = path.read_bytes()
         except Exception:
             continue
-        mime_type = str(entry.get("mime_type") or detect_mime_from_name(str(rel)))
+        byte_size = path.stat().st_size
+        anchor_ids = []
+        for seg in data.get("segments") or []:
+            if isinstance(seg, dict) and seg.get("anchor_id"):
+                anchor_ids.append(str(seg.get("anchor_id")))
         assets.append(
             {
                 "source_key": source_key,
                 "display_name": entry.get("display_name") or Path(str(rel)).name,
-                "file_kind": entry.get("file_kind"),
+                "file_kind": file_kind,
                 "mime_type": mime_type,
-                "content_base64": base64.b64encode(content).decode("ascii"),
-                "byte_size": len(content),
-                "source_origin": "global_open_review",
+                "byte_size": byte_size,
+                "source_path": str(path),
+                "anchor_hint": "image_full" if file_kind == "image" else "page_<n>",
+                "warnings": warnings,
+                "anchor_ids": anchor_ids,
+                "visual_anchor_ids": _pdf_visual_anchor_ids(data) if file_kind == "pdf" else anchor_ids,
+                "source_origin": "local",
                 "source_locator": entry.get("source_locator") or {},
             }
         )
