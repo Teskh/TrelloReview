@@ -19,6 +19,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from llm_review_payloads import (
+    build_open_review_system_prompt,
+    build_open_review_user_payload,
     build_review_system_prompt,
     build_review_user_payload,
     estimate_review_input_tokens,
@@ -84,6 +86,7 @@ class WorkbenchPaths:
     cards_dir: Path
     checklist_file: Path
     checklist_template_file: Optional[Path] = None
+    open_review_file: Optional[Path] = None
 
 
 def init_workbench_paths(
@@ -91,6 +94,7 @@ def init_workbench_paths(
     *,
     checklist_file: Optional[Path] = None,
     checklist_template_file: Optional[Path] = None,
+    open_review_file: Optional[Path] = None,
 ) -> WorkbenchPaths:
     cards_dir = root / "cards"
     root.mkdir(parents=True, exist_ok=True)
@@ -102,8 +106,10 @@ def init_workbench_paths(
         cards_dir=cards_dir,
         checklist_file=checklist_path,
         checklist_template_file=checklist_template_file,
+        open_review_file=open_review_file or (root / "open_review_prompt.json"),
     )
     _ensure_checklist_file(paths)
+    _ensure_open_review_file(paths)
     return paths
 
 
@@ -166,6 +172,72 @@ def save_checklist_text(paths: WorkbenchPaths, text: str) -> Dict[str, Any]:
 
 def reset_checklist(paths: WorkbenchPaths) -> Dict[str, Any]:
     return save_checklist(paths, default_checklist(paths.checklist_template_file))
+
+
+def default_open_review_config() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "name": "Revisión abierta",
+        "system_prompt": build_open_review_system_prompt(),
+        "default_question": (
+            "Revisa el expediente y los documentos legales de referencia. "
+            "Indica qué parece faltar, estar incorrecto, ser inconsistente o requerir revisión humana, "
+            "citando tanto la ley/documento de referencia como la evidencia del expediente cuando corresponda."
+        ),
+    }
+
+
+def validate_and_normalize_open_review_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("La configuración de revisión abierta debe ser un objeto JSON")
+    system_prompt = str(payload.get("system_prompt") or "").strip()
+    if not system_prompt:
+        raise ValueError("La revisión abierta requiere un system prompt")
+    default_question = str(payload.get("default_question") or "").strip()
+    if not default_question:
+        raise ValueError("La revisión abierta requiere una pregunta predeterminada")
+    return {
+        "version": int(payload.get("version") or 1),
+        "name": str(payload.get("name") or "Revisión abierta").strip() or "Revisión abierta",
+        "system_prompt": system_prompt,
+        "default_question": default_question,
+    }
+
+
+def _open_review_file(paths: WorkbenchPaths) -> Path:
+    return paths.open_review_file or (paths.root / "open_review_prompt.json")
+
+
+def _ensure_open_review_file(paths: WorkbenchPaths) -> None:
+    path = _open_review_file(paths)
+    if not path.exists():
+        _json_dump(path, default_open_review_config())
+
+
+def load_open_review_config(paths: WorkbenchPaths) -> Dict[str, Any]:
+    _ensure_open_review_file(paths)
+    raw = _json_load(_open_review_file(paths), default_open_review_config())
+    return validate_and_normalize_open_review_config(raw)
+
+
+def load_open_review_config_text(paths: WorkbenchPaths) -> str:
+    _ensure_open_review_file(paths)
+    return _open_review_file(paths).read_text(encoding="utf-8")
+
+
+def save_open_review_config(paths: WorkbenchPaths, payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = validate_and_normalize_open_review_config(payload)
+    _open_review_file(paths).write_text(json.dumps(normalized, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return normalized
+
+
+def save_open_review_config_text(paths: WorkbenchPaths, text: str) -> Dict[str, Any]:
+    parsed = json.loads(text)
+    return save_open_review_config(paths, parsed)
+
+
+def reset_open_review_config(paths: WorkbenchPaths) -> Dict[str, Any]:
+    return save_open_review_config(paths, default_open_review_config())
 
 
 def _auto_item_id(idx: int, title: str, seen: set[str]) -> str:
@@ -242,6 +314,10 @@ def _card_meta_path(ws_dir: Path) -> Path:
 
 def _indexes_dir(ws_dir: Path) -> Path:
     return ws_dir / "indexes"
+
+
+def _open_review_docs_dir(paths: WorkbenchPaths) -> Path:
+    return paths.root / "open_review_documents"
 
 
 def _runs_dir(ws_dir: Path) -> Path:
@@ -355,6 +431,7 @@ def list_runs_summary(ws_dir: Path) -> List[Dict[str, Any]]:
         out.append(
             {
                 "run_id": run_dir.name,
+                "run_type": data.get("run_type") or "checklist",
                 "created_at": data.get("created_at"),
                 "model": data.get("model"),
                 "service_tier": data.get("service_tier"),
@@ -388,6 +465,7 @@ def list_completed_run_cards(paths: WorkbenchPaths) -> Dict[str, Any]:
                     "url": str(meta.get("url") or ""),
                 },
                 "run_id": latest.get("run_id"),
+                "run_type": latest.get("run_type") or "checklist",
                 "finished_at": latest.get("created_at"),
                 "run_summary": {
                     "status": latest.get("status"),
@@ -450,6 +528,44 @@ def get_card_workspace_info(paths: WorkbenchPaths, card_id: str) -> Dict[str, An
         "manifest": manifest,
         "localFiles": local_files,
         "runs": list_runs_summary(ws_dir),
+    }
+
+
+def ensure_open_review_documents_workspace(paths: WorkbenchPaths) -> Dict[str, Any]:
+    ws_dir = _open_review_docs_dir(paths)
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    _attachments_dir(ws_dir).mkdir(parents=True, exist_ok=True)
+    _indexes_dir(ws_dir).mkdir(parents=True, exist_ok=True)
+    manifest = _load_manifest(ws_dir, "open_review_global")
+    _save_manifest(ws_dir, manifest)
+    return get_open_review_documents_info(paths)
+
+
+def get_open_review_documents_info(paths: WorkbenchPaths) -> Dict[str, Any]:
+    ws_dir = _open_review_docs_dir(paths)
+    if not ws_dir.exists():
+        return {"exists": False, "documents": [], "stale": [], "indexes": []}
+    manifest = _load_manifest(ws_dir, "open_review_global")
+    local_items, stale = _scan_local_workspace_sources(ws_dir, manifest)
+    for row in local_items:
+        if isinstance(row, dict) and str(row.get("sourceKey") or "").startswith("local:"):
+            row["sourceKey"] = "open_review:" + str(row.get("relativePath") or "").strip()
+    for row in stale:
+        if isinstance(row, dict) and str(row.get("sourceKey") or "").startswith("local:"):
+            row["sourceKey"] = "open_review:" + str(row.get("relativePath") or "").strip()
+    indexes = []
+    for source_key, entry in sorted((manifest.get("indexes") or {}).items()):
+        if isinstance(entry, dict):
+            row = dict(entry)
+            row["source_key"] = source_key
+            indexes.append(row)
+    return {
+        "exists": True,
+        "workspacePath": str(ws_dir),
+        "attachmentsPath": str(_attachments_dir(ws_dir)),
+        "documents": local_items,
+        "stale": stale,
+        "indexes": indexes,
     }
 
 
@@ -744,6 +860,17 @@ def get_local_file_path(paths: WorkbenchPaths, card_id: str, rel_path: str) -> P
     return candidate
 
 
+def get_open_review_file_path(paths: WorkbenchPaths, rel_path: str) -> Path:
+    ws_dir = _open_review_docs_dir(paths)
+    attachments_dir = _attachments_dir(ws_dir).resolve()
+    candidate = (attachments_dir / rel_path).resolve()
+    if attachments_dir not in [candidate, *candidate.parents]:
+        raise ValueError("Ruta relativa no válida")
+    if not candidate.is_file():
+        raise FileNotFoundError("No se encontró el archivo")
+    return candidate
+
+
 def import_local_files_for_card(
     paths: WorkbenchPaths,
     *,
@@ -783,6 +910,123 @@ def import_local_files_for_card(
         saved.append({"name": safe_name, "size": len(body)})
 
     return {"saved": saved, "workspace": get_card_workspace_info(paths, card_id)}
+
+
+def import_open_review_documents(paths: WorkbenchPaths, *, files: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ensure_open_review_documents_workspace(paths)
+    ws_dir = _open_review_docs_dir(paths)
+    attachments_dir = _attachments_dir(ws_dir).resolve()
+    saved: List[Dict[str, Any]] = []
+
+    for idx, payload in enumerate(files, start=1):
+        if not isinstance(payload, dict):
+            raise ValueError(f"La carga útil del archivo #{idx} debe ser un objeto")
+        raw_name = str(payload.get("name") or "").strip()
+        if not raw_name:
+            raise ValueError(f"A la carga útil del archivo #{idx} le falta el nombre")
+        safe_name = Path(raw_name.replace("\\", "/")).name.strip()
+        if not safe_name:
+            raise ValueError(f"La carga útil del archivo #{idx} tiene un nombre no válido")
+        raw_content = payload.get("contentBase64")
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            raise ValueError(f"A la carga útil del archivo #{idx} le falta `contentBase64`")
+        try:
+            body = base64.b64decode(raw_content.encode("ascii"), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError(f"La carga útil del archivo #{idx} tiene contenido base64 no válido") from exc
+
+        target = (attachments_dir / safe_name).resolve()
+        if attachments_dir not in [target, *target.parents]:
+            raise ValueError(f"Ruta de destino no válida para la carga útil del archivo #{idx}")
+        target.write_bytes(body)
+        saved.append({"name": safe_name, "relativePath": safe_name, "size": len(body)})
+
+    return {"saved": saved, "openReviewDocuments": get_open_review_documents_info(paths)}
+
+
+def delete_local_file_for_card(
+    paths: WorkbenchPaths,
+    *,
+    card_id: str,
+    relative_path: str,
+) -> Dict[str, Any]:
+    ws_dir = _find_card_workspace_dir(paths, card_id)
+    if not ws_dir:
+        raise FileNotFoundError("No se encontró el espacio de trabajo")
+    rel = str(relative_path or "").strip()
+    if not rel:
+        raise ValueError("Falta la ruta relativa del archivo local")
+
+    manifest = _load_manifest(ws_dir, card_id)
+    manifest_local = manifest.get("local_files", {})
+    local_entry = manifest_local.get(rel, {}) if isinstance(manifest_local, dict) else {}
+    source_key = str((local_entry or {}).get("source_key") or f"local:{rel}")
+    index_entry = (manifest.get("indexes") or {}).get(source_key, {})
+    idx_rel = index_entry.get("index_file") if isinstance(index_entry, dict) else None
+
+    target = get_local_file_path(paths, card_id, rel)
+    target.unlink()
+
+    removed_index_file = None
+    if idx_rel:
+        idx_path = (ws_dir / str(idx_rel)).resolve()
+        if ws_dir.resolve() in [idx_path, *idx_path.parents] and idx_path.is_file():
+            idx_path.unlink()
+            removed_index_file = str(idx_rel)
+
+    indexes = manifest.get("indexes") or {}
+    indexes.pop(source_key, None)
+    manifest["indexes"] = indexes
+
+    local_files = manifest.get("local_files") or {}
+    local_files.pop(rel, None)
+    manifest["local_files"] = local_files
+
+    _save_manifest(ws_dir, manifest)
+    return {
+        "deleted": {"relativePath": rel, "sourceKey": source_key, "indexFile": removed_index_file},
+        "workspace": get_card_workspace_info(paths, card_id),
+    }
+
+
+def delete_open_review_document(paths: WorkbenchPaths, *, relative_path: str) -> Dict[str, Any]:
+    ws_dir = _open_review_docs_dir(paths)
+    if not ws_dir.exists():
+        raise FileNotFoundError("No se encontró la carpeta global de revisión abierta")
+    rel = str(relative_path or "").strip()
+    if not rel:
+        raise ValueError("Falta la ruta relativa del documento")
+
+    manifest = _load_manifest(ws_dir, "open_review_global")
+    manifest_local = manifest.get("local_files", {})
+    local_entry = manifest_local.get(rel, {}) if isinstance(manifest_local, dict) else {}
+    source_key = str((local_entry or {}).get("source_key") or f"open_review:{rel}")
+    index_entry = (manifest.get("indexes") or {}).get(source_key, {})
+    idx_rel = index_entry.get("index_file") if isinstance(index_entry, dict) else None
+
+    target = get_open_review_file_path(paths, rel)
+    target.unlink()
+
+    removed_index_file = None
+    if idx_rel:
+        idx_path = (ws_dir / str(idx_rel)).resolve()
+        if ws_dir.resolve() in [idx_path, *idx_path.parents] and idx_path.is_file():
+            idx_path.unlink()
+            removed_index_file = str(idx_rel)
+
+    indexes = manifest.get("indexes") or {}
+    indexes.pop(source_key, None)
+    manifest["indexes"] = indexes
+
+    local_files = manifest.get("local_files") or {}
+    local_files.pop(rel, None)
+    manifest["local_files"] = local_files
+
+    _save_manifest(ws_dir, manifest)
+    return {
+        "deleted": {"relativePath": rel, "sourceKey": source_key, "indexFile": removed_index_file},
+        "openReviewDocuments": get_open_review_documents_info(paths),
+    }
 
 
 def _index_filename(source_key: str, file_kind: str) -> str:
@@ -939,6 +1183,72 @@ def save_indexes_for_card(
     return {"saved": saved, "workspace": get_card_workspace_info(paths, card_id)}
 
 
+def save_open_review_indexes(paths: WorkbenchPaths, *, indexes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ensure_open_review_documents_workspace(paths)
+    ws_dir = _open_review_docs_dir(paths)
+    manifest = _load_manifest(ws_dir, "open_review_global")
+    indexes_dir = _indexes_dir(ws_dir)
+    saved: List[Dict[str, Any]] = []
+
+    for payload in indexes:
+        if not isinstance(payload, dict):
+            continue
+        source = str(payload.get("source") or "").strip()
+        source_key = str(payload.get("sourceKey") or "").strip()
+        if source != "open_review":
+            raise ValueError(f"Fuente no válida para documentos de revisión abierta: {source_key}")
+        if not source_key.startswith("open_review:"):
+            raise ValueError(f"sourceKey inválido para revisión abierta: {source_key}")
+        index_data = payload.get("index")
+        if not isinstance(index_data, dict):
+            raise ValueError(f"A la carga útil del índice {source_key} le falta el objeto `index`")
+
+        file_kind = str(index_data.get("file_kind") or payload.get("fileKind") or "unknown").lower()
+        idx_name = _index_filename(source_key, file_kind)
+        idx_rel = f"indexes/{idx_name}"
+        idx_path = indexes_dir / idx_name
+        _json_dump(idx_path, index_data)
+
+        index_summary = {
+            "source": source,
+            "source_key": source_key,
+            "file_kind": file_kind,
+            "display_name": payload.get("displayName") or index_data.get("display_name") or source_key,
+            "mime_type": payload.get("mimeType") or index_data.get("mime_type") or "",
+            "content_hash": payload.get("contentHash") or index_data.get("content_hash") or "",
+            "index_file": idx_rel,
+            "segment_count": len(index_data.get("segments") or []),
+            "updated_at": utc_now_iso(),
+            "warnings": index_data.get("warnings") or [],
+            "source_locator": payload.get("sourceLocator") or {},
+        }
+        manifest["indexes"][source_key] = index_summary
+
+        rel = str((payload.get("localFile") or {}).get("relativePath") or "").strip()
+        if rel:
+            stat = None
+            try:
+                stat = file_stat_fingerprint(get_open_review_file_path(paths, rel))
+            except Exception:
+                stat = None
+            manifest["local_files"][rel] = {
+                "source_key": source_key,
+                "content_hash": index_summary["content_hash"],
+                "file_kind": file_kind,
+                "index_file": idx_rel,
+                "index_status": "indexed",
+                "last_indexed_at": utc_now_iso(),
+                "warnings": index_summary["warnings"],
+                "size": stat["size"] if stat else None,
+                "mtime_ns": stat["mtime_ns"] if stat else None,
+            }
+
+        saved.append({"sourceKey": source_key, "fileKind": file_kind, "indexFile": idx_rel})
+
+    _save_manifest(ws_dir, manifest)
+    return {"saved": saved, "openReviewDocuments": get_open_review_documents_info(paths)}
+
+
 def remove_index_sources_for_card(
     paths: WorkbenchPaths,
     *,
@@ -998,6 +1308,20 @@ def get_index_for_card(paths: WorkbenchPaths, card_id: str, source_key: str) -> 
     if not ws_dir:
         raise FileNotFoundError("No se encontró el espacio de trabajo")
     manifest = _load_manifest(ws_dir, card_id)
+    index_data = _load_index_by_source_key(ws_dir, manifest, source_key)
+    entry = manifest.get("indexes", {}).get(source_key, {})
+    return {
+        "sourceKey": source_key,
+        "summary": entry,
+        "index": index_data,
+    }
+
+
+def get_open_review_index(paths: WorkbenchPaths, source_key: str) -> Dict[str, Any]:
+    ws_dir = _open_review_docs_dir(paths)
+    if not ws_dir.exists():
+        raise FileNotFoundError("No se encontró la carpeta global de revisión abierta")
+    manifest = _load_manifest(ws_dir, "open_review_global")
     index_data = _load_index_by_source_key(ws_dir, manifest, source_key)
     entry = manifest.get("indexes", {}).get(source_key, {})
     return {
@@ -1075,6 +1399,49 @@ def _collect_evidence_segments(
     return evidence, index_lookup
 
 
+def _collect_open_review_evidence_segments(paths: WorkbenchPaths) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    ws_dir = _open_review_docs_dir(paths)
+    if not ws_dir.exists():
+        return [], {}
+    manifest = _load_manifest(ws_dir, "open_review_global")
+    evidence: List[Dict[str, Any]] = []
+    index_lookup: Dict[str, Dict[str, Any]] = {}
+    for source_key, entry in (manifest.get("indexes") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            data = _load_index_by_source_key(ws_dir, manifest, source_key)
+        except Exception:
+            continue
+        index_lookup[source_key] = data
+        segments = []
+        for seg in data.get("segments") or []:
+            if not isinstance(seg, dict):
+                continue
+            segments.append(
+                {
+                    "anchor_id": seg.get("anchor_id"),
+                    "kind": seg.get("kind"),
+                    "text": _truncate_evidence_text(seg.get("text")),
+                    "page": seg.get("page"),
+                    "sheet": seg.get("sheet"),
+                    "meta": seg.get("meta") or {},
+                }
+            )
+        evidence.append(
+            {
+                "source_key": source_key,
+                "source_scope": "global_open_review",
+                "display_name": entry.get("display_name") or source_key,
+                "file_kind": entry.get("file_kind"),
+                "mime_type": entry.get("mime_type"),
+                "segments": segments,
+                "warnings": entry.get("warnings") or [],
+            }
+        )
+    return evidence, index_lookup
+
+
 def _response_text_from_responses_api(payload: Dict[str, Any]) -> str:
     output_text = payload.get("output_text")
     if isinstance(output_text, str) and output_text.strip():
@@ -1136,6 +1503,66 @@ def checklist_run_schema() -> Dict[str, Any]:
             "global_notes": {"type": "array", "items": {"type": "string"}},
         },
         "required": ["summary", "items", "global_notes"],
+    }
+
+
+def open_review_run_schema() -> Dict[str, Any]:
+    citation = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "source_key": {"type": "string"},
+            "anchor_id": {"type": "string"},
+            "effect": {"type": "string", "enum": ["supports", "contradicts", "insufficient"]},
+            "quote": {"type": "string"},
+            "reason": {"type": "string"},
+            "page": {"type": ["integer", "null"]},
+            "sheet": {"type": ["string", "null"]},
+            "bbox": {
+                "type": ["array", "null"],
+                "items": {"type": "number"},
+                "minItems": 4,
+                "maxItems": 4,
+            },
+        },
+        "required": ["source_key", "anchor_id", "effect", "quote", "reason", "page", "sheet", "bbox"],
+    }
+    finding = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "finding_id": {"type": "string"},
+            "finding_type": {
+                "type": "string",
+                "enum": ["missing", "possibly_wrong", "inconsistent", "legal_risk", "needs_human_review"],
+            },
+            "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+            "claim": {"type": "string"},
+            "rationale": {"type": "string"},
+            "confidence": {"type": "number"},
+            "citations": {"type": "array", "items": citation},
+            "missing_or_needed_evidence": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "finding_id",
+            "finding_type",
+            "severity",
+            "claim",
+            "rationale",
+            "confidence",
+            "citations",
+            "missing_or_needed_evidence",
+        ],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "summary": {"type": "string"},
+            "findings": {"type": "array", "items": finding},
+            "global_notes": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["summary", "findings", "global_notes"],
     }
 
 
@@ -1515,6 +1942,46 @@ def _collect_multimodal_assets(
                 "anchor_ids": anchor_ids,
                 "visual_anchor_ids": _pdf_visual_anchor_ids(data) if file_kind == "pdf" else anchor_ids,
                 "source_origin": _source_origin_for_multimodal_asset(entry, source_key),
+            }
+        )
+    assets.sort(key=lambda row: (str(row.get("source_key") or ""), str(row.get("display_name") or "")))
+    return assets
+
+
+def _collect_open_review_multimodal_assets(paths: WorkbenchPaths) -> List[Dict[str, Any]]:
+    ws_dir = _open_review_docs_dir(paths)
+    if not ws_dir.exists():
+        return []
+    manifest = _load_manifest(ws_dir, "open_review_global")
+    assets: List[Dict[str, Any]] = []
+    for source_key, entry in (manifest.get("indexes") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            data = _load_index_by_source_key(ws_dir, manifest, source_key)
+        except Exception:
+            continue
+        if not _index_needs_multimodal(data):
+            continue
+        rel = ((entry.get("source_locator") or {}) if isinstance(entry.get("source_locator"), dict) else {}).get("relativePath")
+        if not rel:
+            rel = str(source_key).replace("open_review:", "", 1)
+        try:
+            path = get_open_review_file_path(paths, str(rel))
+            content = path.read_bytes()
+        except Exception:
+            continue
+        mime_type = str(entry.get("mime_type") or detect_mime_from_name(str(rel)))
+        assets.append(
+            {
+                "source_key": source_key,
+                "display_name": entry.get("display_name") or Path(str(rel)).name,
+                "file_kind": entry.get("file_kind"),
+                "mime_type": mime_type,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+                "byte_size": len(content),
+                "source_origin": "global_open_review",
+                "source_locator": entry.get("source_locator") or {},
             }
         )
     assets.sort(key=lambda row: (str(row.get("source_key") or ""), str(row.get("display_name") or "")))
@@ -1955,6 +2422,8 @@ def _openai_request(
     system_prompt: str,
     user_payload: Dict[str, Any],
     multimodal_assets: Optional[List[Dict[str, Any]]] = None,
+    schema_name: str = "checklist_review",
+    schema: Optional[Dict[str, Any]] = None,
     stream: bool = False,
     stream_event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
@@ -1969,8 +2438,8 @@ def _openai_request(
         service_tier=service_tier,
         system_prompt=system_prompt,
         user_content=user_content,
-        schema_name="checklist_review",
-        schema=checklist_run_schema(),
+        schema_name=schema_name,
+        schema=schema or checklist_run_schema(),
         stream=stream,
         stream_event_callback=stream_event_callback,
     )
@@ -2222,7 +2691,10 @@ def _validate_citations(result: Dict[str, Any], index_lookup: Dict[str, Dict[str
                 seg_map[str(seg["anchor_id"])] = seg
         segment_maps[source_key] = seg_map
 
-    for item in result.get("items") or []:
+    rows: List[Dict[str, Any]] = []
+    rows.extend([row for row in (result.get("items") or []) if isinstance(row, dict)])
+    rows.extend([row for row in (result.get("findings") or []) if isinstance(row, dict)])
+    for item in rows:
         if not isinstance(item, dict):
             continue
         validated = []
@@ -2331,6 +2803,69 @@ def _summarize_run(result: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": overall, "counts": counts}
 
 
+def _normalize_open_review_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    findings: List[Dict[str, Any]] = []
+    allowed_types = {"missing", "possibly_wrong", "inconsistent", "legal_risk", "needs_human_review"}
+    allowed_severities = {"low", "medium", "high", "critical"}
+    for idx, row in enumerate(result.get("findings") or [], start=1):
+        if not isinstance(row, dict):
+            continue
+        try:
+            confidence = float(row.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        finding_type = str(row.get("finding_type") or "needs_human_review")
+        severity = str(row.get("severity") or "medium")
+        findings.append(
+            {
+                "finding_id": str(row.get("finding_id") or f"finding_{idx:03d}"),
+                "finding_type": finding_type if finding_type in allowed_types else "needs_human_review",
+                "severity": severity if severity in allowed_severities else "medium",
+                "claim": str(row.get("claim") or "").strip(),
+                "rationale": str(row.get("rationale") or "").strip(),
+                "confidence": confidence,
+                "citations": row.get("citations") if isinstance(row.get("citations"), list) else [],
+                "missing_or_needed_evidence": (
+                    row.get("missing_or_needed_evidence")
+                    if isinstance(row.get("missing_or_needed_evidence"), list)
+                    else []
+                ),
+            }
+        )
+    result["findings"] = findings
+    if not isinstance(result.get("global_notes"), list):
+        result["global_notes"] = []
+    result["summary"] = str(result.get("summary") or "").strip()
+    return result
+
+
+def _summarize_open_review(result: Dict[str, Any]) -> Dict[str, Any]:
+    counts = {
+        "total": 0,
+        "missing": 0,
+        "possibly_wrong": 0,
+        "inconsistent": 0,
+        "legal_risk": 0,
+        "needs_human_review": 0,
+        "high_or_critical": 0,
+    }
+    for finding in result.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        counts["total"] += 1
+        finding_type = str(finding.get("finding_type") or "")
+        if finding_type in counts:
+            counts[finding_type] += 1
+        if str(finding.get("severity") or "") in {"high", "critical"}:
+            counts["high_or_critical"] += 1
+    status = "ok"
+    if counts["total"] > 0:
+        status = "has_findings"
+    if counts["high_or_critical"] > 0:
+        status = "has_high_risk_findings"
+    return {"status": status, "counts": counts}
+
+
 def run_checklist_for_card(
     paths: WorkbenchPaths,
     *,
@@ -2343,7 +2878,12 @@ def run_checklist_for_card(
     service_tier: str = "auto",
     multimodal_limit_bytes: Optional[int] = None,
     progress_callback: Optional[Callable[..., None]] = None,
+    run_type: str = "checklist",
+    open_review_question: Optional[str] = None,
+    open_review_system_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if run_type not in {"checklist", "open_review"}:
+        raise ValueError(f"Tipo de ejecución no soportado: {run_type}")
     ws_dir = _find_card_workspace_dir(paths, card_id)
     if not ws_dir:
         raise FileNotFoundError("No se encontró el espacio de trabajo de la tarjeta. Créalo primero.")
@@ -2369,7 +2909,18 @@ def run_checklist_for_card(
     diagnostics["timings"]["preflight_seconds"] = round(time.time() - stage_started, 3)
     if not prep.get("readyForRun"):
         raise ValueError(str(prep.get("blockingMessage") or "Se requiere preparación antes de ejecutar la revisión."))
-    checklist = load_checklist(paths)
+    checklist = load_checklist(paths) if run_type == "checklist" else None
+    if run_type == "open_review":
+        open_config = load_open_review_config(paths)
+        question = (open_review_question or open_config.get("default_question") or "").strip()
+        if not question:
+            raise ValueError("La revisión abierta requiere una pregunta")
+        system_prompt = (open_review_system_prompt or open_config.get("system_prompt") or "").strip()
+        if not system_prompt:
+            raise ValueError("La revisión abierta requiere un system prompt")
+    else:
+        question = ""
+        system_prompt = build_system_prompt()
     valid_source_keys = prep.get("validSourceKeys")
     stage_started = time.time()
     _report_progress(
@@ -2378,6 +2929,14 @@ def run_checklist_for_card(
         message="Cargando evidencia indexada.",
     )
     evidence, index_lookup = _collect_evidence_segments(paths, card_id, allowed_source_keys=valid_source_keys)
+    if run_type == "open_review":
+        open_evidence, open_index_lookup = _collect_open_review_evidence_segments(paths)
+        evidence.extend(open_evidence)
+        index_lookup.update(open_index_lookup)
+        diagnostics["open_review_global_documents"] = {
+            "document_count": len(open_evidence),
+            "segment_count": sum(len(doc.get("segments") or []) for doc in open_evidence if isinstance(doc, dict)),
+        }
     diagnostics["timings"]["evidence_load_seconds"] = round(time.time() - stage_started, 3)
     if not evidence:
         raise ValueError("No se encontró evidencia indexada después de la conciliación. Prepara la revisión primero.")
@@ -2393,10 +2952,14 @@ def run_checklist_for_card(
         "document_count": len(evidence),
         "segment_count": evidence_segments,
         "text_chars": evidence_chars,
-        "checklist_item_count": len(checklist.get("items") or []),
+        "checklist_item_count": len(checklist.get("items") or []) if isinstance(checklist, dict) else 0,
+        "run_type": run_type,
+        "open_review_question_chars": len(question),
     }
     multimodal_limit_bytes = resolve_multimodal_limit_bytes(multimodal_limit_bytes)
     multimodal_assets = _collect_multimodal_assets(paths, card_id, allowed_source_keys=valid_source_keys)
+    if run_type == "open_review":
+        multimodal_assets.extend(_collect_open_review_multimodal_assets(paths))
     selected_multimodal_assets, omitted_multimodal_source_keys, selected_multimodal_bytes = _select_multimodal_assets(
         multimodal_assets,
         limit_bytes=multimodal_limit_bytes,
@@ -2504,18 +3067,34 @@ def run_checklist_for_card(
         index_lookup=index_lookup,
         transcriptions=ocr_transcriptions,
     )
-    user_payload = build_review_user_payload(
-        checklist=checklist,
-        evidence=evidence,
-        multimodal_assets=_multimodal_summary_payload(review_visual_assets),
-        card_id=card_id,
-        card_name=card_name,
-        card_url=card_url,
-        card_packet=card_packet,
-    )
+    if run_type == "open_review":
+        user_payload = build_open_review_user_payload(
+            question=question,
+            evidence=evidence,
+            multimodal_assets=_multimodal_summary_payload(review_visual_assets),
+            card_id=card_id,
+            card_name=card_name,
+            card_url=card_url,
+            card_packet=card_packet,
+        )
+        schema_name = "open_review"
+        response_schema = open_review_run_schema()
+    else:
+        user_payload = build_review_user_payload(
+            checklist=checklist or {},
+            evidence=evidence,
+            multimodal_assets=_multimodal_summary_payload(review_visual_assets),
+            card_id=card_id,
+            card_name=card_name,
+            card_url=card_url,
+            card_packet=card_packet,
+        )
+        schema_name = "checklist_review"
+        response_schema = checklist_run_schema()
     user_payload_json = json.dumps(user_payload, ensure_ascii=False)
     user_payload_bytes_utf8 = len(user_payload_json.encode("utf-8"))
     diagnostics["checklist_request"] = {
+        "run_type": run_type,
         "requested_reasoning_effort": reasoning_effort,
         "requested_service_tier": service_tier,
         "user_payload_chars": len(user_payload_json),
@@ -2556,7 +3135,7 @@ def run_checklist_for_card(
         progress_callback,
         stage="checklist",
         message=(
-            f"Enviando checklist a {model_name}: {len(evidence)} documento(s), "
+            f"Enviando {'revisión abierta' if run_type == 'open_review' else 'checklist'} a {model_name}: {len(evidence)} documento(s), "
             f"{evidence_segments} segmento(s), ~{evidence_chars} caracteres, "
             f"{len(review_visual_assets)} activo(s) visual(es), "
             f"{round(user_payload_bytes_utf8 / (1024 * 1024), 2)} MB JSON, "
@@ -2585,9 +3164,11 @@ def run_checklist_for_card(
             model=model_name,
             reasoning_effort=actual_reasoning_effort,
             service_tier=actual_service_tier,
-            system_prompt=build_system_prompt(),
+            system_prompt=system_prompt,
             user_payload=user_payload,
             multimodal_assets=review_visual_assets,
+            schema_name=schema_name,
+            schema=response_schema,
             stream=True,
             stream_event_callback=stream_callback,
         )
@@ -2612,9 +3193,11 @@ def run_checklist_for_card(
                     model=model_name,
                     reasoning_effort=actual_reasoning_effort,
                     service_tier=actual_service_tier,
-                    system_prompt=build_system_prompt(),
+                    system_prompt=system_prompt,
                     user_payload=user_payload,
                     multimodal_assets=review_visual_assets,
+                    schema_name=schema_name,
+                    schema=response_schema,
                     stream=True,
                     stream_event_callback=stream_callback,
                 )
@@ -2659,9 +3242,11 @@ def run_checklist_for_card(
                     model=model_name,
                     reasoning_effort=actual_reasoning_effort,
                     service_tier=actual_service_tier,
-                    system_prompt=build_system_prompt(),
+                    system_prompt=system_prompt,
                     user_payload=user_payload,
                     multimodal_assets=review_visual_assets,
+                    schema_name=schema_name,
+                    schema=response_schema,
                     stream=True,
                     stream_event_callback=stream_callback,
                 )
@@ -2752,9 +3337,12 @@ def run_checklist_for_card(
         )
         raise RuntimeError(f"La salida del modelo no era JSON válido: {e}\n{text[:1000]}") from e
 
-    parsed = _align_run_items_to_checklist(parsed, checklist)
+    if run_type == "open_review":
+        parsed = _normalize_open_review_result(parsed)
+    else:
+        parsed = _align_run_items_to_checklist(parsed, checklist or {})
     parsed = _validate_citations(parsed, index_lookup)
-    summary = _summarize_run(parsed)
+    summary = _summarize_open_review(parsed) if run_type == "open_review" else _summarize_run(parsed)
     diagnostics["timings"]["validation_seconds"] = round(time.time() - validate_started, 3)
     diagnostics["finished_at"] = utc_now_iso()
     diagnostics["timings"]["total_seconds"] = round(
@@ -2769,6 +3357,7 @@ def run_checklist_for_card(
     _json_dump(run_dir / "llm_response_raw.json", raw_api)
     run_result = {
         "run_id": run_id,
+        "run_type": run_type,
         "created_at": utc_now_iso(),
         "model": model_name,
         "service_tier": actual_service_tier,
@@ -2785,6 +3374,11 @@ def run_checklist_for_card(
         "card": {"id": card_id, "name": card_name, "url": card_url},
         "result": parsed,
     }
+    if run_type == "open_review":
+        run_result["open_review"] = {
+            "question": question,
+            "system_prompt": system_prompt,
+        }
     _json_dump(run_dir / "run_result.json", run_result)
 
     manifest = _load_manifest(ws_dir, card_id)
@@ -2796,6 +3390,7 @@ def run_checklist_for_card(
         0,
         {
             "run_id": run_id,
+            "run_type": run_type,
             "created_at": run_result["created_at"],
             "model": model_name,
             "service_tier": actual_service_tier,
@@ -2808,6 +3403,38 @@ def run_checklist_for_card(
     _save_manifest(ws_dir, manifest)
 
     return {"run": run_result, "runs": list_runs_summary(ws_dir)}
+
+
+def run_open_review_for_card(
+    paths: WorkbenchPaths,
+    *,
+    card_id: str,
+    card_name: str,
+    card_url: str,
+    card_packet: Dict[str, Any],
+    question: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    model: Optional[str] = None,
+    reasoning_effort: str = "high",
+    service_tier: str = "auto",
+    multimodal_limit_bytes: Optional[int] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
+) -> Dict[str, Any]:
+    return run_checklist_for_card(
+        paths,
+        card_id=card_id,
+        card_name=card_name,
+        card_url=card_url,
+        card_packet=card_packet,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
+        multimodal_limit_bytes=multimodal_limit_bytes,
+        progress_callback=progress_callback,
+        run_type="open_review",
+        open_review_question=question,
+        open_review_system_prompt=system_prompt,
+    )
 
 
 def get_run_result(paths: WorkbenchPaths, card_id: str, run_id: str) -> Dict[str, Any]:

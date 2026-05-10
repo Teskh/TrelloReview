@@ -13,11 +13,17 @@ const state = {
   tokenEstimate: null,
   checklistParsed: null,
   checklistDraft: null,
+  openReviewConfig: null,
+  openReviewDraft: null,
+  openReviewDocs: null,
   runResult: null,
   runHistory: [],
   reviewJobs: [],
   dismissedReviewJobIds: new Set(),
   reviewJobsPollTimer: null,
+  reviewAnimationTimer: null,
+  reviewAnimationFrame: 1,
+  reviewAnimationPreloaded: false,
   cardLoadSeq: 0,
   collapsedSections: {},
   completedCardsById: new Map(),
@@ -32,6 +38,8 @@ const MULTIMODAL_LIMIT_MB_KEY = "trelloReview.multimodalLimitMb";
 const SELECTED_MODEL_KEY = "trelloReview.selectedModel";
 const SELECTED_SERVICE_TIER_KEY = "trelloReview.selectedServiceTier";
 const REVIEW_JOBS_POLL_MS = 3000;
+const REVIEW_ANIMATION_FRAME_COUNT = 72;
+const REVIEW_ANIMATION_FRAME_MS = 90;
 const DEFAULT_MODEL = "gpt-5.5";
 const AVAILABLE_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"];
 const DEFAULT_SERVICE_TIER = "auto";
@@ -55,6 +63,8 @@ const els = {
   recentJobsList: document.getElementById("recentJobsList"),
   cardBadge: document.getElementById("cardBadge"),
   viewerState: document.getElementById("viewerState"),
+  reviewAnimation: document.getElementById("reviewAnimation"),
+  reviewAnimationFrame: document.getElementById("reviewAnimationFrame"),
 
   prepareReviewBtn: document.getElementById("prepareReviewBtn"),
   uploadWorkspaceFilesBtn: document.getElementById("uploadWorkspaceFilesBtn"),
@@ -63,6 +73,7 @@ const els = {
   indexLocalBtn: document.getElementById("indexLocalBtn"),
   indexTrelloBtn: document.getElementById("indexTrelloBtn"),
   runChecklistBtn: document.getElementById("runChecklistBtn"),
+  runOpenReviewBtn: document.getElementById("runOpenReviewBtn"),
   modelInput: document.getElementById("modelInput"),
   reasoningEffortSelect: document.getElementById("reasoningEffortSelect"),
   serviceTierSelect: document.getElementById("serviceTierSelect"),
@@ -77,13 +88,21 @@ const els = {
   checklistInstructionsInput: document.getElementById("checklistInstructionsInput"),
   checklistItemsList: document.getElementById("checklistItemsList"),
   loadChecklistBtn: document.getElementById("loadChecklistBtn"),
-  resetChecklistBtn: document.getElementById("resetChecklistBtn"),
   importChecklistBtn: document.getElementById("importChecklistBtn"),
   exportChecklistBtn: document.getElementById("exportChecklistBtn"),
   importChecklistInput: document.getElementById("importChecklistInput"),
   uploadWorkspaceFilesInput: document.getElementById("uploadWorkspaceFilesInput"),
   saveChecklistBtn: document.getElementById("saveChecklistBtn"),
   addChecklistItemBtn: document.getElementById("addChecklistItemBtn"),
+
+  openReviewStatus: document.getElementById("openReviewStatus"),
+  openReviewQuestionInput: document.getElementById("openReviewQuestionInput"),
+  openReviewSystemPromptInput: document.getElementById("openReviewSystemPromptInput"),
+  uploadOpenReviewDocsBtn: document.getElementById("uploadOpenReviewDocsBtn"),
+  uploadOpenReviewDocsInput: document.getElementById("uploadOpenReviewDocsInput"),
+  openReviewDocsList: document.getElementById("openReviewDocsList"),
+  loadOpenReviewBtn: document.getElementById("loadOpenReviewBtn"),
+  saveOpenReviewBtn: document.getElementById("saveOpenReviewBtn"),
 
   runSummary: document.getElementById("runSummary"),
   resultsList: document.getElementById("resultsList"),
@@ -567,6 +586,53 @@ function isReviewJobActive(job) {
   return ["queued", "running"].includes(job?.status || "");
 }
 
+function reviewAnimationPath(frameNumber) {
+  return `/animation/${String(frameNumber).padStart(4, "0")}.png`;
+}
+
+function prefersReducedMotion() {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches || false;
+}
+
+function preloadReviewAnimationFrames() {
+  if (state.reviewAnimationPreloaded) return;
+  state.reviewAnimationPreloaded = true;
+  for (let i = 1; i <= REVIEW_ANIMATION_FRAME_COUNT; i += 1) {
+    const img = new Image();
+    img.src = reviewAnimationPath(i);
+  }
+}
+
+function stopReviewAnimation() {
+  if (state.reviewAnimationTimer) {
+    window.clearInterval(state.reviewAnimationTimer);
+    state.reviewAnimationTimer = null;
+  }
+  if (els.reviewAnimation) els.reviewAnimation.hidden = true;
+}
+
+function startReviewAnimation() {
+  if (!els.reviewAnimation || !els.reviewAnimationFrame) return;
+  els.reviewAnimation.hidden = false;
+  if (prefersReducedMotion()) {
+    els.reviewAnimationFrame.src = reviewAnimationPath(1);
+    return;
+  }
+
+  preloadReviewAnimationFrames();
+  if (state.reviewAnimationTimer) return;
+  state.reviewAnimationTimer = window.setInterval(() => {
+    state.reviewAnimationFrame = (state.reviewAnimationFrame % REVIEW_ANIMATION_FRAME_COUNT) + 1;
+    els.reviewAnimationFrame.src = reviewAnimationPath(state.reviewAnimationFrame);
+  }, REVIEW_ANIMATION_FRAME_MS);
+}
+
+function updateReviewAnimation() {
+  const hasActiveJob = state.reviewJobs.some(isReviewJobActive);
+  if (hasActiveJob) startReviewAnimation();
+  else stopReviewAnimation();
+}
+
 function hasActiveReviewJobForCard(cardId) {
   return !!cardId && state.reviewJobs.some((job) => job?.card?.id === cardId && isReviewJobActive(job));
 }
@@ -588,6 +654,7 @@ function reviewJobStatusTone(status) {
 
 function reviewJobMeta(job) {
   const parts = [];
+  if (job?.run_type === "open_review") parts.push("Abierta");
   if (job?.model) parts.push(job.model);
   if (job?.service_tier || job?.requested_service_tier) {
     parts.push(`Tier: ${summarizeServiceTier(job.service_tier, job.requested_service_tier)}`);
@@ -604,6 +671,9 @@ function reviewJobMeta(job) {
 
 function reviewJobSummaryText(job) {
   const counts = job?.run_summary?.counts || {};
+  if (job?.status === "succeeded" && job?.run_type === "open_review") {
+    return `Hallazgos ${counts.total || 0} • Alto/crítico ${counts.high_or_critical || 0}`;
+  }
   if (job?.status === "succeeded") return `Cumple ${counts.pass || 0} • Falla ${counts.fail || 0} • Revisar ${counts.needs_review || 0}`;
   if (job?.status === "failed") return job?.error || job?.progress_message || "La ejecución falló.";
   return job?.progress_message || "La revisión sigue ejecutándose en segundo plano.";
@@ -654,7 +724,7 @@ function renderCompletedCards() {
           <span class="data-item-status ready">Lista</span>
         </div>
         <div class="recent-job-meta">${escapeHtml(item.model || DEFAULT_MODEL)}${item.service_tier || item.requested_service_tier ? ` • ${escapeHtml(`Tier: ${summarizeServiceTier(item.service_tier, item.requested_service_tier)}`)}` : ""} • ${escapeHtml(item.finished_at ? `Term. ${fmtDate(item.finished_at)}` : "Fecha desconocida")}</div>
-        <div class="recent-job-summary">${escapeHtml(reviewJobSummaryText({ status: "succeeded", run_summary: item.run_summary }))}</div>
+        <div class="recent-job-summary">${escapeHtml(reviewJobSummaryText({ status: "succeeded", run_type: item.run_type, run_summary: item.run_summary }))}</div>
       </div>
     `;
     const actions = document.createElement("div");
@@ -672,6 +742,7 @@ function renderCompletedCards() {
 function renderRecentJobs() {
   const jobs = visibleReviewJobs();
   const activeCount = jobs.filter(isReviewJobActive).length;
+  updateReviewAnimation();
   els.recentJobsMeta.textContent = jobs.length ? `${activeCount} en curso • ${jobs.length} total` : "Sin actividad.";
   els.recentJobsList.innerHTML = "";
 
@@ -862,11 +933,17 @@ function indexStatusTone(status) {
 
 function renderWorkspaceItem(item, kind) {
   const name = item.relativePath || item.name || item.fileName || item.attachmentId || "?";
-  const primaryMeta = kind === "local" ? bytesLabel(item.size) : (item.mimeType || "desconocido");
+  const primaryMeta = (kind === "local" || kind === "open_review") ? bytesLabel(item.size) : (item.mimeType || "desconocido");
   const indexedAt = item.lastIndexedAt ? ` • ${fmtDate(item.lastIndexedAt)}` : "";
   const warnings = Array.isArray(item.indexWarnings) && item.indexWarnings.length
     ? `<div class="data-item-note">${escapeHtml(item.indexWarnings[0])}</div>`
     : "";
+  let actions = "";
+  if (kind === "local" && item.relativePath && item.indexStatus !== "missing") {
+    actions = `<div class="data-item-actions"><button type="button" class="action-btn outline sm btn-danger" data-local-delete="${escapeHtml(item.relativePath)}">Eliminar</button></div>`;
+  } else if (kind === "open_review" && item.relativePath && item.indexStatus !== "missing") {
+    actions = `<div class="data-item-actions"><button type="button" class="action-btn outline sm btn-danger" data-open-review-delete="${escapeHtml(item.relativePath)}">Eliminar</button></div>`;
+  }
   return `<li class="data-item">
     <div class="data-item-head">
       <div class="data-item-title">${escapeHtml(name)}</div>
@@ -874,7 +951,14 @@ function renderWorkspaceItem(item, kind) {
     </div>
     <div class="data-item-meta">${escapeHtml(primaryMeta)}${indexedAt}</div>
     ${warnings}
+    ${actions}
   </li>`;
+}
+
+function bindLocalAttachmentDeleteButtons() {
+  els.localFilesList?.querySelectorAll?.("[data-local-delete]").forEach((btn) => {
+    btn.onclick = () => deleteLocalAttachment(btn.getAttribute("data-local-delete") || "");
+  });
 }
 
 function renderPrepSummary(ws, prep) {
@@ -917,6 +1001,7 @@ function renderWorkspace() {
   const hasCard = !!state.selectedCard;
   els.prepareReviewBtn.disabled = !hasCard;
   els.uploadWorkspaceFilesBtn.disabled = !hasCard;
+  if (els.uploadOpenReviewDocsBtn) els.uploadOpenReviewDocsBtn.disabled = !hasCard;
   els.createWorkspaceBtn.disabled = !hasCard;
   els.refreshWorkspaceBtn.disabled = !hasCard;
   
@@ -926,6 +1011,10 @@ function renderWorkspace() {
   const runInFlight = hasActiveReviewJobForCard(state.selectedCard?.id);
   els.runChecklistBtn.disabled = !state.workspaceStatus?.readyForRun || runInFlight;
   els.runChecklistBtn.textContent = runInFlight ? "Revisión en curso..." : "Ejecutar revisión";
+  if (els.runOpenReviewBtn) {
+    els.runOpenReviewBtn.disabled = !state.workspaceStatus?.readyForRun || runInFlight;
+    els.runOpenReviewBtn.textContent = runInFlight ? "Revisión en curso..." : "Ejecutar abierta";
+  }
 
   if (!hasCard) {
     els.workspaceMeta.textContent = "No hay ninguna tarjeta seleccionada.";
@@ -962,6 +1051,7 @@ function renderWorkspace() {
     els.localFilesList.innerHTML = localFiles.map((row) => renderWorkspaceItem(row, "local")).join("");
   }
   if (staleLocal.length) els.localFilesList.innerHTML += staleLocal.map((row) => renderWorkspaceItem(row, "local")).join("");
+  bindLocalAttachmentDeleteButtons();
 
   const remoteItems = prep.remote?.items || [];
   const staleRemote = prep.remote?.stale || [];
@@ -1090,6 +1180,82 @@ function buildChecklistPayload() {
   return { version: 1, name: draft.name, instructions: draft.instructions, items };
 }
 
+function newOpenReviewDraft(config = {}) {
+  return {
+    version: Number(config.version) || 1,
+    name: config.name || "Revisión abierta",
+    system_prompt: config.system_prompt || "",
+    default_question: config.default_question || "",
+  };
+}
+
+function renderOpenReviewEditorStatus(msg) {
+  if (els.openReviewStatus) els.openReviewStatus.textContent = msg;
+}
+
+function renderOpenReviewEditor() {
+  if (!els.openReviewQuestionInput || !els.openReviewSystemPromptInput) return;
+  if (!state.openReviewDraft) state.openReviewDraft = newOpenReviewDraft(state.openReviewConfig || {});
+  els.openReviewQuestionInput.value = state.openReviewDraft.default_question || "";
+  els.openReviewSystemPromptInput.value = state.openReviewDraft.system_prompt || "";
+  renderOpenReviewDocs();
+}
+
+function buildOpenReviewPayload() {
+  const draft = state.openReviewDraft || newOpenReviewDraft(state.openReviewConfig || {});
+  draft.default_question = els.openReviewQuestionInput.value.trim();
+  draft.system_prompt = els.openReviewSystemPromptInput.value.trim();
+  return draft;
+}
+
+async function loadOpenReview() {
+  try {
+    const [data, docs] = await Promise.all([
+      apiGet("/api/open-review"),
+      apiGet("/api/open-review/documents"),
+    ]);
+    state.openReviewConfig = data.parsed || null;
+    state.openReviewDraft = newOpenReviewDraft(state.openReviewConfig || {});
+    state.openReviewDocs = docs || null;
+    renderOpenReviewEditor();
+    renderOpenReviewEditorStatus("Configuración de revisión abierta cargada.");
+  } catch (err) {
+    renderOpenReviewEditorStatus(`Error al cargar revisión abierta: ${err.message}`);
+  }
+}
+
+function renderOpenReviewDocs() {
+  if (!els.openReviewDocsList) return;
+  const docs = state.openReviewDocs?.documents || [];
+  const stale = state.openReviewDocs?.stale || [];
+  if (!state.openReviewDocs?.exists && !docs.length) {
+    els.openReviewDocsList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">No hay documentos globales para revisión abierta.</span></li>`;
+    return;
+  }
+  if (!docs.length && !stale.length) {
+    els.openReviewDocsList.innerHTML = `<li class="data-item"><span class="meta-text" style="padding:0;">No hay documentos globales para revisión abierta.</span></li>`;
+    return;
+  }
+  els.openReviewDocsList.innerHTML = docs.map((row) => renderWorkspaceItem(row, "open_review")).join("");
+  if (stale.length) els.openReviewDocsList.innerHTML += stale.map((row) => renderWorkspaceItem(row, "open_review")).join("");
+  els.openReviewDocsList.querySelectorAll("[data-open-review-delete]").forEach((btn) => {
+    btn.onclick = () => deleteOpenReviewDocument(btn.getAttribute("data-open-review-delete") || "");
+  });
+}
+
+async function saveOpenReview() {
+  try {
+    const config = buildOpenReviewPayload();
+    const data = await apiPost("/api/open-review", { config });
+    state.openReviewConfig = data.parsed || null;
+    state.openReviewDraft = newOpenReviewDraft(state.openReviewConfig || {});
+    renderOpenReviewEditor();
+    renderOpenReviewEditorStatus("Cambios guardados.");
+  } catch (err) {
+    renderOpenReviewEditorStatus(`No se pudo guardar: ${err.message}`);
+  }
+}
+
 function citationEffectClass(effect) {
   return ["supports", "contradicts", "insufficient"].includes(effect) ? effect : "insufficient";
 }
@@ -1126,6 +1292,31 @@ function runItemStatusLabel(status) {
   }[status] || status;
 }
 
+function findingTypeLabel(type) {
+  return {
+    missing: "Faltante",
+    possibly_wrong: "Posible error",
+    inconsistent: "Inconsistente",
+    legal_risk: "Riesgo legal",
+    needs_human_review: "Revisión humana",
+  }[type] || "Hallazgo";
+}
+
+function findingSeverityClass(severity) {
+  if (["critical", "high"].includes(severity)) return "fail";
+  if (severity === "medium") return "needs_review";
+  return "pass";
+}
+
+function findingSeverityLabel(severity) {
+  return {
+    critical: "Crítica",
+    high: "Alta",
+    medium: "Media",
+    low: "Baja",
+  }[severity] || "Media";
+}
+
 function renderRunHistorySelect() {
   const runs = state.workspace?.runs || [];
   const preferredRunId = state.runResult?.run_id || els.runHistorySelect.value || "";
@@ -1138,7 +1329,11 @@ function renderRunHistorySelect() {
   for (const r of runs) {
     const opt = document.createElement("option");
     opt.value = r.run_id;
-    opt.textContent = `${fmtDate(r.created_at)} • cumple:${r.counts?.pass||0} falla:${r.counts?.fail||0}`;
+    if (r.run_type === "open_review") {
+      opt.textContent = `${fmtDate(r.created_at)} • abierta • hallazgos:${r.counts?.total||0}`;
+    } else {
+      opt.textContent = `${fmtDate(r.created_at)} • checklist • cumple:${r.counts?.pass||0} falla:${r.counts?.fail||0}`;
+    }
     els.runHistorySelect.appendChild(opt);
   }
   if (preferredRunId && runs.some((r) => r.run_id === preferredRunId)) {
@@ -1164,6 +1359,12 @@ function renderResults() {
   if (Number.isFinite(timing.total_seconds)) timingBits.push(`Total ${Number(timing.total_seconds).toFixed(1)}s`);
   const timingSuffix = timingBits.length ? ` • ${timingBits.join(" • ")}` : "";
   const serviceTierSummary = summarizeServiceTier(run.service_tier, run.requested_service_tier);
+  if (run.run_type === "open_review") {
+    const counts = run.summary?.counts || {};
+    els.runSummary.innerHTML = `Modelo: ${run.model || "?"} • Tier: ${serviceTierSummary} • Hallazgos: ${counts.total || 0} • Alto/crítico: ${counts.high_or_critical || 0}${timingSuffix}`;
+    renderOpenReviewResults(run);
+    return;
+  }
   els.runSummary.innerHTML = `Modelo: ${run.model || "?"} • Tier: ${serviceTierSummary} • Cumple: ${run.summary?.counts?.pass||0} • Falla: ${run.summary?.counts?.fail||0}${timingSuffix}`;
   
   const items = run.result?.items || [];
@@ -1232,6 +1433,91 @@ function renderResults() {
     if (missing.length > 0) {
       const missSection = document.createElement("div");
       missSection.innerHTML = `<span class="rationale-label">Evidencia faltante</span><div style="display:flex;gap:8px;flex-wrap:wrap;">${missing.map(m=>`<span class="badge" style="background:var(--status-warn-bg);color:var(--status-warn-fg);border:none;">${escapeHtml(m)}</span>`).join("")}</div>`;
+      dataCol.appendChild(missSection);
+    }
+
+    row.appendChild(metaCol);
+    row.appendChild(dataCol);
+    els.resultsList.appendChild(row);
+  }
+}
+
+function renderOpenReviewResults(run) {
+  const findings = run.result?.findings || [];
+  els.resultsList.innerHTML = findings.length ? "" : `<div class="meta-text" style="padding:0;">No hay hallazgos en la revisión abierta.</div>`;
+
+  if (run.result?.summary) {
+    const summaryRow = document.createElement("div");
+    summaryRow.className = "result-row";
+    summaryRow.innerHTML = `
+      <div class="result-meta-col">
+        <div class="result-index">Resumen</div>
+        <div class="result-title">Revisión abierta</div>
+      </div>
+      <div class="result-data-col">
+        <div class="rationale-block">${escapeHtml(run.result.summary)}</div>
+      </div>
+    `;
+    els.resultsList.appendChild(summaryRow);
+  }
+
+  for (const finding of findings) {
+    const row = document.createElement("div");
+    row.className = "result-row";
+    const severity = finding.severity || "medium";
+    const severityClass = findingSeverityClass(severity);
+    const metaCol = document.createElement("div");
+    metaCol.className = "result-meta-col";
+    metaCol.innerHTML = `
+      <div class="result-index">${escapeHtml(findingTypeLabel(finding.finding_type))}</div>
+      <div class="result-title">${escapeHtml(finding.claim || finding.finding_id || "Hallazgo")}</div>
+      <span class="status-tag ${escapeHtml(severityClass)}">${escapeHtml(findingSeverityLabel(severity))}</span>
+      <div class="mono-text muted mt-auto">Conf.: ${Number.isFinite(Number(finding.confidence)) ? Number(finding.confidence).toFixed(2) : "n/d"}</div>
+    `;
+
+    const dataCol = document.createElement("div");
+    dataCol.className = "result-data-col";
+    dataCol.innerHTML = `
+      <div>
+        <span class="rationale-label">Fundamentación del modelo</span>
+        <div class="rationale-block">${escapeHtml(finding.rationale || "No se proporcionó fundamentación.")}</div>
+      </div>
+    `;
+
+    const citations = Array.isArray(finding.citations) ? finding.citations : [];
+    if (citations.length > 0) {
+      const citSection = document.createElement("div");
+      citSection.innerHTML = `<span class="rationale-label">Citas de evidencia</span>`;
+      const grid = document.createElement("div");
+      grid.className = "evidence-grid";
+      for (const cit of citations) {
+        const card = document.createElement("div");
+        const effectClass = citationEffectClass(cit.effect);
+        card.className = `evidence-card ${effectClass}`;
+        card.innerHTML = `
+          <div class="evidence-topline">
+            <span class="evidence-effect ${effectClass}">${citationEffectLabel(cit.effect)}</span>
+            <span class="evidence-meta">${escapeHtml(cit.source_key || "?")} → ${escapeHtml(cit.anchor_id || "?")}</span>
+          </div>
+          <div class="evidence-quote">"${escapeHtml(cit.quote || "...")}"</div>
+          <div class="evidence-reason">${escapeHtml(cit.reason || "N/D")}</div>
+          <div class="evidence-meta">Validación: ${escapeHtml(citationValidationLabel(cit))}</div>
+        `;
+        const btn = document.createElement("button");
+        btn.className = "action-btn outline sm evidence-action";
+        btn.textContent = `Inspeccionar fuente: ${cit.source_key||"?"}`;
+        btn.onclick = () => openCitation(cit);
+        card.appendChild(btn);
+        grid.appendChild(card);
+      }
+      citSection.appendChild(grid);
+      dataCol.appendChild(citSection);
+    }
+
+    const missing = Array.isArray(finding.missing_or_needed_evidence) ? finding.missing_or_needed_evidence : [];
+    if (missing.length > 0) {
+      const missSection = document.createElement("div");
+      missSection.innerHTML = `<span class="rationale-label">Evidencia faltante o necesaria</span><div style="display:flex;gap:8px;flex-wrap:wrap;">${missing.map(m=>`<span class="badge" style="background:var(--status-warn-bg);color:var(--status-warn-fg);border:none;">${escapeHtml(m)}</span>`).join("")}</div>`;
       dataCol.appendChild(missSection);
     }
 
@@ -1379,22 +1665,6 @@ async function saveChecklist() {
   }
 }
 
-async function resetChecklistToAppDefault() {
-  els.resetChecklistBtn.disabled = true;
-  try {
-    const data = await apiPost("/api/checklist/reset", {});
-    state.checklistParsed = data.parsed || null;
-    state.checklistDraft = newChecklistDraft(state.checklistParsed);
-    renderChecklistBuilder();
-    renderChecklistEditorStatus("Se reemplazó por el Checklist predeterminado de la app.");
-    refreshTokenEstimate();
-  } catch (err) {
-    renderChecklistEditorStatus(`Falló el restablecimiento: ${err.message}`);
-  } finally {
-    els.resetChecklistBtn.disabled = false;
-  }
-}
-
 async function exportChecklist() {
   els.exportChecklistBtn.disabled = true;
   try {
@@ -1463,10 +1733,17 @@ function promptWorkspaceFilesImport() {
   els.uploadWorkspaceFilesInput.click();
 }
 
+function promptOpenReviewDocsImport() {
+  if (!els.uploadOpenReviewDocsInput) return;
+  els.uploadOpenReviewDocsInput.value = "";
+  els.uploadOpenReviewDocsInput.click();
+}
+
 async function importWorkspaceFiles(fileList) {
   const files = Array.from(fileList || []);
   if (!state.selectedCard || !files.length) return;
   els.uploadWorkspaceFilesBtn.disabled = true;
+  if (els.uploadOpenReviewDocsBtn) els.uploadOpenReviewDocsBtn.disabled = true;
   try {
     if (!state.workspace?.exists) {
       state.workspace = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/create`);
@@ -1486,7 +1763,71 @@ async function importWorkspaceFiles(fileList) {
     setViewerState(`Falló la carga: ${err.message}`);
   } finally {
     els.uploadWorkspaceFilesBtn.disabled = false;
+    if (els.uploadOpenReviewDocsBtn) els.uploadOpenReviewDocsBtn.disabled = !state.selectedCard;
     if (els.uploadWorkspaceFilesInput) els.uploadWorkspaceFilesInput.value = "";
+  }
+}
+
+async function deleteLocalAttachment(relativePath) {
+  if (!state.selectedCard || !relativePath) return;
+  const ok = window.confirm(`Eliminar "${relativePath}" de los archivos locales de esta revisión?`);
+  if (!ok) return;
+  setViewerState(`Eliminando archivo local: ${relativePath}`);
+  try {
+    await apiPost(`/api/cards/${state.selectedCard.id}/workspace/files/delete`, { relativePath });
+    state.indexCache.delete(`local:${relativePath}`);
+    await loadWorkspaceStatus(state.currentPacket);
+    refreshTokenEstimate();
+    setViewerState(`Se eliminó "${relativePath}" de los archivos locales.`);
+  } catch (err) {
+    await loadWorkspaceStatus(state.currentPacket).catch(() => {});
+    refreshTokenEstimate();
+    setViewerState(`No se pudo eliminar "${relativePath}": ${err.message}`);
+  }
+}
+
+async function importOpenReviewDocuments(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  if (els.uploadOpenReviewDocsBtn) els.uploadOpenReviewDocsBtn.disabled = true;
+  try {
+    const payloadFiles = [];
+    for (const file of files) {
+      const buffer = await file.arrayBuffer();
+      payloadFiles.push({
+        name: file.name,
+        contentBase64: arrayBufferToBase64(buffer),
+      });
+    }
+    const data = await apiPost("/api/open-review/documents/import", { files: payloadFiles });
+    state.openReviewDocs = data.openReviewDocuments || null;
+    renderOpenReviewDocs();
+    const uploaded = (state.openReviewDocs?.documents || []).filter((row) =>
+      payloadFiles.some((f) => f.name === row.relativePath)
+    );
+    await indexOpenReviewDocuments(uploaded.length ? uploaded : null);
+    setViewerState(`Se importaron ${payloadFiles.length} documento(s) global(es) para revisión abierta.`);
+  } catch (err) {
+    setViewerState(`Falló la carga de documentos de revisión abierta: ${err.message}`);
+  } finally {
+    if (els.uploadOpenReviewDocsBtn) els.uploadOpenReviewDocsBtn.disabled = false;
+    if (els.uploadOpenReviewDocsInput) els.uploadOpenReviewDocsInput.value = "";
+  }
+}
+
+async function deleteOpenReviewDocument(relativePath) {
+  if (!relativePath) return;
+  const ok = window.confirm(`Eliminar "${relativePath}" de los documentos globales de revisión abierta?`);
+  if (!ok) return;
+  setViewerState(`Eliminando documento global: ${relativePath}`);
+  try {
+    await apiPost("/api/open-review/documents/delete", { relativePath });
+    state.indexCache.delete(`open_review:${relativePath}`);
+    await loadOpenReview();
+    setViewerState(`Se eliminó "${relativePath}" de los documentos globales de revisión abierta.`);
+  } catch (err) {
+    await loadOpenReview().catch(() => {});
+    setViewerState(`No se pudo eliminar "${relativePath}": ${err.message}`);
   }
 }
 
@@ -1888,7 +2229,9 @@ async function buildIndexRecord({ source, cardId, displayName, fileName, mimeTyp
 
   return {
     source,
-    sourceKey: source === "local" ? `local:${localFile.relativePath}` : `trello:${trelloAttachment.attachmentId}`,
+    sourceKey: source === "local"
+      ? `local:${localFile.relativePath}`
+      : (source === "open_review" ? `open_review:${localFile.relativePath}` : `trello:${trelloAttachment.attachmentId}`),
     cardId,
     displayName,
     fileName,
@@ -1911,6 +2254,10 @@ async function fetchArrayBuffer(url) {
 
 function localContentUrl(cardId, relativePath) {
   return `/api/cards/${encodeURIComponent(cardId)}/workspace/files/content?path=${encodeURIComponent(relativePath)}`;
+}
+
+function openReviewContentUrl(relativePath) {
+  return `/api/open-review/documents/content?path=${encodeURIComponent(relativePath)}`;
 }
 
 function summarizeIndexFailures(failures) {
@@ -1973,6 +2320,59 @@ async function indexLocalAttachments(filesOverride = null) {
     failures.push({ message: err.message });
   } finally {
     els.indexLocalBtn.disabled = false;
+  }
+  return { savedCount, failures };
+}
+
+async function indexOpenReviewDocuments(filesOverride = null) {
+  if (!state.openReviewDocs) {
+    state.openReviewDocs = await apiGet("/api/open-review/documents");
+  }
+  const files = filesOverride || state.openReviewDocs?.documents || [];
+  if (!files.length) {
+    setViewerState("No hay documentos globales de revisión abierta para indexar.");
+    return { savedCount: 0, failures: [] };
+  }
+  setViewerState(`Indexando ${files.length} documento(s) global(es) para revisión abierta...`);
+  let savedCount = 0;
+  const failures = [];
+  try {
+    for (let i = 0; i < files.length; i += 1) {
+      const f = files[i];
+      if (!f.relativePath) continue;
+      try {
+        setViewerState(`Indexando revisión abierta ${i + 1}/${files.length}: ${f.relativePath}`);
+        const url = openReviewContentUrl(f.relativePath);
+        const { buffer, contentType } = await fetchArrayBuffer(url);
+        const fileName = f.relativePath.split("/").pop() || f.relativePath;
+        const record = await buildIndexRecord({
+          source: "open_review",
+          cardId: "open_review_global",
+          displayName: fileName,
+          fileName,
+          mimeType: contentType.split(";")[0] || "application/octet-stream",
+          arrayBuffer: buffer,
+          sourceLocator: { type: "open_review_file", relativePath: f.relativePath, url },
+          localFile: { relativePath: f.relativePath },
+        });
+        await apiPost("/api/open-review/indexes", { indexes: [record] });
+        savedCount += 1;
+      } catch (err) {
+        failures.push({ message: `${f.relativePath}: ${err.message}` });
+      }
+    }
+    state.openReviewDocs = await apiGet("/api/open-review/documents");
+    renderOpenReviewDocs();
+    if (failures.length) {
+      setViewerState(`Se indexaron ${savedCount} documento(s) global(es). Fallaron ${failures.length}: ${summarizeIndexFailures(failures)}`);
+    } else {
+      setViewerState(`Se indexaron ${savedCount} documento(s) global(es) de revisión abierta.`);
+    }
+  } catch (err) {
+    state.openReviewDocs = await apiGet("/api/open-review/documents").catch(() => state.openReviewDocs);
+    renderOpenReviewDocs();
+    setViewerState(`Falló la indexación de documentos de revisión abierta: ${err.message}`);
+    failures.push({ message: err.message });
   }
   return { savedCount, failures };
 }
@@ -2139,6 +2539,45 @@ async function runChecklist() {
   }
 }
 
+async function runOpenReview() {
+  if (!state.selectedCard || !state.workspaceStatus?.readyForRun) return;
+  if (hasActiveReviewJobForCard(state.selectedCard.id)) {
+    setViewerState("Ya hay una revisión en curso para esta tarjeta. Sigue su estado en Recientes.");
+    return;
+  }
+  if (!state.openReviewDraft && !state.openReviewConfig) {
+    await loadOpenReview();
+  }
+  const config = buildOpenReviewPayload();
+  els.runOpenReviewBtn.disabled = true;
+  setViewerState("Encolando revisión abierta...");
+  try {
+    const data = await apiPost(`/api/cards/${state.selectedCard.id}/workspace/open-review/run-async`, {
+      model: getSelectedModel(),
+      reasoning_effort: els.reasoningEffortSelect.value,
+      service_tier: getSelectedServiceTier(),
+      cardPacket: state.currentPacket,
+      multimodal_limit_bytes: getConfiguredMultimodalLimitBytes(),
+      question: config.default_question,
+      system_prompt: config.system_prompt,
+    });
+    if (data.job?.job_id) {
+      state.dismissedReviewJobIds.delete(data.job.job_id);
+      persistDismissedReviewJobIds();
+    }
+    await refreshReviewJobs({ silent: true });
+    setViewerState(
+      data.existing
+        ? "La revisión abierta ya estaba en curso. Sigue el progreso en Recientes."
+        : "La revisión abierta sigue ejecutándose en segundo plano."
+    );
+  } catch (err) {
+    setViewerState(`Falló la revisión abierta: ${err.message}`);
+  } finally {
+    renderWorkspace();
+  }
+}
+
 async function refreshTokenEstimate() {
   const selectedCardId = state.selectedCard?.id;
   const cardPacket = state.currentPacket;
@@ -2177,7 +2616,9 @@ async function loadSelectedRun() {
 /* Modals & Citations */
 async function getIndexBySourceKey(sourceKey) {
   if (state.indexCache.has(sourceKey)) return state.indexCache.get(sourceKey);
-  const data = await apiGet(`/api/cards/${state.selectedCard.id}/workspace/index?sourceKey=${encodeURIComponent(sourceKey)}`);
+  const data = String(sourceKey || "").startsWith("open_review:")
+    ? await apiGet(`/api/open-review/index?sourceKey=${encodeURIComponent(sourceKey)}`)
+    : await apiGet(`/api/cards/${state.selectedCard.id}/workspace/index?sourceKey=${encodeURIComponent(sourceKey)}`);
   state.indexCache.set(sourceKey, data);
   return data;
 }
@@ -2346,6 +2787,9 @@ function sourceLocatorToFetchUrl(summary) {
   const loc = summary?.source_locator || summary?.sourceLocator || {};
   if (loc.type === "local_file" && loc.relativePath && state.selectedCard) {
     return localContentUrl(state.selectedCard.id, loc.relativePath);
+  }
+  if (loc.type === "open_review_file" && loc.relativePath) {
+    return openReviewContentUrl(loc.relativePath);
   }
   if (loc.type === "trello_attachment" && loc.proxyUrl) {
     return loc.proxyUrl;
@@ -2625,17 +3069,21 @@ function bindEvents() {
   els.indexLocalBtn.onclick = () => indexLocalAttachments();
   els.indexTrelloBtn.onclick = () => indexTrelloAttachments();
   els.runChecklistBtn.onclick = runChecklist;
+  if (els.runOpenReviewBtn) els.runOpenReviewBtn.onclick = runOpenReview;
   els.loadRunBtn.onclick = loadSelectedRun;
   els.runHistorySelect.onchange = loadSelectedRun;
   
   els.loadChecklistBtn.onclick = loadChecklist;
-  els.resetChecklistBtn.onclick = resetChecklistToAppDefault;
   els.importChecklistBtn.onclick = promptChecklistImport;
   els.exportChecklistBtn.onclick = exportChecklist;
   els.importChecklistInput.onchange = (e) => importChecklistFile(e.target.files?.[0]);
   els.uploadWorkspaceFilesInput.onchange = (e) => importWorkspaceFiles(e.target.files);
   els.saveChecklistBtn.onclick = saveChecklist;
   els.addChecklistItemBtn.onclick = () => { ensureChecklistDraft().items.push(newChecklistItemDraft()); renderChecklistBuilder(); };
+  if (els.uploadOpenReviewDocsBtn) els.uploadOpenReviewDocsBtn.onclick = promptOpenReviewDocsImport;
+  if (els.uploadOpenReviewDocsInput) els.uploadOpenReviewDocsInput.onchange = (e) => importOpenReviewDocuments(e.target.files);
+  if (els.loadOpenReviewBtn) els.loadOpenReviewBtn.onclick = loadOpenReview;
+  if (els.saveOpenReviewBtn) els.saveOpenReviewBtn.onclick = saveOpenReview;
   
   els.reasoningEffortSelect.onchange = refreshTokenEstimate;
   els.modelInput.onchange = () => {
@@ -2687,7 +3135,7 @@ async function init() {
   renderWorkspace();
   renderResults();
   startReviewJobsPolling();
-  await Promise.all([loadChecklist(), loadBoards(), loadCompletedCardsSnapshot()]);
+  await Promise.all([loadChecklist(), loadOpenReview(), loadBoards(), loadCompletedCardsSnapshot()]);
 }
 
 init();

@@ -41,6 +41,8 @@ if os.name == "nt":
 from app_paths import resolve_app_paths
 from trello_smoke_test import TrelloClient, load_dotenv
 from workbench_store import (
+    delete_local_file_for_card,
+    delete_open_review_document,
     detect_mime_from_name,
     estimate_llm_input_tokens_for_card,
     ensure_card_workspace,
@@ -48,18 +50,29 @@ from workbench_store import (
     get_card_workspace_status,
     get_index_for_card,
     get_local_file_path,
+    get_open_review_documents_info,
+    get_open_review_file_path,
+    get_open_review_index,
     get_run_result,
     import_local_files_for_card,
+    import_open_review_documents,
     init_workbench_paths,
     list_completed_run_cards,
     list_index_summaries,
     load_checklist,
     load_checklist_text,
+    load_open_review_config,
+    load_open_review_config_text,
     remove_index_sources_for_card,
     reset_checklist,
+    reset_open_review_config,
     run_checklist_for_card,
+    run_open_review_for_card,
     save_checklist,
     save_checklist_text,
+    save_open_review_config,
+    save_open_review_config_text,
+    save_open_review_indexes,
     save_indexes_for_card,
     utc_now_iso,
 )
@@ -133,6 +146,9 @@ class ReviewJob:
     status: str
     created_at: str
     updated_at: str
+    run_type: str = "checklist"
+    open_review_question: str | None = None
+    open_review_system_prompt: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
     run_id: str | None = None
@@ -157,6 +173,8 @@ class ReviewJob:
             "requested_service_tier": self.requested_service_tier,
             "service_tier": self.service_tier,
             "multimodal_limit_bytes": self.multimodal_limit_bytes,
+            "run_type": self.run_type,
+            "open_review_question": self.open_review_question,
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -196,10 +214,13 @@ class ReviewJobManager:
         reasoning_effort: str,
         service_tier: str,
         multimodal_limit_bytes: int | None,
+        run_type: str = "checklist",
+        open_review_question: str | None = None,
+        open_review_system_prompt: str | None = None,
     ) -> tuple[Dict[str, Any], bool]:
         with self._lock:
             for job in self._jobs.values():
-                if job.card_id == card_id and job.status in {"queued", "running"}:
+                if job.card_id == card_id and job.run_type == run_type and job.status in {"queued", "running"}:
                     return job.to_payload(), True
 
             now = utc_now_iso()
@@ -213,6 +234,9 @@ class ReviewJobManager:
                 requested_service_tier=service_tier,
                 service_tier=service_tier,
                 multimodal_limit_bytes=multimodal_limit_bytes,
+                run_type=run_type,
+                open_review_question=open_review_question,
+                open_review_system_prompt=open_review_system_prompt,
                 status="queued",
                 created_at=now,
                 updated_at=now,
@@ -231,6 +255,9 @@ class ReviewJobManager:
                 "reasoning_effort": reasoning_effort,
                 "service_tier": service_tier,
                 "multimodal_limit_bytes": multimodal_limit_bytes,
+                "run_type": run_type,
+                "open_review_question": open_review_question,
+                "open_review_system_prompt": open_review_system_prompt,
             },
             daemon=True,
         )
@@ -249,6 +276,9 @@ class ReviewJobManager:
         reasoning_effort: str,
         service_tier: str,
         multimodal_limit_bytes: int | None,
+        run_type: str,
+        open_review_question: str | None,
+        open_review_system_prompt: str | None,
     ) -> None:
         started_at = utc_now_iso()
         with self._lock:
@@ -259,7 +289,7 @@ class ReviewJobManager:
             job.started_at = started_at
             job.updated_at = started_at
             job.stage = "starting"
-            job.progress_message = "Inicializando revisión."
+            job.progress_message = "Inicializando revisión abierta." if run_type == "open_review" else "Inicializando revisión."
             job.progress_current = None
             job.progress_total = None
             job.diagnostics = {"started_at": started_at}
@@ -287,18 +317,34 @@ class ReviewJobManager:
                 job.diagnostics = merged
 
         try:
-            result = run_checklist_for_card(
-                self._paths,
-                card_id=card_id,
-                card_name=card_name,
-                card_url=card_url,
-                card_packet=card_packet,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                service_tier=service_tier,
-                multimodal_limit_bytes=multimodal_limit_bytes,
-                progress_callback=report_progress,
-            )
+            if run_type == "open_review":
+                result = run_open_review_for_card(
+                    self._paths,
+                    card_id=card_id,
+                    card_name=card_name,
+                    card_url=card_url,
+                    card_packet=card_packet,
+                    question=open_review_question,
+                    system_prompt=open_review_system_prompt,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    service_tier=service_tier,
+                    multimodal_limit_bytes=multimodal_limit_bytes,
+                    progress_callback=report_progress,
+                )
+            else:
+                result = run_checklist_for_card(
+                    self._paths,
+                    card_id=card_id,
+                    card_name=card_name,
+                    card_url=card_url,
+                    card_packet=card_packet,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    service_tier=service_tier,
+                    multimodal_limit_bytes=multimodal_limit_bytes,
+                    progress_callback=report_progress,
+                )
             finished_at = utc_now_iso()
             run = result.get("run") or {}
             with self._lock:
@@ -312,7 +358,7 @@ class ReviewJobManager:
                 job.run_summary = run.get("summary") if isinstance(run, dict) else None
                 job.service_tier = str(run.get("service_tier") or job.service_tier)
                 job.stage = "done"
-                job.progress_message = "Revisión completada."
+                job.progress_message = "Revisión abierta completada." if run_type == "open_review" else "Revisión completada."
                 job.progress_current = None
                 job.progress_total = None
                 if isinstance(run, dict) and isinstance(run.get("diagnostics"), dict):
@@ -1204,6 +1250,12 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
         content_type = mimetypes.guess_type(file_path.name)[0] or detect_mime_from_name(file_path.name)
         self._send_binary(body, content_type=content_type, filename=file_path.name)
 
+    def _send_open_review_file(self, rel_path: str) -> None:
+        file_path = get_open_review_file_path(self.workbench_paths, rel_path)
+        body = file_path.read_bytes()
+        content_type = mimetypes.guess_type(file_path.name)[0] or detect_mime_from_name(file_path.name)
+        self._send_binary(body, content_type=content_type, filename=file_path.name)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/"):
@@ -1241,6 +1293,35 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                         "parsed": load_checklist(self.workbench_paths),
                     }
                 )
+                return
+
+            if path == "/api/open-review":
+                self._send_json(
+                    {
+                        "text": load_open_review_config_text(self.workbench_paths),
+                        "parsed": load_open_review_config(self.workbench_paths),
+                    }
+                )
+                return
+
+            if path == "/api/open-review/documents":
+                self._send_json(get_open_review_documents_info(self.workbench_paths))
+                return
+
+            if path == "/api/open-review/documents/content":
+                rel_path = (qs.get("path", [""])[0] or "").strip()
+                if not rel_path:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Falta el parámetro de consulta `path`")
+                    return
+                self._send_open_review_file(rel_path)
+                return
+
+            if path == "/api/open-review/index":
+                source_key = (qs.get("sourceKey", [""])[0] or "").strip()
+                if not source_key:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Falta sourceKey")
+                    return
+                self._send_json(get_open_review_index(self.workbench_paths, source_key))
                 return
 
             if path == "/api/completed-cards":
@@ -1364,6 +1445,47 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
             if path == "/api/checklist/reset":
                 parsed_checklist = reset_checklist(self.workbench_paths)
                 self._send_json({"ok": True, "parsed": parsed_checklist, "text": load_checklist_text(self.workbench_paths)})
+                return
+
+            if path == "/api/open-review":
+                if isinstance(payload.get("config"), dict):
+                    parsed_config = save_open_review_config(self.workbench_paths, payload["config"])
+                else:
+                    text = str(payload.get("text") or "")
+                    parsed_config = save_open_review_config_text(self.workbench_paths, text)
+                self._send_json({"ok": True, "parsed": parsed_config, "text": load_open_review_config_text(self.workbench_paths)})
+                return
+
+            if path == "/api/open-review/reset":
+                parsed_config = reset_open_review_config(self.workbench_paths)
+                self._send_json({"ok": True, "parsed": parsed_config, "text": load_open_review_config_text(self.workbench_paths)})
+                return
+
+            if path == "/api/open-review/documents/import":
+                files = payload.get("files")
+                if not isinstance(files, list) or not files:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "El cuerpo debe contener un arreglo `files` no vacío")
+                    return
+                result = import_open_review_documents(self.workbench_paths, files=files)
+                self._send_json({"ok": True, **result})
+                return
+
+            if path == "/api/open-review/documents/delete":
+                relative_path = str(payload.get("relativePath") or "").strip()
+                if not relative_path:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Falta `relativePath`")
+                    return
+                result = delete_open_review_document(self.workbench_paths, relative_path=relative_path)
+                self._send_json({"ok": True, **result})
+                return
+
+            if path == "/api/open-review/indexes":
+                indexes = payload.get("indexes")
+                if not isinstance(indexes, list):
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "El cuerpo debe contener un arreglo `indexes`")
+                    return
+                result = save_open_review_indexes(self.workbench_paths, indexes=indexes)
+                self._send_json({"ok": True, **result})
                 return
 
             if path.startswith("/api/cards/") and path.endswith("/workspace/token-estimate"):
@@ -1497,6 +1619,24 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 self._send_json({"ok": True, **result})
                 return
 
+            if path.startswith("/api/cards/") and path.endswith("/workspace/files/delete"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 6:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de eliminación de archivos del espacio de trabajo no válida")
+                    return
+                card_id = parts[2]
+                relative_path = str(payload.get("relativePath") or "").strip()
+                if not relative_path:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Falta `relativePath`")
+                    return
+                result = delete_local_file_for_card(
+                    self.workbench_paths,
+                    card_id=card_id,
+                    relative_path=relative_path,
+                )
+                self._send_json({"ok": True, **result})
+                return
+
             if path.startswith("/api/cards/") and path.endswith("/workspace/indexes/prune"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 6:
@@ -1570,6 +1710,40 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
                 self._send_json({"ok": True, "job": job, "existing": existing})
                 return
 
+            if path.startswith("/api/cards/") and path.endswith("/workspace/open-review/run-async"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 6:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "Ruta de revisión abierta asíncrona no válida")
+                    return
+                card_id = parts[2]
+                card_packet = payload.get("cardPacket")
+                if not isinstance(card_packet, dict):
+                    card_packet = get_card_packet(client, card_id=card_id)
+                card = card_packet.get("card") if isinstance(card_packet, dict) else {}
+                if not isinstance(card, dict):
+                    card = {}
+                model = parse_openai_model(payload.get("model"))
+                reasoning_effort = parse_reasoning_effort(payload.get("reasoning_effort"))
+                service_tier = parse_openai_service_tier(payload.get("service_tier"))
+                multimodal_limit_bytes = parse_multimodal_limit_bytes(payload.get("multimodal_limit_bytes"))
+                question = str(payload.get("question") or "").strip()
+                system_prompt = str(payload.get("system_prompt") or "").strip()
+                job, existing = self.review_job_manager.start_job(
+                    card_id=card_id,
+                    card_name=str(card.get("name") or card_id),
+                    card_url=str(card.get("url") or ""),
+                    card_packet=card_packet,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    service_tier=service_tier,
+                    multimodal_limit_bytes=multimodal_limit_bytes,
+                    run_type="open_review",
+                    open_review_question=question or None,
+                    open_review_system_prompt=system_prompt or None,
+                )
+                self._send_json({"ok": True, "job": job, "existing": existing})
+                return
+
             self._send_error_json(HTTPStatus.NOT_FOUND, "Ruta no encontrada")
         except ValueError as e:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(e))
@@ -1611,6 +1785,7 @@ def main() -> int:
             APP_PATHS.review_workspace_dir,
             checklist_file=APP_PATHS.user_checklist_file,
             checklist_template_file=APP_PATHS.default_checklist_file,
+            open_review_file=APP_PATHS.user_open_review_file,
         )  # type: ignore[attr-defined]
         server.review_job_manager = ReviewJobManager(server.workbench_paths)  # type: ignore[attr-defined]
     except OSError as e:

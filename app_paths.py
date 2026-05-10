@@ -23,6 +23,7 @@ class AppPaths:
     user_root: Path
     review_workspace_dir: Path
     user_checklist_file: Path
+    user_open_review_file: Path
     env_search_paths: List[Path]
 
 
@@ -183,5 +184,6 @@ def resolve_app_paths() -> AppPaths:
         user_root=user_root,
         review_workspace_dir=user_root / "review_workspace",
         user_checklist_file=user_root / "checklist.json",
+        user_open_review_file=user_root / "open_review_prompt.json",
         env_search_paths=env_search_paths,
     )

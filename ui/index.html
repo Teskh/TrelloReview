@@ -58,6 +58,9 @@
               </div>
             </div>
             <div class="section-panel">
+              <div id="reviewAnimation" class="review-animation-strip" aria-hidden="true" hidden>
+                <img id="reviewAnimationFrame" src="/animation/0001.png" alt="" />
+              </div>
               <div class="list-container recent-list-container">
                 <ul id="recentJobsList" class="nav-list recent-jobs-list"></ul>
               </div>
@@ -121,6 +124,7 @@
         <nav class="view-tabs">
           <button class="view-tab active" data-ptab="workspace">Espacio de trabajo</button>
           <button class="view-tab" data-ptab="checklist">Checklist</button>
+          <button class="view-tab" data-ptab="open-review">Revisión abierta</button>
           <button class="view-tab" data-ptab="results">Resultados del análisis</button>
           <button class="view-tab" data-ptab="viewer">Visor de datos</button>
           <div class="tab-indicator"></div>
@@ -174,6 +178,7 @@
                     <input id="multimodalLimitInput" type="number" min="1" max="100" step="1" value="10" class="compact-input" />
                   </div>
                   <button id="runChecklistBtn" class="action-btn outline" disabled>Ejecutar revisión</button>
+                  <button id="runOpenReviewBtn" class="action-btn outline" disabled>Ejecutar abierta</button>
                 </div>
               </div>
 
@@ -211,7 +216,6 @@
                 </div>
                 <div class="pane-actions">
                   <button id="loadChecklistBtn" class="action-btn outline">Recargar</button>
-                  <button id="resetChecklistBtn" class="action-btn outline">Usar el predeterminado de la app</button>
                   <button id="importChecklistBtn" class="action-btn outline">Importar</button>
                   <button id="exportChecklistBtn" class="action-btn outline">Exportar</button>
                   <button id="saveChecklistBtn" class="action-btn primary">Guardar cambios</button>
@@ -236,6 +240,37 @@
                 </div>
                 
                 <div id="checklistItemsList" class="items-stack"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Open Review View -->
+          <div class="pane" id="ptab-open-review">
+            <div class="content-wrapper">
+              <div class="pane-header">
+                <div>
+                  <h2 class="display-title">Revisión abierta</h2>
+                  <div id="openReviewStatus" class="meta-text">Esperando carga...</div>
+                </div>
+                <div class="pane-actions">
+                  <button id="uploadOpenReviewDocsBtn" class="action-btn outline" disabled>Subir documentos</button>
+                  <button id="loadOpenReviewBtn" class="action-btn outline">Recargar</button>
+                  <button id="saveOpenReviewBtn" class="action-btn primary">Guardar cambios</button>
+                </div>
+              </div>
+              <div class="form-layout">
+                <div class="data-col">
+                  <h3>Documentos globales para revisión abierta</h3>
+                  <ul id="openReviewDocsList" class="data-list"></ul>
+                </div>
+                <div class="field-group">
+                  <label>Pregunta para esta revisión</label>
+                  <textarea id="openReviewQuestionInput" rows="3" placeholder="Qué quieres que el modelo busque..."></textarea>
+                </div>
+                <div class="field-group">
+                  <label>System prompt guardado</label>
+                  <textarea id="openReviewSystemPromptInput" rows="10" placeholder="System prompt para revisión abierta..."></textarea>
+                </div>
               </div>
             </div>
           </div>
@@ -298,6 +333,7 @@
 
     <input id="importChecklistInput" type="file" accept=".json,application/json" hidden />
     <input id="uploadWorkspaceFilesInput" type="file" multiple hidden />
+    <input id="uploadOpenReviewDocsInput" type="file" multiple hidden />
 
     <!-- Templates -->
     <template id="boardItemTpl">

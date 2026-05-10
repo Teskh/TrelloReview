@@ -30,6 +30,23 @@ def build_review_system_prompt() -> str:
     )
 
 
+def build_open_review_system_prompt() -> str:
+    return (
+        "You are a meticulous legal and document review assistant. "
+        "Answer the user's open-ended review question using only the provided evidence segments, which may include OCR transcriptions derived from attached Trello images/PDFs, "
+        "plus multimodal visual attachments for local uploaded images or scanned PDF pages, "
+        "plus the provided Trello card description/comments context. "
+        "Look for material omissions, possible mistakes, inconsistencies, legal risks, and issues requiring human review. "
+        "Every substantive finding must cite one or more evidence anchors. "
+        "Citations must reference source_key and anchor_id exactly as provided. "
+        "Distinguish law/reference-document requirements from project or case-document facts. "
+        "Do not invent requirements, facts, or citations. Use verbatim quotes copied from the cited segment text when available. "
+        "If a conclusion depends on missing or ambiguous evidence, say so explicitly and list the evidence needed. "
+        "For image-only/scanned pages or image files without quoted text, set quote to an empty string and cite the mapped anchor. "
+        "When a local uploaded scanned PDF page or image is attached visually, use that visual evidence directly and cite its mapped anchor_id."
+    )
+
+
 def _card_comment_context(card_packet: Dict[str, Any]) -> List[Dict[str, Any]]:
     comments: List[Dict[str, Any]] = []
     for row in card_packet.get("comments") or []:
@@ -103,6 +120,57 @@ def build_review_user_payload(
                 "insufficient": "Evidence is relevant but not enough to resolve the checklist conclusion.",
             },
             "for_image_or_scanned_pdf_without_text": "Use page anchor citation and empty quote; only mark needs_review if the visual evidence plus other evidence still does not resolve the item.",
+        },
+        "multimodal_assets": multimodal_assets or [],
+        "evidence_documents": evidence,
+    }
+
+
+def build_open_review_user_payload(
+    *,
+    question: str,
+    evidence: List[Dict[str, Any]],
+    multimodal_assets: Optional[List[Dict[str, Any]]] = None,
+    card_id: str,
+    card_name: str,
+    card_url: str,
+    card_packet: Dict[str, Any],
+) -> Dict[str, Any]:
+    card_core = card_packet.get("card") if isinstance(card_packet, dict) else {}
+    if not isinstance(card_core, dict):
+        card_core = {}
+    description = str(card_core.get("desc") or "")
+    comments = _card_comment_context(card_packet if isinstance(card_packet, dict) else {})
+    return {
+        "task": "Answer an open-ended review question against Trello context and indexed evidence, and return structured findings with citations.",
+        "question": question,
+        "card": {
+            "id": card_id,
+            "name": card_name,
+            "url": card_url,
+            "description": description,
+            "comments": comments,
+            "metadata": {
+                "labels": [l.get("name") or l.get("color") for l in (card_core.get("labels") or []) if isinstance(l, dict)],
+                "members": [
+                    m.get("fullName") or m.get("username")
+                    for m in (card_packet.get("members") or [])
+                    if isinstance(m, dict) and (m.get("fullName") or m.get("username"))
+                ],
+                "trello_attachment_count": len(card_packet.get("attachments") or []),
+                "comment_count": len(comments),
+            },
+        },
+        "citation_rules": {
+            "must_cite_every_finding": True,
+            "cite_only_provided_source_key_and_anchor_id": True,
+            "prefer_exact_quote": True,
+            "citation_effect_values": {
+                "supports": "Evidence supports the finding.",
+                "contradicts": "Evidence cuts against the finding.",
+                "insufficient": "Evidence is relevant but not enough to resolve the finding.",
+            },
+            "for_image_or_scanned_pdf_without_text": "Use page anchor citation and empty quote; only mark needs_human_review if the visual evidence plus other evidence still does not resolve the finding.",
         },
         "multimodal_assets": multimodal_assets or [],
         "evidence_documents": evidence,

@@ -45,6 +45,8 @@ __pycache__/
 *.bak
 *.svg
 *.png
+!ui/animation/
+!ui/animation/*.png
 #*.jpg
 *txt
 !requirements.txt
