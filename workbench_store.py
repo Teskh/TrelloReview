@@ -1345,6 +1345,102 @@ def list_index_summaries(paths: WorkbenchPaths, card_id: str) -> Dict[str, Any]:
     return {"indexes": indexes}
 
 
+def _compact_segment_meta(meta: Any) -> Dict[str, Any]:
+    if not isinstance(meta, dict):
+        return {}
+    compact: Dict[str, Any] = {}
+    ocr_status = str(meta.get("ocr_status") or "").strip()
+    if ocr_status and ocr_status != "text_available":
+        compact["ocr_status"] = ocr_status
+    formula = meta.get("formula")
+    if formula:
+        compact["formula"] = formula
+    tag = meta.get("tag")
+    if tag:
+        compact["tag"] = tag
+    return compact
+
+
+def _compact_evidence_segment(seg: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "anchor_id": seg.get("anchor_id"),
+        "kind": seg.get("kind"),
+        "text": _truncate_evidence_text(seg.get("text")),
+    }
+    page = seg.get("page")
+    if page is not None:
+        out["page"] = page
+    sheet = seg.get("sheet")
+    if sheet:
+        out["sheet"] = sheet
+    meta = _compact_segment_meta(seg.get("meta"))
+    if meta:
+        out["meta"] = meta
+    return out
+
+
+def _compact_evidence_document(
+    *,
+    source_key: str,
+    entry: Dict[str, Any],
+    data: Dict[str, Any],
+    segments: List[Dict[str, Any]],
+    source_scope: Optional[str] = None,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "source_key": source_key,
+        "display_name": entry.get("display_name") or source_key,
+        "file_kind": data.get("file_kind") or entry.get("file_kind"),
+        "segments": segments,
+    }
+    source = entry.get("source")
+    if source:
+        out["source"] = source
+    if source_scope:
+        out["source_scope"] = source_scope
+    return out
+
+
+def _evidence_doc_has_text(doc: Dict[str, Any]) -> bool:
+    for seg in doc.get("segments") or []:
+        if isinstance(seg, dict) and str(seg.get("text") or "").strip():
+            return True
+    return False
+
+
+def _sanitize_evidence_for_model(
+    evidence: List[Dict[str, Any]],
+    *,
+    visual_assets: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    visual_source_keys = {
+        str(asset.get("source_key") or "").strip()
+        for asset in visual_assets
+        if isinstance(asset, dict) and str(asset.get("source_key") or "").strip()
+    }
+    sanitized: List[Dict[str, Any]] = []
+    for doc in evidence:
+        if not isinstance(doc, dict):
+            continue
+        source_key = str(doc.get("source_key") or "").strip()
+        file_kind = str(doc.get("file_kind") or "").strip()
+        if file_kind == "image" and source_key not in visual_source_keys and not _evidence_doc_has_text(doc):
+            continue
+
+        out = {
+            k: v
+            for k, v in doc.items()
+            if k not in {"warnings", "segments"}
+        }
+        out["segments"] = [
+            _compact_evidence_segment(seg)
+            for seg in (doc.get("segments") or [])
+            if isinstance(seg, dict)
+        ]
+        sanitized.append(out)
+    return sanitized
+
+
 def _collect_evidence_segments(
     paths: WorkbenchPaths,
     card_id: str,
@@ -1374,27 +1470,14 @@ def _collect_evidence_segments(
         for seg in segments[:500]:
             if not isinstance(seg, dict):
                 continue
-            ev_segments.append(
-                {
-                    "anchor_id": seg.get("anchor_id"),
-                    "kind": seg.get("kind"),
-                    "text": _truncate_evidence_text(seg.get("text")),
-                    "page": seg.get("page"),
-                    "sheet": seg.get("sheet"),
-                    "meta": seg.get("meta") or {},
-                }
-            )
+            ev_segments.append(_compact_evidence_segment(seg))
         evidence.append(
-            {
-                "source_key": source_key,
-                "source": entry.get("source"),
-                "display_name": entry.get("display_name"),
-                "file_kind": data.get("file_kind") or entry.get("file_kind"),
-                "mime_type": data.get("mime_type") or entry.get("mime_type"),
-                "content_hash": data.get("content_hash") or entry.get("content_hash"),
-                "warnings": data.get("warnings") or entry.get("warnings") or [],
-                "segments": ev_segments,
-            }
+            _compact_evidence_document(
+                source_key=source_key,
+                entry=entry,
+                data=data,
+                segments=ev_segments,
+            )
         )
     return evidence, index_lookup
 
@@ -1418,26 +1501,15 @@ def _collect_open_review_evidence_segments(paths: WorkbenchPaths) -> Tuple[List[
         for seg in data.get("segments") or []:
             if not isinstance(seg, dict):
                 continue
-            segments.append(
-                {
-                    "anchor_id": seg.get("anchor_id"),
-                    "kind": seg.get("kind"),
-                    "text": _truncate_evidence_text(seg.get("text")),
-                    "page": seg.get("page"),
-                    "sheet": seg.get("sheet"),
-                    "meta": seg.get("meta") or {},
-                }
-            )
+            segments.append(_compact_evidence_segment(seg))
         evidence.append(
-            {
-                "source_key": source_key,
-                "source_scope": "global_open_review",
-                "display_name": entry.get("display_name") or source_key,
-                "file_kind": entry.get("file_kind"),
-                "mime_type": entry.get("mime_type"),
-                "segments": segments,
-                "warnings": entry.get("warnings") or [],
-            }
+            _compact_evidence_document(
+                source_key=source_key,
+                entry=entry,
+                data=data,
+                segments=segments,
+                source_scope="global_open_review",
+            )
         )
     return evidence, index_lookup
 
@@ -2050,18 +2122,19 @@ def summarize_multimodal_assets(
 
 
 def _multimodal_summary_payload(assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [
-        {
+    summary = []
+    for asset in assets:
+        row = {
             "source_key": asset.get("source_key"),
             "display_name": asset.get("display_name"),
             "file_kind": asset.get("file_kind"),
-            "mime_type": asset.get("mime_type"),
-            "byte_size": asset.get("byte_size"),
             "anchor_hint": asset.get("anchor_hint"),
-            "warnings": asset.get("warnings") or [],
         }
-        for asset in assets
-    ]
+        warnings = asset.get("warnings") or []
+        if warnings:
+            row["warnings"] = warnings
+        summary.append(row)
+    return summary
 
 
 def ocr_transcription_schema() -> Dict[str, Any]:
@@ -2292,7 +2365,12 @@ def _build_multimodal_user_content(
                     ),
                 }
             )
-    content.append({"type": "input_text", "text": json.dumps(user_payload, ensure_ascii=False)})
+    content.append(
+        {
+            "type": "input_text",
+            "text": json.dumps(user_payload, ensure_ascii=False, separators=(",", ":")),
+        }
+    )
     return content
 
 
@@ -3081,10 +3159,14 @@ def run_checklist_for_card(
         index_lookup=index_lookup,
         transcriptions=ocr_transcriptions,
     )
+    model_evidence = _sanitize_evidence_for_model(
+        evidence,
+        visual_assets=review_visual_assets,
+    )
     if run_type == "open_review":
         user_payload = build_open_review_user_payload(
             question=question,
-            evidence=evidence,
+            evidence=model_evidence,
             multimodal_assets=_multimodal_summary_payload(review_visual_assets),
             card_id=card_id,
             card_name=card_name,
@@ -3096,7 +3178,7 @@ def run_checklist_for_card(
     else:
         user_payload = build_review_user_payload(
             checklist=checklist or {},
-            evidence=evidence,
+            evidence=model_evidence,
             multimodal_assets=_multimodal_summary_payload(review_visual_assets),
             card_id=card_id,
             card_name=card_name,
@@ -3105,7 +3187,7 @@ def run_checklist_for_card(
         )
         schema_name = "checklist_review"
         response_schema = checklist_run_schema()
-    user_payload_json = json.dumps(user_payload, ensure_ascii=False)
+    user_payload_json = json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
     user_payload_bytes_utf8 = len(user_payload_json.encode("utf-8"))
     diagnostics["checklist_request"] = {
         "run_type": run_type,

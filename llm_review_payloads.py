@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -47,20 +48,95 @@ def build_open_review_system_prompt() -> str:
     )
 
 
+TRELLO_URL_RE = re.compile(r"https://trello\.com/\S+", re.IGNORECASE)
+MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https://trello\.com/[^)\s]+)(?:\s+\"[^\"]*\")?\)", re.IGNORECASE)
+ATTACHED_PLACEHOLDER_RE = re.compile(r"!?\[attached:\s*[^\]]+\][^\s)]*\)?", re.IGNORECASE)
+
+
+def _compact_iso_date(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})", text)
+    return match.group(1) if match else text
+
+
+def _clean_comment_text(value: Any) -> str:
+    text = str(value or "")
+    text = MARKDOWN_LINK_RE.sub(lambda m: f"[attached: {m.group(1).strip()}]", text)
+    text = TRELLO_URL_RE.sub("[trello attachment link omitted]", text)
+    text = ATTACHED_PLACEHOLDER_RE.sub("", text)
+    text = text.replace("[trello attachment link omitted]", "")
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def _card_comment_context(card_packet: Dict[str, Any]) -> List[Dict[str, Any]]:
     comments: List[Dict[str, Any]] = []
     for row in card_packet.get("comments") or []:
         if not isinstance(row, dict):
             continue
-        comments.append(
-            {
-                "date": row.get("date") or None,
-                "author": row.get("author") or "",
-                "text": str(row.get("text") or ""),
-                "action_id": row.get("actionId") or None,
-            }
-        )
+        text = _clean_comment_text(row.get("text"))
+        if not text:
+            continue
+        comment: Dict[str, Any] = {"text": text}
+        date = _compact_iso_date(row.get("date"))
+        if date:
+            comment["date"] = date
+        author = str(row.get("author") or "").strip()
+        if author:
+            comment["author"] = author
+        comments.append(comment)
     return comments
+
+
+def _card_payload(
+    *,
+    card_name: str,
+    card_url: str,
+    description: str,
+    comments: List[Dict[str, Any]],
+    card_core: Dict[str, Any],
+    card_packet: Dict[str, Any],
+) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    labels = [
+        l.get("name") or l.get("color")
+        for l in (card_core.get("labels") or [])
+        if isinstance(l, dict) and (l.get("name") or l.get("color"))
+    ]
+    if labels:
+        metadata["labels"] = labels
+    members = [
+        m.get("fullName") or m.get("username")
+        for m in (card_packet.get("members") or [])
+        if isinstance(m, dict) and (m.get("fullName") or m.get("username"))
+    ]
+    if members:
+        metadata["members"] = members
+    metadata["trello_attachment_count"] = len(card_packet.get("attachments") or [])
+    metadata["comment_count"] = len(comments)
+    return {
+        "name": card_name,
+        "url": card_url,
+        "description": description,
+        "comments": comments,
+        "metadata": metadata,
+    }
+
+
+def _checklist_numbered_items(checklist: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "item_number": i,
+            "item_id": item.get("id"),
+            "title": item.get("title"),
+            "description": item.get("description"),
+            "pass_criteria": item.get("pass_criteria"),
+            "fail_criteria": item.get("fail_criteria"),
+        }
+        for i, item in enumerate(checklist.get("items") or [], start=1)
+        if isinstance(item, dict)
+    ]
 
 
 def build_review_user_payload(
@@ -80,36 +156,15 @@ def build_review_user_payload(
     comments = _card_comment_context(card_packet if isinstance(card_packet, dict) else {})
     return {
         "task": "Evaluate checklist against Trello context and indexed evidence, and return structured results with citations.",
-        "card": {
-            "id": card_id,
-            "name": card_name,
-            "url": card_url,
-            "description": description,
-            "comments": comments,
-            "metadata": {
-                "labels": [l.get("name") or l.get("color") for l in (card_core.get("labels") or []) if isinstance(l, dict)],
-                "members": [
-                    m.get("fullName") or m.get("username")
-                    for m in (card_packet.get("members") or [])
-                    if isinstance(m, dict) and (m.get("fullName") or m.get("username"))
-                ],
-                "trello_attachment_count": len(card_packet.get("attachments") or []),
-                "comment_count": len(comments),
-            },
-        },
-        "checklist": checklist,
-        "checklist_numbered_items": [
-            {
-                "item_number": i,
-                "item_id": item.get("id"),
-                "title": item.get("title"),
-                "description": item.get("description"),
-                "pass_criteria": item.get("pass_criteria"),
-                "fail_criteria": item.get("fail_criteria"),
-            }
-            for i, item in enumerate(checklist.get("items") or [], start=1)
-            if isinstance(item, dict)
-        ],
+        "card": _card_payload(
+            card_name=card_name,
+            card_url=card_url,
+            description=description,
+            comments=comments,
+            card_core=card_core,
+            card_packet=card_packet,
+        ),
+        "checklist_numbered_items": _checklist_numbered_items(checklist),
         "citation_rules": {
             "must_cite_every_item": True,
             "cite_only_provided_source_key_and_anchor_id": True,
@@ -144,23 +199,14 @@ def build_open_review_user_payload(
     return {
         "task": "Answer an open-ended review question against Trello context and indexed evidence, and return structured findings with citations.",
         "question": question,
-        "card": {
-            "id": card_id,
-            "name": card_name,
-            "url": card_url,
-            "description": description,
-            "comments": comments,
-            "metadata": {
-                "labels": [l.get("name") or l.get("color") for l in (card_core.get("labels") or []) if isinstance(l, dict)],
-                "members": [
-                    m.get("fullName") or m.get("username")
-                    for m in (card_packet.get("members") or [])
-                    if isinstance(m, dict) and (m.get("fullName") or m.get("username"))
-                ],
-                "trello_attachment_count": len(card_packet.get("attachments") or []),
-                "comment_count": len(comments),
-            },
-        },
+        "card": _card_payload(
+            card_name=card_name,
+            card_url=card_url,
+            description=description,
+            comments=comments,
+            card_core=card_core,
+            card_packet=card_packet,
+        ),
         "citation_rules": {
             "must_cite_every_finding": True,
             "cite_only_provided_source_key_and_anchor_id": True,
@@ -216,7 +262,7 @@ def estimate_review_input_tokens(
         card_url=card_url,
         card_packet=card_packet,
     )
-    user_payload_json = json.dumps(user_payload, ensure_ascii=False)
+    user_payload_json = json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
 
     evidence_segment_count = 0
     for doc in evidence:
