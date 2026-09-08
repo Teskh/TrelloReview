@@ -91,9 +91,9 @@ APP_PATHS = resolve_app_paths()
 ROOT_DIR = APP_PATHS.resource_root
 UI_DIR = APP_PATHS.ui_dir
 VALID_REASONING_EFFORTS = {"low", "medium", "high"}
-VALID_OPENAI_MODELS = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
+VALID_OPENAI_MODELS = {"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
 VALID_OPENAI_SERVICE_TIERS = {"auto", "flex"}
-DEFAULT_OPENAI_MODEL = "gpt-5.5"
+DEFAULT_OPENAI_MODEL = "gpt-6-astra"
 DEFAULT_OPENAI_SERVICE_TIER = "auto"
 STARTUP_LOG_PATH = APP_PATHS.settings_root / "startup.log"
 
@@ -587,7 +587,8 @@ def run_with_tray(
     server_thread = threading.Thread(target=_serve_server, kwargs={"server": server, "label": "tray"}, daemon=True)
     server_thread.start()
 
-    def setup(_: Any) -> None:
+    def setup(tray_icon: Any) -> None:
+        tray_icon.visible = True
         if open_browser:
             open_browser_when_ready(app_url)
 

@@ -3097,7 +3097,7 @@ def run_checklist_for_card(
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Falta OPENAI_API_KEY en el entorno")
-    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.5").strip()
+    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-6-astra").strip()
     ocr_transcriptions: List[Dict[str, Any]] = []
     if ocr_assets:
         ocr_batches = _batch_multimodal_assets(ocr_assets)
