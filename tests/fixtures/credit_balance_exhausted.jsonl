@@ -1,0 +1,2 @@
+{"type": "error", "error": {"type": "insufficient_quota", "code": "credit_balance_exhausted", "message": "You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.", "param": null}}
+{"type": "response.failed", "response": {"status": "failed", "error": {"code": "credit_balance_exhausted", "message": "You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/."}}}

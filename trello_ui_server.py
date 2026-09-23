@@ -91,9 +91,9 @@ APP_PATHS = resolve_app_paths()
 ROOT_DIR = APP_PATHS.resource_root
 UI_DIR = APP_PATHS.ui_dir
 VALID_REASONING_EFFORTS = {"low", "medium", "high"}
-VALID_OPENAI_MODELS = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
+VALID_OPENAI_MODELS = {"gpt-6-sol", "gpt-6-luna", "gpt-6-astra"}
 VALID_OPENAI_SERVICE_TIERS = {"auto", "flex"}
-DEFAULT_OPENAI_MODEL = "gpt-5.5"
+DEFAULT_OPENAI_MODEL = "gpt-6-sol"
 DEFAULT_OPENAI_SERVICE_TIER = "auto"
 STARTUP_LOG_PATH = APP_PATHS.settings_root / "startup.log"
 
@@ -587,7 +587,8 @@ def run_with_tray(
     server_thread = threading.Thread(target=_serve_server, kwargs={"server": server, "label": "tray"}, daemon=True)
     server_thread.start()
 
-    def setup(_: Any) -> None:
+    def setup(tray_icon: Any) -> None:
+        tray_icon.visible = True
         if open_browser:
             open_browser_when_ready(app_url)
 
@@ -1255,6 +1256,12 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
         body = file_path.read_bytes()
         content_type = mimetypes.guess_type(file_path.name)[0] or detect_mime_from_name(file_path.name)
         self._send_binary(body, content_type=content_type, filename=file_path.name)
+
+    def end_headers(self) -> None:
+        # Keep the page and its model-selection code in sync after local updates.
+        if urlparse(self.path).path in {"/", "/index.html", "/app.js", "/styles.css"}:
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)

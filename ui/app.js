@@ -40,8 +40,8 @@ const SELECTED_SERVICE_TIER_KEY = "trelloReview.selectedServiceTier";
 const REVIEW_JOBS_POLL_MS = 3000;
 const REVIEW_ANIMATION_FRAME_COUNT = 72;
 const REVIEW_ANIMATION_FRAME_MS = 90;
-const DEFAULT_MODEL = "gpt-5.5";
-const AVAILABLE_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"];
+const DEFAULT_MODEL = "gpt-6-sol";
+const AVAILABLE_MODELS = ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra"];
 const DEFAULT_SERVICE_TIER = "auto";
 const AVAILABLE_SERVICE_TIERS = ["auto", "flex"];
 const DEFAULT_MULTIMODAL_LIMIT_MB = 10;
@@ -267,7 +267,10 @@ function renderBoards() {
     const btn = node.querySelector("button");
     btn.textContent = board.name || "(tablero sin nombre)";
     if (state.selectedBoard?.id === board.id) btn.classList.add("active");
-    btn.addEventListener("click", () => selectBoard(board));
+    btn.addEventListener("click", async () => {
+      selectBoard(board);
+      await loadCards();
+    });
     els.boardsList.appendChild(node);
   }
 
@@ -285,6 +288,7 @@ function selectBoard(board, { statusMessage = "Tablero seleccionado. Carga las t
   state.workspace = null;
   state.indexCache.clear();
   state.runResult = null;
+  if (els.cardSearch) els.cardSearch.value = "";
   renderBoards();
   renderCards();
   renderPacketViews();

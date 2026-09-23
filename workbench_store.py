@@ -1690,7 +1690,7 @@ MULTIMODAL_SUPPORTED_IMAGE_MIME_TYPES = {
     "image/webp",
     "image/gif",
 }
-OCR_OPENAI_MODEL = os.getenv("OPENAI_OCR_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
+OCR_OPENAI_MODEL = os.getenv("OPENAI_OCR_MODEL", "gpt-6-luna").strip() or "gpt-6-luna"
 OCR_REASONING_EFFORT = os.getenv("OPENAI_OCR_REASONING_EFFORT", "medium").strip() or "medium"
 EVIDENCE_SEGMENT_MAX_CHARS = 1200
 OCR_APPEND_THRESHOLD_CHARS = 200
@@ -2374,6 +2374,36 @@ def _build_multimodal_user_content(
     return content
 
 
+def _openai_error_message(error: Any) -> str:
+    """Keep provider error details, with actionable guidance for billing failures."""
+    if not isinstance(error, dict):
+        return f"Error de OpenAI: {error or 'sin detalles'}"
+    code = str(error.get("code") or error.get("type") or "unknown_error")
+    message = str(error.get("message") or "OpenAI no proporcionó detalles del error.")
+    guidance = {
+        "credit_balance_exhausted": "Saldo de la API de OpenAI agotado. Agrega créditos en https://platform.openai.com/settings/organization/billing/ antes de volver a intentar.",
+        "organization_spend_limit_exceeded": "Se alcanzó el límite de gasto de la organización de OpenAI. Revisa sus límites de facturación.",
+        "organization_usage_limit_exceeded": "Se alcanzó el límite de uso de la organización de OpenAI. Revisa sus límites de uso.",
+        "insufficient_quota": "La API de OpenAI no tiene cuota disponible. Revisa el saldo y los límites de facturación de la organización.",
+        "rate_limit_exceeded": "Se alcanzó el límite temporal de solicitudes de OpenAI. Espera antes de volver a intentar.",
+        "invalid_api_key": "OpenAI rechazó la clave API. Revisa la clave configurada en la aplicación.",
+    }.get(code, "Error de OpenAI.")
+    return f"{guidance} [{code}] {message}"
+
+
+def _check_openai_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    if response.get("error"):
+        raise RuntimeError(_openai_error_message(response["error"]))
+    status = response.get("status")
+    if status == "failed":
+        raise RuntimeError("OpenAI informó que la respuesta falló, sin proporcionar detalles del error.")
+    if status == "incomplete":
+        details = response.get("incomplete_details") or {}
+        reason = details.get("reason") or "motivo no especificado"
+        raise RuntimeError(f"La respuesta de OpenAI quedó incompleta ({reason}). No se guardó como revisión completada.")
+    return response
+
+
 def _openai_structured_json_request(
     *,
     api_key: str,
@@ -2467,10 +2497,12 @@ def _openai_structured_json_request(
                             if stream_event_callback:
                                 stream_event_callback(event)
                             event_type = str(event.get("type") or "")
-                            if event_type == "response.completed" and isinstance(event.get("response"), dict):
-                                completed_response = event["response"]
-                            elif event_type in {"response.incomplete", "response.failed"} and isinstance(event.get("response"), dict):
-                                completed_response = event["response"]
+                            if event_type == "error":
+                                raise RuntimeError(_openai_error_message(event.get("error") or event))
+                            if event_type in {"response.completed", "response.incomplete", "response.failed"}:
+                                response = dict(event.get("response") or {})
+                                response.setdefault("status", event_type.split(".", 1)[1])
+                                completed_response = _check_openai_response(response)
                             continue
                         if line.startswith("data:"):
                             sse_data_lines.append(line[5:].lstrip())
@@ -2480,12 +2512,19 @@ def _openai_structured_json_request(
                         f"Streaming de OpenAI Responses API finalizó sin response.completed "
                         f"para model={model} reasoning={reasoning_effort} (request_bytes={request_bytes})."
                     )
-                return json.loads(resp.read().decode("utf-8"))
+                return _check_openai_response(json.loads(resp.read().decode("utf-8")))
         except HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
-            last_err = RuntimeError(f"Error de OpenAI Responses API {e.code} (intento {attempt_idx}): {detail}")
+            try:
+                error = json.loads(detail).get("error") or {}
+            except (json.JSONDecodeError, AttributeError):
+                error = {"message": detail}
+            last_err = RuntimeError(f"OpenAI Responses API HTTP {e.code}: {_openai_error_message(error)}")
             # If structured format is rejected, try plain JSON-prompt fallback once.
-            if attempt_idx == 1 and e.code != 429:
+            param = str(error.get("param") or "") if isinstance(error, dict) else ""
+            if attempt_idx == 1 and e.code == 400 and (
+                param.startswith("text.format") or param.startswith("response_format")
+            ):
                 continue
             raise last_err from e
         except (TimeoutError, socket.timeout) as e:
@@ -3097,7 +3136,7 @@ def run_checklist_for_card(
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Falta OPENAI_API_KEY en el entorno")
-    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-5.5").strip()
+    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-6-sol").strip()
     ocr_transcriptions: List[Dict[str, Any]] = []
     if ocr_assets:
         ocr_batches = _batch_multimodal_assets(ocr_assets)
