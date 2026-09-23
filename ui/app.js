@@ -267,7 +267,10 @@ function renderBoards() {
     const btn = node.querySelector("button");
     btn.textContent = board.name || "(tablero sin nombre)";
     if (state.selectedBoard?.id === board.id) btn.classList.add("active");
-    btn.addEventListener("click", () => selectBoard(board));
+    btn.addEventListener("click", async () => {
+      selectBoard(board);
+      await loadCards();
+    });
     els.boardsList.appendChild(node);
   }
 
@@ -285,6 +288,7 @@ function selectBoard(board, { statusMessage = "Tablero seleccionado. Carga las t
   state.workspace = null;
   state.indexCache.clear();
   state.runResult = null;
+  if (els.cardSearch) els.cardSearch.value = "";
   renderBoards();
   renderCards();
   renderPacketViews();

@@ -1257,6 +1257,12 @@ class TrelloWorkbenchHandler(SimpleHTTPRequestHandler):
         content_type = mimetypes.guess_type(file_path.name)[0] or detect_mime_from_name(file_path.name)
         self._send_binary(body, content_type=content_type, filename=file_path.name)
 
+    def end_headers(self) -> None:
+        # Keep the page and its model-selection code in sync after local updates.
+        if urlparse(self.path).path in {"/", "/index.html", "/app.js", "/styles.css"}:
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/"):

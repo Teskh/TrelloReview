@@ -66,3 +66,6 @@ docs/references/
 *.dump
 backend/media_gallery/
 backend/backups/
+
+# Shared Dock launcher artwork
+!assets/wombat-icon.png
