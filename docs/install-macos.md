@@ -42,3 +42,26 @@ python scripts/build_macos.py
 ```
 
 The ZIP is written to `dist/`. The build verifies the bundle signature and checks server startup in foreground and menu bar modes using placeholder credentials. It does not call Trello or OpenAI.
+
+## Source checkout: wombat Dock shortcut
+
+For a source installation, run:
+
+```sh
+.venv/bin/python3 scripts/install_macos_shortcut.py
+```
+
+This installs a small launcher in `~/Applications/Trello Review Launcher.app`
+and adds its wombat icon to the applications section of the Dock. It opens
+`Start Trello Review.command` in Terminal and uses the existing checkout and
+Python environment. Keep Terminal open while using the app. This does not
+build or install the standalone packaged app. Rerun the installer if you move
+the checkout. The installer replaces only this project's Dock entries and
+backs up the original Dock settings under `.appdata/`.
+
+## Regression tests
+
+Run `python -m unittest discover -s tests -v` from the repository root.
+GitHub Actions runs these tests on pushes and pull requests. They simulate
+OpenAI responses without API keys, paid requests, or case documents. The
+billing-error fixture contains only sanitized provider error details.
