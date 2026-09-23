@@ -1,7 +1,8 @@
 """Install a Dock launcher for the source checkout, with the wombat icon."""
 from pathlib import Path
 import plistlib
-import shlex
+import json
+import platform
 import subprocess
 import sys
 import tempfile
@@ -35,15 +36,26 @@ def main():
                 subprocess.run(["sips", "-z", str(size * scale), str(size * scale), str(source), "--out", str(output)], check=True, stdout=subprocess.DEVNULL)
         subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(resources / "wombat.icns")], check=True)
     executable = contents / "MacOS" / "launch"
-    executable.write_text("#!/bin/zsh\nexec /usr/bin/open " + shlex.quote(str(launcher)) + "\n")
+    with tempfile.TemporaryDirectory() as temp:
+        source_file = Path(temp) / "launch.c"
+        source_file.write_text(
+            '#include <unistd.h>\nint main(void) {\n'
+            '  execl("/usr/bin/open", "open", ' + json.dumps(str(launcher)) + ', (char *)0);\n'
+            '  return 1;\n}\n'
+        )
+        subprocess.run(["xcrun", "clang", "-arch", platform.machine(), str(source_file), "-o", str(executable)], check=True)
     executable.chmod(0o755)
     (contents / "Info.plist").write_bytes(plistlib.dumps({
         "CFBundleIdentifier": "com.teskh.trelloreview.launcher",
         "CFBundleName": "Trello Review", "CFBundleDisplayName": "Trello Review",
         "CFBundleExecutable": "launch", "CFBundlePackageType": "APPL",
-        "CFBundleIconFile": "wombat.icns", "CFBundleVersion": "1",
+        "CFBundleIconFile": "wombat.icns", "CFBundleVersion": "2",
+        "LSRequiresNativeExecution": True,
+        "LSArchitecturePriority": [platform.machine()],
         "LSUIElement": True,
     }))
+    subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True)
+    subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister", "-f", str(app)], check=True)
     raw = subprocess.check_output(["defaults", "export", "com.apple.dock", "-"])
     backup = root / ".appdata" / "dock-before-wombat-launcher.plist"
     backup.parent.mkdir(exist_ok=True)
