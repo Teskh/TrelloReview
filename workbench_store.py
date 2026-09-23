@@ -1690,7 +1690,7 @@ MULTIMODAL_SUPPORTED_IMAGE_MIME_TYPES = {
     "image/webp",
     "image/gif",
 }
-OCR_OPENAI_MODEL = os.getenv("OPENAI_OCR_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
+OCR_OPENAI_MODEL = os.getenv("OPENAI_OCR_MODEL", "gpt-6-luna").strip() or "gpt-6-luna"
 OCR_REASONING_EFFORT = os.getenv("OPENAI_OCR_REASONING_EFFORT", "medium").strip() or "medium"
 EVIDENCE_SEGMENT_MAX_CHARS = 1200
 OCR_APPEND_THRESHOLD_CHARS = 200
@@ -3097,7 +3097,7 @@ def run_checklist_for_card(
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Falta OPENAI_API_KEY en el entorno")
-    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-6-astra").strip()
+    model_name = (model or os.getenv("OPENAI_MODEL") or "gpt-6-sol").strip()
     ocr_transcriptions: List[Dict[str, Any]] = []
     if ocr_assets:
         ocr_batches = _batch_multimodal_assets(ocr_assets)
